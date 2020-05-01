@@ -74,7 +74,7 @@ if ($response->is_success) {
 		my $stop = $sendung->{stop};
 		$stop =~ s/[-:Z\.T]//ig;
 		$stop = substr($stop, 0, 14);
-		print $fh "<programme start=\"".$start." +0100\" stop=\"".$stop." +0100\" channel=\"".uri_escape($sendername)."\">\n";
+		print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
 		my $episode = $sendung->{episode};
 		print $fh "<title lang=\"de\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
 		
