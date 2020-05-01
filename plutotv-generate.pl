@@ -48,6 +48,10 @@ if ($response->is_success) {
       
         print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
         print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=DE&serverSideAds=true\n";
+        #my $url = $sender->{stitched}->{urls}[0]->{url};
+        #$url =~ s/deviceId=unknown/deviceId=0/ig;
+        #$url =~ s/appVersion=unknown/appVersion=0/ig;
+        #print $fhm $url."\n";
       }
     }
 
