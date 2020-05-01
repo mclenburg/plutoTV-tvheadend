@@ -24,15 +24,22 @@ my $url = "http://api.pluto.tv/v2/channels?start=".$from."Z&stop=".$to."Z";
 my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
+my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
+
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
     my $m3ufile = 'plutotv.m3u';
     open(my $fh, '>', $epgfile) or die "Could not open file '$epgfile' $!";
-    open(my $fhm, '>', $m3ufile) or die "Could not open file '$m3ufile' $!";
+    my $fhm;
+    if( $withm3u ) {
+      open($fhm, '>', $m3ufile) or die "Could not open file '$m3ufile' $!";
+    }
     print $fh "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
     print $fh "<tv>\n";  
 
-    print $fhm "#EXTM3U\n";  
+    if( $withm3u ) {
+      print $fhm "#EXTM3U\n";  
+    }
 
     my @senderListe = @{parse_json($response->decoded_content)};
     for my $sender( @senderListe ) {
@@ -45,13 +52,14 @@ if ($response->is_success) {
         print $fh "<icon src=\"".$logo->{path}."\" />\n";
         print $fh "</channel>\n";
       
-      
-        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-        print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=DE&serverSideAds=true\n";
-        #my $url = $sender->{stitched}->{urls}[0]->{url};
-        #$url =~ s/deviceId=unknown/deviceId=0/ig;
-        #$url =~ s/appVersion=unknown/appVersion=0/ig;
-        #print $fhm $url."\n";
+	      if( $withm3u ) {
+		print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
+		print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=DE&serverSideAds=true\n";
+		#my $url = $sender->{stitched}->{urls}[0]->{url};
+		#$url =~ s/deviceId=unknown/deviceId=0/ig;
+		#$url =~ s/appVersion=unknown/appVersion=0/ig;
+		#print $fhm $url."\n";
+	      }
       }
     }
 
@@ -60,19 +68,11 @@ if ($response->is_success) {
               my $sendername = $sender->{name};
 	      for my $sendung ( @{$sender->{timelines}}) {
 		my $start = $sendung->{start};
-		$start =~ s/-//ig;
-		$start =~ s/://ig;
-		$start =~ s/Z//ig;
-		$start =~ s/\.//ig;
-		$start =~ s/T//ig;
-		$start = substr($start, 0, 14);
+		$start =~ s/[-:Z\.T]//ig;
+		#$start = substr($start, 0, 14);
 
 		my $stop = $sendung->{stop};
-		$stop =~ s/-//ig;
-		$stop =~ s/://ig;
-		$stop =~ s/Z//ig;
-		$stop =~ s/\.//ig;
-		$stop =~ s/T//ig;
+		$stop =~ s/[-:Z\.T]//ig;
 		$stop = substr($stop, 0, 14);
 		print $fh "<programme start=\"".$start." +0100\" stop=\"".$stop." +0100\" channel=\"".uri_escape($sendername)."\">\n";
 		my $episode = $sendung->{episode};
@@ -85,7 +85,9 @@ if ($response->is_success) {
     }
   print $fh "\n</tv>\n\n\n";
   close $fh;
-  close $fhm;
+  if( $withm3u ) {
+    close $fhm;
+  }
   print "Ready\n";
 }
 else {
