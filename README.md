@@ -8,3 +8,8 @@ Perl-Script to generate m3u and xmltv-epg from PlutoTV-API
 ## usage
 `perl plutotv-generate.pl [--createm3u] `
 
+## more
+PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
+crontab:
+`15 */5 * * * perl plutotv-generate.pl`
+
