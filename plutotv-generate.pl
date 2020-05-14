@@ -25,7 +25,8 @@ my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
-my $regionCode = "DE";  # overwritten by stitched URL
+my $withgivenurl = grep { $_ eq '--usegivenurl'} @ARGV;
+my $regionCode = "DE";  # may overwritten by stitched URL
 my $langcode ="de";
 
 if ($response->is_success) {
@@ -50,8 +51,9 @@ if ($response->is_success) {
         my $url = $sender->{stitched}->{urls}[0]->{url};
         my $regionStart = index($url, "marketingRegion=")+16;
         my $regionEnds = index($url, "&", index($url, "marketingRegion=")+16);
-        $regionCode = substr($url, $regionStart, $regionEnds-$regionStart); 
-
+        if($regionStart>0) {
+          $regionCode = substr($url, $regionStart, $regionEnds-$regionStart); 
+        }
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
         my $logo = $sender->{logo};
@@ -61,11 +63,12 @@ if ($response->is_success) {
       
 	      if( $withm3u ) {
 		print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-		print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\n";
-		#my $url = $sender->{stitched}->{urls}[0]->{url};
-		#$url =~ s/deviceId=unknown/deviceId=0/ig;
-		#$url =~ s/appVersion=unknown/appVersion=0/ig;
-		#print $fhm $url."\n";
+                if(!$withgivenurl) {
+		  print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\n";
+                } 
+                else {	
+		  print $fhm $url."\n";
+                }
 	      }
       }
     }
