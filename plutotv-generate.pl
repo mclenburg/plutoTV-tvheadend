@@ -25,7 +25,7 @@ my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
-my $regionCode = "DE";
+my $regionCode = "DE";  # overwritten by stitched URL
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
@@ -46,8 +46,11 @@ if ($response->is_success) {
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) { 
         my $sendername = $sender->{name};
+        $regionCode = $sender->{stitched}->{urls}[0]->{url};
+        $regionCode = substr($regionCode, index($regionCode, "marketingRegion=")+16, 2);
+        #print $regionCode;
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
-        print $fh "<display-name lang=\"de\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
+        print $fh "<display-name lang=\"".lc($regionCode)."\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
         my $logo = $sender->{logo};
         $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
         print $fh "<icon src=\"".$logo->{path}."\" />\n";
@@ -77,9 +80,9 @@ if ($response->is_success) {
 		$stop = substr($stop, 0, 14);
 		print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
 		my $episode = $sendung->{episode};
-		print $fh "<title lang=\"de\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
+		print $fh "<title lang=\"".lc($regionCode)."\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
 		
-		print $fh "<desc lang=\"de\"><![CDATA[".$episode->{description}."]]></desc>\n";
+		print $fh "<desc lang=\"".lc($regionCode)."\"><![CDATA[".$episode->{description}."]]></desc>\n";
 		print $fh "</programme>\n";
 	      }
 	    }
