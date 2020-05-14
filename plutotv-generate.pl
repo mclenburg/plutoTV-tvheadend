@@ -26,6 +26,7 @@ my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
 my $regionCode = "DE";  # overwritten by stitched URL
+my $langcode ="de";
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
@@ -46,11 +47,13 @@ if ($response->is_success) {
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) { 
         my $sendername = $sender->{name};
-        $regionCode = $sender->{stitched}->{urls}[0]->{url};
-        $regionCode = substr($regionCode, index($regionCode, "marketingRegion=")+16, 2);
-        #print $regionCode;
+        my $url = $sender->{stitched}->{urls}[0]->{url};
+        my $regionStart = index($url, "marketingRegion=")+16;
+        my $regionEnds = index($url, "&", index($url, "marketingRegion=")+16);
+        $regionCode = substr($url, $regionStart, $regionEnds-$regionStart); 
+
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
-        print $fh "<display-name lang=\"".lc($regionCode)."\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
+        print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
         my $logo = $sender->{logo};
         $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
         print $fh "<icon src=\"".$logo->{path}."\" />\n";
@@ -80,9 +83,9 @@ if ($response->is_success) {
 		$stop = substr($stop, 0, 14);
 		print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
 		my $episode = $sendung->{episode};
-		print $fh "<title lang=\"".lc($regionCode)."\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
+		print $fh "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
 		
-		print $fh "<desc lang=\"".lc($regionCode)."\"><![CDATA[".$episode->{description}."]]></desc>\n";
+		print $fh "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
 		print $fh "</programme>\n";
 	      }
 	    }
