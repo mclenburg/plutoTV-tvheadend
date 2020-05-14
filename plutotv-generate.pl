@@ -17,7 +17,7 @@ my $from = DateTime->now();
 my $to = DateTime->now();
 $to=$to->add(days => 10);
 
-#printf("From %sZ To %sZ\n", $from, $to);
+printf("From %sZ To %sZ\n", $from, $to);
 
 my $url = "http://api.pluto.tv/v2/channels?start=".$from."Z&stop=".$to."Z";
 #printf($url . "\n");
@@ -25,6 +25,7 @@ my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
+my $regionCode = "DE";
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
@@ -54,7 +55,7 @@ if ($response->is_success) {
       
 	      if( $withm3u ) {
 		print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-		print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=DE&serverSideAds=true\n";
+		print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\n";
 		#my $url = $sender->{stitched}->{urls}[0]->{url};
 		#$url =~ s/deviceId=unknown/deviceId=0/ig;
 		#$url =~ s/appVersion=unknown/appVersion=0/ig;
