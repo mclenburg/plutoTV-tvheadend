@@ -26,6 +26,7 @@ my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
 my $withgivenurl = grep { $_ eq '--usegivenurl'} @ARGV;
+my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
 my $regionCode = "DE";  # may overwritten by stitched URL
 my $langcode ="de";
 
@@ -63,11 +64,17 @@ if ($response->is_success) {
       
 	      if( $withm3u ) {
 		print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-                if(!$withgivenurl) {
+                if(!$withgivenurl && $useffmpeg) {
 		  print $fhm "pipe:///usr/bin/ffmpeg -stream_loop -1 -i \"http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\"  -vcodec copy -acodec copy -f mpegts -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                 } 
+                elsif($withgivenurl && $useffmpeg) {
+                  print $fhm "pipe:///usr/bin/ffmpeg -stream_loop -1 -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
+                }
+                elsif(!$withgivenurl) {
+                  print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\n";
+                }
                 else {	
-		  print $fhm $url."\n";
+		          print $fhm $url."\n";
                 }
 	      }
       }
