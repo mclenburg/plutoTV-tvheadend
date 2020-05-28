@@ -10,6 +10,7 @@ use JSON::Parse ':all';
 use HTTP::Request ();
 use LWP::UserAgent;
 use URI::Escape;
+use UUID::Tiny ':std';
 
 package main;
 
@@ -55,15 +56,16 @@ if ($response->is_success) {
     }
 
     my $pre = "";
+    my $uuid = uuid_to_string(create_uuid(UUID_V1));
     my @senderListe = @{parse_json($response->decoded_content)};
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) { 
         my $sendername = $sender->{name};
         my $url = $sender->{stitched}->{urls}[0]->{url};
-        $url =~ s/&deviceMake=/&deviceMake=web/ig;
+        $url =~ s/&deviceMake=/&deviceMake=Chrome/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
-        $url =~ s/&deviceModel=/&deviceModel=web/ig;
-        $url =~ s/&sid=/&sid=$sender->{number}/ig;
+        $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
+        $url =~ s/&sid=/&sid=$uuid/ig;
         my $regionStart = index($url, "marketingRegion=")+16;
         my $regionEnds = index($url, "&", index($url, "marketingRegion=")+16);
         if($regionStart>0) {

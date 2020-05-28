@@ -2,8 +2,8 @@
 Perl-Script to generate m3u and xmltv-epg from PlutoTV-API
 
 
-## install used modules
-`sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent`
+## install used mo
+`sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny`
 
 ## usage
 `perl plutotv-generate.pl [--createm3u] [--usejalle19proxy]`
