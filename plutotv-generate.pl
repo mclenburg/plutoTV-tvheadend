@@ -25,31 +25,45 @@ my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
-my $withgivenurl = grep { $_ eq '--usegivenurl'} @ARGV;
+# my $withgivenurl = grep { $_ eq '--usegivenurl'} @ARGV;
 my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
+my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
 my $regionCode = "DE";  # may overwritten by stitched URL
 my $langcode ="de";
+my $jalleHost = "localhost:8282";
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
     my $m3ufile = 'plutotv.m3u';
+    my $sourcesfile = 'sources.json';
     open(my $fh, '>', $epgfile) or die "Could not open file '$epgfile' $!";
     my $fhm;
-    if( $withm3u ) {
+    if( $withm3u or $jalle19) {
       open($fhm, '>', $m3ufile) or die "Could not open file '$m3ufile' $!";
     }
+    my $fhj;
+    if( $jalle19 ) {
+      open($fhj, '>', $sourcesfile) or die "Could not open file '$sourcesfile' $!";
+      print $fhj "[\n";
+    }
+    
     print $fh "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
     print $fh "<tv>\n";  
 
-    if( $withm3u ) {
+    if( $withm3u or $jalle19 ) {
       print $fhm "#EXTM3U\n";  
     }
 
+    my $pre = "";
     my @senderListe = @{parse_json($response->decoded_content)};
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) { 
         my $sendername = $sender->{name};
         my $url = $sender->{stitched}->{urls}[0]->{url};
+        $url =~ s/&deviceMake=/&deviceMake=web/ig;
+        $url =~ s/&deviceType=/&deviceType=web/ig;
+        $url =~ s/&deviceModel=/&deviceModel=web/ig;
+        $url =~ s/&sid=/&sid=$sender->{number}/ig;
         my $regionStart = index($url, "marketingRegion=")+16;
         my $regionEnds = index($url, "&", index($url, "marketingRegion=")+16);
         if($regionStart>0) {
@@ -62,16 +76,20 @@ if ($response->is_success) {
         print $fh "<icon src=\"".$logo->{path}."\" />\n";
         print $fh "</channel>\n";
       
-	      if( $withm3u ) {
-		print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-                if(!$withgivenurl && $useffmpeg) {
-		  print $fhm "pipe:///usr/bin/ffmpeg -stream_loop -1 -i \"http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\"  -vcodec copy -acodec copy -f mpegts -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
-                } 
-                elsif($withgivenurl && $useffmpeg) {
-                  print $fhm "pipe:///usr/bin/ffmpeg -stream_loop -1 -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
+	      if( $withm3u or $jalle19 ) {
+		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
+                
+                if($useffmpeg) {
+                  print $fhm "pipe:///usr/bin/ffmpeg -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                 }
-                elsif(!$withgivenurl) {
-                  print $fhm "http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\n";
+                elsif( $jalle19 ) {
+                  print $fhj "\t".$pre."{\n\t\t\"name\": \"".$sender->{name}."\",\n";
+                  print $fhj "\t\t\"provider\": \"PlutoTV\",\n";
+                  print $fhj "\t\t\"url\": \"/".$sender->{_id}."\",\n";
+                  print $fhj "\t\t\"source\": \"http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\"\n";
+                  print $fhj "\t}\n";
+                  print $fhm "http://$jalleHost/".$sender->{_id}."\n";
+                  $pre = ",";
                 }
                 else {	
 		          print $fhm $url."\n";
@@ -102,8 +120,12 @@ if ($response->is_success) {
     }
   print $fh "\n</tv>\n\n\n";
   close $fh;
-  if( $withm3u ) {
+  if( $withm3u or $jalle19) {
     close $fhm;
+  }
+  if( $jalle19 ) {
+    print $fhj "]";
+    close $fhj;
   }
   print "Ready\n";
 }
