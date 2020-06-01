@@ -19,6 +19,19 @@ my $from = DateTime->now();
 my $to = DateTime->now();
 $to=$to->add(days => 10);
 
+sub create_bashfile {
+    my $path= cwd;
+    open(my $fhb, '>', $_[0]->{_id}.".sh") or die "Could not open file";
+    print $fhb "#!/bin/bash\n";
+    print $fhb "#\n\n";
+    print $fhb "url=\"".$_[1]."\"\n";
+    print $fhb "uuid=\$(uuidgen)\n";
+    print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
+    print $fhb "/usr/bin/ffmpeg -loglevel fatal -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset normal -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+    close $fhb;
+    chmod 0777, $_[0]->{_id}.".sh";
+}
+
 printf("From %sZ To %sZ\n", $from, $to);
 
 my $url = "http://api.pluto.tv/v2/channels?start=".$from."Z&stop=".$to."Z";
@@ -97,22 +110,15 @@ if ($response->is_success) {
                   $pre = ",";
                 }
                 elsif ( $usebash ) {
-                  my $path= cwd;
-                  print $fhm "pipe://".$path."/".$sender->{_id}.".sh\n";
-                  open(my $fhb, '>', $sender->{_id}.".sh") or die "Could not open file";
-                  print $fhb "#!/bin/bash\n";
-                  print $fhb "#\n\n";
-                  print $fhb "url=\"".$url."\"\n";
-                  print $fhb "uuid=\$(uuidgen)\n";
-                  print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
-                  print $fhb "/usr/bin/ffmpeg -loglevel fatal -user-agent \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3554.0 Safari/537.36\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset normal -metadata service_name='' pipe:1\n";
-                  close $fhb;
-                  chmod 0777, $sender->{_id}.".sh";
+                  create_bashfile ($sender, $url);
                 }
                 else {	
 		          print $fhm $url."\n";
                 }
 	      }
+          if( $usebash and !$withm3u) {
+              create_bashfile( $sender, $url);
+          }
       }
     }
 
