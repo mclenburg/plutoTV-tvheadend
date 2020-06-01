@@ -25,9 +25,10 @@ sub create_bashfile {
     print $fhb "#!/bin/bash\n";
     print $fhb "#\n\n";
     print $fhb "url=\"".$_[1]."\"\n";
-    print $fhb "uuid=\$(uuidgen)\n";
+    print $fhb "#uuid=\$(uuidgen)\n";
+    print $fhb "uuid=$_[2]\n";
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
-    print $fhb "/usr/bin/ffmpeg -loglevel fatal -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset normal -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+    print $fhb "/usr/bin/ffmpeg -loglevel fatal -threads 2 -re -fflags +genpts -stream_loop -1 -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset normal -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     close $fhb;
     chmod 0777, $_[0]->{_id}.".sh";
 }
@@ -71,7 +72,7 @@ if ($response->is_success) {
     }
 
     my $pre = "";
-#    my $uuid = uuid_to_string(create_uuid(UUID_V1));
+    my $uuid = uuid_to_string(create_uuid(UUID_V1));
     my @senderListe = @{parse_json($response->decoded_content)};
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) { 
@@ -81,7 +82,7 @@ if ($response->is_success) {
         $url =~ s/&deviceType=/&deviceType=web/ig;
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
-#        $uuid = uuid_to_string(create_uuid(UUID_V1));
+        $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $regionStart = index($url, "marketingRegion=")+16;
         my $regionEnds = index($url, "&", index($url, "marketingRegion=")+16);
         if($regionStart>0) {
@@ -110,14 +111,14 @@ if ($response->is_success) {
                   $pre = ",";
                 }
                 elsif ( $usebash ) {
-                  create_bashfile ($sender, $url);
+                  create_bashfile ($sender, $url, $uuid);
                 }
                 else {	
 		          print $fhm $url."\n";
                 }
 	      }
           if( $usebash and !$withm3u) {
-              create_bashfile( $sender, $url);
+              create_bashfile( $sender, $url, $uuid);
           }
       }
     }
