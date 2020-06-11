@@ -30,7 +30,7 @@ sub create_bashfile {
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
-    print $fhb "/usr/bin/ffmpeg -loglevel -bsf h264_mp4toannexb fatal -threads 2 -re -fflags +genpts -stream_loop -1 -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset normal -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+    print $fhb "/usr/bin/ffmpeg -loglevel fatal -threads 2 -vf scale=-1:720 -re -fflags +genpts -stream_loop -1 -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset veryfast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     print $fhb "done\n";
     close $fhb;
     chmod 0777, $_[0]->{_id}.".sh";
