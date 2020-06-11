@@ -1,12 +1,13 @@
 # plutoTV-tvheadend
 Perl-Script to generate m3u and xmltv-epg from PlutoTV-API
+So far, there are still short interruptions when advertising starts or ends.
 
 
 ## install used mo
 `sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny`
 
 ## usage
-`perl plutotv-generate.pl [--createm3u] [--usejalle19proxy]`
+`perl plutotv-generate.pl [--createm3u] [--usejalle19proxy] [--usebash]`
 
 ## more
 PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
