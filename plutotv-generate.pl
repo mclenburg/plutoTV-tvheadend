@@ -16,12 +16,19 @@ use File::Which;
 
 package main;
 
+my $langcode ="de";
+my $jalleHost = "localhost:8282";
+
 my $from = DateTime->now();
 my $to = DateTime->now();
 $to=$to->add(days => 10);
 
+my $programpath= cwd;
+my $ffmpeg = which 'ffmpeg';
+
+print $ffmpeg;
+
 sub create_bashfile {
-    my $path= cwd;
     open(my $fhb, '>', $_[0]->{_id}.".sh") or die "Could not open file";
     print $fhb "#!/bin/bash\n";
     print $fhb "#\n\n";
@@ -31,8 +38,8 @@ sub create_bashfile {
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
-    my $ffmpeg = which 'ffmpeg';
-    print $fhb "/usr/bin/ffmpeg -loglevel fatal -threads 2 -re -fflags +genpts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset medium -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+
+    print $fhb $ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset medium -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     print $fhb "done\n";
     close $fhb;
     chmod 0777, $_[0]->{_id}.".sh";
@@ -46,13 +53,9 @@ my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
 my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
-# my $withgivenurl = grep { $_ eq '--usegivenurl'} @ARGV;
 my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
 my $usebash = grep { $_ eq '--usebash'} @ARGV;
 my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
-my $regionCode = "DE";  # may overwritten by stitched URL
-my $langcode ="de";
-my $jalleHost = "localhost:8282";
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
@@ -106,20 +109,20 @@ if ($response->is_success) {
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
                 if($useffmpeg) {
-                  print $fhm "pipe:///usr/bin/ffmpeg -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
+                  print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                 }
                 elsif( $jalle19 ) {
                   print $fhj "\t".$pre."{\n\t\t\"name\": \"".$sender->{name}."\",\n";
                   print $fhj "\t\t\"provider\": \"PlutoTV\",\n";
                   print $fhj "\t\t\"url\": \"/".$sender->{_id}."\",\n";
-                  print $fhj "\t\t\"source\": \"http://service-stitcher.clusters.pluto.tv/stitch/hls/channel/".$sender->{_id}."/master.m3u8?deviceType=web&deviceMake=web&deviceModel=web&sid=".$sender->{number}."&deviceId=".$sender->{_id}."&deviceVersion=DNT&appVersion=DNT&deviceDNT=0&userId=&advertisingId=&deviceLat=&deviceLon=&app_name=&appName=web&buildVersion=&appStoreUrl=&architecture=&includeExtendedEvents=false&marketingRegion=$regionCode&serverSideAds=true\"\n";
+                  print $fhj "\t\t\"source\": \"$url\"\n";
                   print $fhj "\t}\n";
                   print $fhm "http://$jalleHost/".$sender->{_id}."\n";
                   $pre = ",";
                 }
                 elsif ( $usebash ) {
                   create_bashfile ($sender, $url, $uuid);
-                  print $fhm "pipe://".$path."/".$sender->{_id}.".sh \n";
+                  print $fhm "pipe://".$programpath."/".$sender->{_id}.".sh \n";
                 }
                 else {	
 		          print $fhm $url."\n";
