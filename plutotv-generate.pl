@@ -26,8 +26,6 @@ $to=$to->add(days => 10);
 my $programpath= cwd;
 my $ffmpeg = which 'ffmpeg';
 
-print $ffmpeg;
-
 sub create_bashfile {
     open(my $fhb, '>', $_[0]->{_id}.".sh") or die "Could not open file";
     print $fhb "#!/bin/bash\n";
