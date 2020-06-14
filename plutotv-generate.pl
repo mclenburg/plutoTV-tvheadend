@@ -92,11 +92,7 @@ if ($response->is_success) {
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
-        my $regionStart = index($url, "marketingRegion=")+16;
-        my $regionEnds = index($url, "&", index($url, "marketingRegion=")+16);
-        if($regionStart>0) {
-          $regionCode = substr($url, $regionStart, $regionEnds-$regionStart); 
-        }
+
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
         my $logo = $sender->{logo};
