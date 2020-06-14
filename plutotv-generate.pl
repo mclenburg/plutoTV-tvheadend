@@ -12,6 +12,7 @@ use LWP::UserAgent;
 use URI::Escape;
 use UUID::Tiny ':std';
 use Cwd qw(cwd);
+use File::Which;
 
 package main;
 
@@ -30,7 +31,8 @@ sub create_bashfile {
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
-    print $fhb "/usr/bin/ffmpeg -loglevel fatal -threads 2 -vf scale=-1:720 -re -fflags +genpts -stream_loop -1 -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset veryfast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+    my $ffmpeg = which 'ffmpeg';
+    print $fhb "/usr/bin/ffmpeg -loglevel fatal -threads 2 -re -fflags +genpts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset medium -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     print $fhb "done\n";
     close $fhb;
     chmod 0777, $_[0]->{_id}.".sh";
@@ -74,6 +76,7 @@ if ($response->is_success) {
       print $fhm "#EXTM3U\n";  
     }
 
+    my $path= cwd;
     my $pre = "";
     my $uuid = uuid_to_string(create_uuid(UUID_V1));
     my @senderListe = @{parse_json($response->decoded_content)};
@@ -99,6 +102,7 @@ if ($response->is_success) {
         print $fh "</channel>\n";
       
 	      if( $withm3u or $jalle19 ) {
+                $url =~ s/{uuid}/$uuid/ig;
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
                 if($useffmpeg) {
@@ -115,6 +119,7 @@ if ($response->is_success) {
                 }
                 elsif ( $usebash ) {
                   create_bashfile ($sender, $url, $uuid);
+                  print $fhm "pipe://".$path."/".$sender->{_id}.".sh \n";
                 }
                 else {	
 		          print $fhm $url."\n";
