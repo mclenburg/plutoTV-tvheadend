@@ -1,6 +1,8 @@
 # plutoTV-tvheadend
-Perl-Script to generate m3u and xmltv-epg from PlutoTV-API
-So far, there are still short interruptions when advertising starts or ends.
+Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.  
+So far, there are still short interruptions when advertising starts or ends.  
+      
+I recommend using the --usebash variant because it allows easy adjustments to the ffmpeg options without losing the channel assignment in tvheadend.
 
 
 ## install used modules
