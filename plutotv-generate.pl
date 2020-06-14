@@ -77,7 +77,6 @@ if ($response->is_success) {
       print $fhm "#EXTM3U\n";  
     }
 
-    my $path= cwd;
     my $pre = "";
     my $uuid = uuid_to_string(create_uuid(UUID_V1));
     my @senderListe = @{parse_json($response->decoded_content)};
