@@ -27,8 +27,9 @@ my $programpath= cwd;
 my $ffmpeg = which 'ffmpeg';
 
 sub create_bashfile {
+    my $bash = which 'bash';
     open(my $fhb, '>', $_[0]->{_id}.".sh") or die "Could not open file";
-    print $fhb "#!/bin/bash\n";
+    print $fhb "#!$bash\n";
     print $fhb "#\n\n";
     print $fhb "url=\"".$_[1]."\"\n";
     print $fhb "#uuid=\$(uuidgen)\n";
