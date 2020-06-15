@@ -38,7 +38,7 @@ sub create_bashfile {
     print $fhb "while :\n";
     print $fhb "do\n";
 
-    print $fhb $ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset medium -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+    print $fhb $ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts +ignidx +igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset medium -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     print $fhb "done\n";
     close $fhb;
     chmod 0777, $_[0]->{_id}.".sh";
@@ -103,7 +103,7 @@ if ($response->is_success) {
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
                 if($useffmpeg) {
-                  print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
+                  print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts +ignidx +igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                 }
                 elsif( $jalle19 ) {
                   print $fhj "\t".$pre."{\n\t\t\"name\": \"".$sender->{name}."\",\n";
