@@ -109,8 +109,14 @@ if ($response->is_success) {
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
                 if($useffmpeg) {
-                  print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
-                }
+                    if(! defined $streamlink) {
+                        print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
+
+                    }
+                    else {
+                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 \"".$url."\" 720,best \n";
+                    }
+                  }
                 elsif( $jalle19 ) {
                   print $fhj "\t".$pre."{\n\t\t\"name\": \"".$sender->{name}."\",\n";
                   print $fhj "\t\t\"provider\": \"PlutoTV\",\n";
