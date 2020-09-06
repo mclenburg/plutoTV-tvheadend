@@ -41,7 +41,7 @@ sub create_bashfile {
     print $fhb "while :\n";
     print $fhb "do\n";
 
-    if(! defined $streamlink) {
+    if(!defined($streamlink)) {
         print $fhb $ffmpeg." -loglevel fatal -copytb 1 -threads 2 -re -fflags +genpts+ignidx -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     }
     else {
@@ -66,6 +66,11 @@ my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jal
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
 #validate params
+if($usebash and ($usestreamlink or $useffmpeg)) {
+    printf("WARNING: Creation of bash-files requested. Usage of --useffmpeg or --usestreamlink will have no effect.");
+    $useffmpeg = 0;
+    $usestreamlink = 0;
+}
 if($usestreamlink and !defined($streamlink)) {
     printf("WARNING: Usage of streamlink requested, but no streamlink found on system. Will use ffmpeg instead.\n");
     $useffmpeg = 1;
@@ -76,7 +81,7 @@ if($useffmpeg and !defined($ffmpeg)) {
     $useffmpeg = 0;
 }
 if($useffmpeg and $usestreamlink) {
-    printf("WARNING: Invalid combined usage of params useffmpeg and usestreamlink. Will use default raw-URL.");
+    printf("WARNING: Invalid combined usage of params useffmpeg and usestreamlink. Will use default raw-URL.\n");
     $useffmpeg = 0;
     $usestreamlink = 0;
 }
@@ -133,10 +138,9 @@ if ($response->is_success) {
                 $url =~ s/{uuid}/$uuid/ig;
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
-                if($useffmpeg) {
-                    if(! defined $streamlink) {
+                if($useffmpeg or $usestreamlink) {
+                    if(!defined($streamlink)) {
                         print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
-
                     }
                     else {
                         print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 \"".$url."\" 720,best \n";
