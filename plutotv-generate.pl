@@ -63,6 +63,23 @@ my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
 my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
 my $usebash = grep { $_ eq '--usebash'} @ARGV;
 my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
+my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
+
+#validate params
+if($usestreamlink and !defined($streamlink)) {
+    printf("WARNING: Usage of streamlink requested, but no streamlink found on system. Will use ffmpeg instead.\n");
+    $useffmpeg = 1;
+    $usestreamlink = 0;
+}
+if($useffmpeg and !defined($ffmpeg)) {
+    printf("WARNING: Usage of ffmpeg requested, but no ffmpeg found on system. Will use raw-URL instead.\n");
+    $useffmpeg = 0;
+}
+if($useffmpeg and $usestreamlink) {
+    printf("WARNING: Invalid combined usage of params useffmpeg and usestreamlink. Will use default raw-URL.");
+    $useffmpeg = 0;
+    $usestreamlink = 0;
+}
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
