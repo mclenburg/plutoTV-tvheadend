@@ -29,6 +29,13 @@ my $programpath= cwd;
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
 
+#switches for params
+my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
+my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
+my $usebash = grep { $_ eq '--usebash'} @ARGV;
+my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
+my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
+
 sub create_bashfile {
     my $bash = which 'bash';
     open(my $fhb, '>', $_[0]->{_id}.".sh") or die "Could not open file";
@@ -41,7 +48,7 @@ sub create_bashfile {
     print $fhb "while :\n";
     print $fhb "do\n";
 
-    if(!defined($streamlink)) {
+    if(!defined($streamlink) or $useffmpeg) {
         print $fhb $ffmpeg." -loglevel fatal -copytb 1 -threads 2 -re -fflags +genpts+ignidx -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     }
     else {
@@ -59,18 +66,8 @@ my $url = "http://api.pluto.tv/v2/channels?start=".$from."Z&stop=".$to."Z";
 my $request = HTTP::Request->new(GET => $url);
 my $useragent = LWP::UserAgent->new;
 my $response = $useragent->request($request);
-my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
-my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
-my $usebash = grep { $_ eq '--usebash'} @ARGV;
-my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
-my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
 #validate params
-if($usebash and ($usestreamlink or $useffmpeg)) {
-    printf("WARNING: Creation of bash-files requested. Usage of --useffmpeg or --usestreamlink will have no effect.");
-    $useffmpeg = 0;
-    $usestreamlink = 0;
-}
 if($usestreamlink and !defined($streamlink)) {
     printf("WARNING: Usage of streamlink requested, but no streamlink found on system. Will use ffmpeg instead.\n");
     $useffmpeg = 1;
@@ -139,7 +136,7 @@ if ($response->is_success) {
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
                 if($useffmpeg or $usestreamlink) {
-                    if(!defined($streamlink)) {
+                    if(!defined($streamlink) or $useffmpeg) {
                         print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                     }
                     else {
