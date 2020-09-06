@@ -78,9 +78,15 @@ if($useffmpeg and !defined($ffmpeg)) {
     $useffmpeg = 0;
 }
 if($useffmpeg and $usestreamlink) {
-    printf("WARNING: Invalid combined usage of params useffmpeg and usestreamlink. Will use default raw-URL.\n");
-    $useffmpeg = 0;
-    $usestreamlink = 0;
+    if($usebash) {
+        printf("WARNING: Invalid combined usage of params useffmpeg and usestreamlink. Will use ffmpeg as default.\n");
+        $usestreamlink = 0;
+    }
+    else {
+        printf("WARNING: Invalid combined usage of params useffmpeg and usestreamlink. Will use default raw-URL.\n");
+        $useffmpeg = 0;
+        $usestreamlink = 0;
+    }
 }
 
 if ($response->is_success) {
