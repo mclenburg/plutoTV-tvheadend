@@ -18,7 +18,7 @@ If installed, the script will use streamlink instead of ffmpeg to read the strea
 * Go to menu option "Configuration" > "Channel/EPG" > "Channel" > "Map services" > "Map all services" and map the services
 * Run the following command twice:
 
-`cat | socat - UNIX-CONNECT:/home//.hts/tvheadend/epggrab/xmltv.sock`
+`cat plutotv-epg.xml | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock`
 
 
 ## more

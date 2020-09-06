@@ -16,6 +16,8 @@ use File::Which;
 
 package main;
 
+$| = 1;
+
 my $langcode ="de";
 my $jalleHost = "localhost:8282";
 
@@ -90,18 +92,18 @@ if ($response->is_success) {
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) { 
         my $sendername = $sender->{name};
-        my $url = "";
+        my $url = undef;
         $url = $sender->{stitched}->{urls}[0]->{url};
+        if(!defined $url) {
+          printf("WARNING: no url found for $sendername\n");
+          next;
+        }
+
         $url =~ s/&deviceMake=/&deviceMake=Chrome/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
-
-        if($url == "") {
-            printf("WARNING: no url found for $sendername\n");
-            next;
-        }
 
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
