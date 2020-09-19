@@ -30,7 +30,7 @@ my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
 
 #switches for params
-my $withm3u = grep { $_ eq '--createm3u'} @ARGV;
+my $createm3u = grep { $_ eq '--createm3u'} @ARGV;
 my $useffmpeg = grep { $_ eq '--useffmpeg'} @ARGV;
 my $usebash = grep { $_ eq '--usebash'} @ARGV;
 my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
@@ -95,7 +95,7 @@ if ($response->is_success) {
     my $sourcesfile = 'sources.json';
     open(my $fh, '>', $epgfile) or die "Could not open file '$epgfile' $!";
     my $fhm;
-    if( $withm3u or $jalle19) {
+    if( $createm3u or $jalle19) {
       open($fhm, '>', $m3ufile) or die "Could not open file '$m3ufile' $!";
     }
     my $fhj;
@@ -107,7 +107,7 @@ if ($response->is_success) {
     print $fh "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
     print $fh "<tv>\n";  
 
-    if( $withm3u or $jalle19 ) {
+    if( $createm3u or $jalle19 ) {
       print $fhm "#EXTM3U\n";  
     }
 
@@ -137,11 +137,11 @@ if ($response->is_success) {
         print $fh "<icon src=\"".$logo->{path}."\" />\n";
         print $fh "</channel>\n";
       
-	      if( $withm3u or $jalle19 ) {
+	      if( $createm3u or $jalle19 ) {
                 $url =~ s/{uuid}/$uuid/ig;
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
-                if($useffmpeg or $usestreamlink) {
+                if(($useffmpeg or $usestreamlink) and !$usebash) {
                     if(!defined($streamlink) or $useffmpeg) {
                         print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                     }
@@ -166,7 +166,7 @@ if ($response->is_success) {
 		          print $fhm $url."\n";
                 }
 	      }
-          if( $usebash and !$withm3u) {
+          if( $usebash and !$createm3u) {
               create_bashfile( $sender, $url, $uuid);
           }
       }
@@ -194,7 +194,7 @@ if ($response->is_success) {
     }
   print $fh "\n</tv>\n\n\n";
   close $fh;
-  if( $withm3u or $jalle19) {
+  if( $createm3u or $jalle19) {
     close $fhm;
   }
   if( $jalle19 ) {
