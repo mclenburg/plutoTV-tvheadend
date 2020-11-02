@@ -46,7 +46,7 @@ sub create_bashfile {
     print $fhb "deviceid=\$(uuidgen)\n";
     print $fhb "#uuid=$_[2]\n";
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
-    print $fhb "repurl=\${url/\\{deviceid\\}/\$deviceid}\n";
+    print $fhb "repurl=\${repurl/\\{deviceid\\}/\$deviceid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
 
@@ -128,8 +128,9 @@ if ($response->is_success) {
 
         $url =~ s/&deviceMake=/&deviceMake=Chrome/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
-          $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
+        $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
+        $url =~ s/&deviceVersion=unknown/&deviceVersion=76\{uuid\}/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $deviceid = uuid_to_string(create_uuid(UUID_V1));
