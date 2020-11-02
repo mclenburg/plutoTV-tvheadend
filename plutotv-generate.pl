@@ -43,8 +43,10 @@ sub create_bashfile {
     print $fhb "#\n\n";
     print $fhb "url=\"".$_[1]."\"\n";
     print $fhb "uuid=\$(uuidgen)\n";
+    print $fhb "deviceid=\$(uuidgen)\n";
     print $fhb "#uuid=$_[2]\n";
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
+    print $fhb "repurl=\${url/\\{deviceid\\}/\$deviceid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
 
@@ -126,9 +128,11 @@ if ($response->is_success) {
 
         $url =~ s/&deviceMake=/&deviceMake=Chrome/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
+          $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
+        $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
@@ -139,6 +143,7 @@ if ($response->is_success) {
       
 	      if( $createm3u or $jalle19 ) {
                 $url =~ s/{uuid}/$uuid/ig;
+                $url =~ s/{deviceid}/$deviceid/ig;
 		        print $fhm "#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sendername)."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$logo->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
                 
                 if(($useffmpeg or $usestreamlink) and !$usebash) {
