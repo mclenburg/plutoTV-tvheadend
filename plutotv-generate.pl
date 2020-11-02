@@ -166,7 +166,7 @@ if ($response->is_success) {
                   $pre = ",";
                 }
                 elsif ( $usebash ) {
-                  my $filename = $sender->name;
+                  my $filename = $sender->{name};
                   $filename=~s/ /_/ig;
                   $filename=~s/\'//ig;
                   create_bashfile ($sender, $url, $uuid, $filename);
@@ -177,7 +177,7 @@ if ($response->is_success) {
                 }
 	      }
           if( $usebash and !$createm3u) {
-              my $filename = $sender->name;
+              my $filename = $sender->{name};
               $filename=~s/ /_/ig;
               $filename=~s/\'//ig;
               create_bashfile( $sender, $url, $uuid, $filename);
