@@ -132,7 +132,7 @@ if ($response->is_success) {
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
-        $deviceid = uuid_to_string(create_uuid(UUID_V1));
+        my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
