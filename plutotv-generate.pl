@@ -51,6 +51,8 @@ sub create_bashfile {
     print $fhb "while :\n";
     print $fhb "do\n";
 
+    print "creating file $_[3]\n";
+
     if(!defined($streamlink) or $useffmpeg) {
         print $fhb $ffmpeg." -loglevel fatal -copytb 1 -threads 2 -re -fflags +genpts+ignidx -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     }
