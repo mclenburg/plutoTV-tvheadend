@@ -39,7 +39,7 @@ my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 sub create_bashfile {
     my $bash = which 'bash';
 
-    open(my $fhb, '>', $_[3].".sh") or die "Could not open file";
+    open(my $fhb, '>', $_[3].".sh") or die "Could not open file $_[3]";
     print $fhb "#!$bash\n";
     print $fhb "#\n\n";
     print $fhb "url=\"".$_[1]."\"\n";
