@@ -38,7 +38,8 @@ my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
 sub create_bashfile {
     my $bash = which 'bash';
-    open(my $fhb, '>', $_[0]->{_id}.".sh") or die "Could not open file";
+
+    open(my $fhb, '>', $_[3].".sh") or die "Could not open file";
     print $fhb "#!$bash\n";
     print $fhb "#\n\n";
     print $fhb "url=\"".$_[1]."\"\n";
@@ -58,7 +59,7 @@ sub create_bashfile {
     }
     print $fhb "done\n";
     close $fhb;
-    chmod 0777, $_[0]->{_id}.".sh";
+    chmod 0777, $_[3].".sh";
 }
 
 printf("From %sZ To %sZ\n", $from, $to);
@@ -165,8 +166,11 @@ if ($response->is_success) {
                   $pre = ",";
                 }
                 elsif ( $usebash ) {
-                  create_bashfile ($sender, $url, $uuid);
-                  print $fhm "pipe://".$programpath."/".$sender->{_id}.".sh \n";
+                  my $filename = $sender->name;
+                  $filename=~s/ /_/ig;
+                  $filename=~s/\'//ig;
+                  create_bashfile ($sender, $url, $uuid, $filename);
+                  print $fhm "pipe://".$programpath."/".$filename.".sh \n";
                 }
                 else {	
 		          print $fhm $url."\n";
