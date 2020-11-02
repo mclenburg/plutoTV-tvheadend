@@ -170,8 +170,8 @@ if ($response->is_success) {
                   $filename=~s/ /_/ig;
                   $filename=~s/\'//ig;
                   $filename=~s/\//_/ig;
-                    $filename=~s/(//ig;
-                    $filename=~s/)//ig;
+                    $filename=~s/\(//ig;
+                    $filename=~s/\)//ig;
                   create_bashfile ($sender, $url, $uuid, $filename);
                   print $fhm "pipe://".$programpath."/".$filename.".sh \n";
                 }
@@ -184,8 +184,8 @@ if ($response->is_success) {
               $filename=~s/ /_/ig;
               $filename=~s/\'//ig;
               $filename=~s/\//_/ig;
-              $filename=~s/(//ig;
-              $filename=~s/)//ig;
+              $filename=~s/\(//ig;
+              $filename=~s/\)//ig;
               create_bashfile( $sender, $url, $uuid, $filename);
           }
       }
