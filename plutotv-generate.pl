@@ -177,7 +177,10 @@ if ($response->is_success) {
                 }
 	      }
           if( $usebash and !$createm3u) {
-              create_bashfile( $sender, $url, $uuid);
+              my $filename = $sender->name;
+              $filename=~s/ /_/ig;
+              $filename=~s/\'//ig;
+              create_bashfile( $sender, $url, $uuid, $filename);
           }
       }
     }
