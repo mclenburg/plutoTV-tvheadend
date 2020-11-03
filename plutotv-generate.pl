@@ -44,8 +44,8 @@ sub create_bashfile {
     print $fhb "#\n\n";
     print $fhb "url=\"".$_[1]."\"\n";
     print $fhb "uuid=\$(uuidgen)\n";
-    print $fhb "deviceid=\$(uuidgen)\n";
-    print $fhb "#uuid=$_[2]\n";
+    print $fhb "deviceid=\"$_[2]\"\n";
+    #print $fhb "#uuid=$_[2]\n";
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
     print $fhb "repurl=\${repurl/\\{deviceid\\}/\$deviceid}\n";
     print $fhb "while :\n";
@@ -172,7 +172,7 @@ if ($response->is_success) {
                   $filename=~s/\//_/ig;
                     $filename=~s/\(//ig;
                     $filename=~s/\)//ig;
-                  create_bashfile ($sender, $url, $uuid, $filename);
+                  create_bashfile ($sender, $url, $deviceid, $filename);
                   print $fhm "pipe://".$programpath."/".$filename.".sh \n";
                 }
                 else {	
@@ -186,7 +186,7 @@ if ($response->is_success) {
               $filename=~s/\//_/ig;
               $filename=~s/\(//ig;
               $filename=~s/\)//ig;
-              create_bashfile( $sender, $url, $uuid, $filename);
+              create_bashfile( $sender, $url, $deviceid, $filename);
           }
       }
     }
