@@ -131,7 +131,8 @@ if ($response->is_success) {
         $url =~ s/&deviceType=/&deviceType=web/ig;
         $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
         $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
-        $url =~ s/&deviceVersion=unknown/&deviceVersion=76\{uuid\}/ig;
+        $url =~ s/&deviceVersion=unknown/&deviceVersion=76/ig;
+        $url =~ s/&appName=&/&appName=web&/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $deviceid = uuid_to_string(create_uuid(UUID_V1));
