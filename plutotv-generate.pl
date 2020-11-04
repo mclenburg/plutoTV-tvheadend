@@ -52,7 +52,7 @@ sub create_bashfile {
     print $fhb "do\n";
 
     if(!defined($streamlink) or $useffmpeg) {
-        print $fhb $ffmpeg." -loglevel fatal -copytb 1 -threads 2 -re -fflags +genpts+ignidx -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+        print $fhb $ffmpeg." -loglevel fatal -copytb 1 -threads 2 -re -fflags +genpts+ignidx -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:82.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     }
     else {
         print $fhb "$streamlink --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 \"\$repurl\" 720,best \n";
@@ -127,13 +127,15 @@ if ($response->is_success) {
           next;
         }
 
-        $url =~ s/&deviceMake=/&deviceMake=Chrome/ig;
+        $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
         $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
-        $url =~ s/&deviceModel=/&deviceModel=Chrome/ig;
-        $url =~ s/&deviceVersion=unknown/&deviceVersion=76/ig;
+        $url =~ s/&deviceModel=/&deviceModel=Firefox/ig;
+        $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
         $url =~ s/&appName=&/&appName=web&/ig;
+        $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3&/ig;
         $url =~ s/&sid=/&sid=\{uuid\}/ig;
+        $url = $url."&serverSideAds=true&paln=";
         $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
