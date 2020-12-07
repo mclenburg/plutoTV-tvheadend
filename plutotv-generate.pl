@@ -55,7 +55,7 @@ sub create_bashfile {
         print $fhb $ffmpeg." -loglevel fatal -copytb 1 -threads 2 -re -fflags +genpts+ignidx -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:82.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
     }
     else {
-        print $fhb "$streamlink --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 \"\$repurl\" 720,best \n";
+        print $fhb "$streamlink --stdout --quiet --hds-segment-threads 2 \"\$repurl\" 720,best  | $ffmpeg -loglevel quiet -i pipe:0 -vcodec copy -acodec copy -mpegts_service_type advanced_codec_digital_hdtv -f mpegts pipe:1 \n";
     }
     print $fhb "done\n";
     close $fhb;
