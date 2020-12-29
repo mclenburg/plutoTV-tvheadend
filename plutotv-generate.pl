@@ -130,12 +130,12 @@ if ($response->is_success) {
         $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
         $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
-        $url =~ s/&deviceModel=/&deviceModel=Firefox/ig;
+        $url =~ s/&deviceModel=/&deviceModel=web/ig;
         $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
         $url =~ s/&appName=&/&appName=web&/ig;
         $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
-        $url =~ s/&sid=/&sid=\{uuid\}/ig;
-        $url = $url."&serverSideAds=false&paln=&terminate=false";
+        $url =~ s/&sid=/&sid=\{uuid\}&sessionID=\{uuid\}/ig;
+        $url = $url."&serverSideAds=false&paln=&terminate=false&clientDeviceType=0&deviceDNT=false&clientModelNumber=na";
         $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
