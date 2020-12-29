@@ -47,6 +47,7 @@ sub create_bashfile {
     print $fhb "deviceid=\"$_[2]\"\n";
     #print $fhb "#uuid=$_[2]\n";
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
+    print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
     print $fhb "repurl=\${repurl/\\{deviceid\\}/\$deviceid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
@@ -135,11 +136,10 @@ if ($response->is_success) {
         $url =~ s/&appName=&/&appName=web&/ig;
         $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
         $url =~ s/&sid=/&sid=\{uuid\}&sessionID=\{uuid\}/ig;
-        $url = $url."&serverSideAds=false&paln=&terminate=false&clientDeviceType=0&deviceDNT=false&clientModelNumber=na&clientID=".uuid_to_string(create_uuid(UUID_V1));
+        $url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&deviceDNT=false&clientModelNumber=na&clientID=".uuid_to_string(create_uuid(UUID_V1));
         $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
-        print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
         my $logo = $sender->{logo};
         $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
