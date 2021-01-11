@@ -141,6 +141,7 @@ if ($response->is_success) {
         $uuid = uuid_to_string(create_uuid(UUID_V1));
         my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
+        print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
         my $logo = $sender->{logo};
         $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
