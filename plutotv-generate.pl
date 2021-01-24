@@ -47,7 +47,7 @@ sub create_bashfile {
     print $fhb "deviceid=\"$_[2]\"\n";
     #print $fhb "#uuid=$_[2]\n";
     print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
-    print $fhb "repurl=\${url/\\{uuid\\}/\$uuid}\n";
+    print $fhb "repurl=\${repurl/\\{uuid\\}/\$uuid}\n";
     print $fhb "repurl=\${repurl/\\{deviceid\\}/\$deviceid}\n";
     print $fhb "while :\n";
     print $fhb "do\n";
