@@ -53,10 +53,10 @@ sub create_bashfile {
     print $fhb "do\n";
 
     if(!defined($streamlink) or $useffmpeg) {
-        print $fhb $ffmpeg." -loglevel fatal -copytb 1 -headers \"Connection: Keep-Alive\" -threads 2 -re -fflags +genpts+ignidx -vsync cfr -dts_delta_threshold 30 -err_detect ignore_err -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:82.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' pipe:1\n";
+        print $fhb $ffmpeg." -loglevel fatal -copytb 1 -headers \"Connection: Keep-Alive\" -threads 2 -re -fflags +genpts+ignidx -vsync cfr -dts_delta_threshold 30 -err_detect ignore_err -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:82.0) Gecko/20100101 Firefox/76.0\" -i \$repurl  -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n";
     }
     else {
-        print $fhb "$streamlink --stdout --http-header \"Connection=keep-alive\" --http-header \"DNT=1\" --http-header \"TE=Trailers\" --quiet --hls-live-restart --hds-segment-threads 2 \"\$repurl\" 720,best  | $ffmpeg -loglevel quiet -i pipe:0 -err_detect ignore_err -dts_delta_threshold 30 -vsync cfr -vcodec copy -acodec copy -mpegts_service_type advanced_codec_digital_hdtv -f mpegts pipe:1 \n";
+        print $fhb "$streamlink --stdout --http-header \"Connection=keep-alive\" --http-header \"DNT=1\" --http-header \"TE=Trailers\" --quiet --hls-live-restart --hds-segment-threads 2 \"\$repurl\" 720,best  | $ffmpeg -loglevel quiet -i pipe:0 -err_detect ignore_err -fflags +genpts+ignidx -dts_delta_threshold 30 -vsync cfr -vcodec copy -acodec copy -mpegts_service_type advanced_codec_digital_hdtv -f mpegts pipe:1 \n";
     }
     print $fhb "done\n";
     close $fhb;
