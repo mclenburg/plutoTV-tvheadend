@@ -16,8 +16,8 @@ my $port   = "9000";
 
 sub process_request {
     my $deamon = shift;
-    my $client = $deamon->accept or last;
-    my $request = $client->get_request(1) or last;
+    my $client = $deamon->accept or die("could not get any Client");
+    my $request = $client->get_request(1) or die("could not get Client-Request.");
     $client->autoflush(1);
 
     my $parse_params = HTTP::Request::Params->new({
