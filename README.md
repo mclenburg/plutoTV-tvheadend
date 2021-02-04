@@ -2,9 +2,9 @@
 Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.  
 So far, there are still short interruptions when advertising starts or ends.  
       
-I recommend using the --usebash variant because it allows easy adjustments to the ffmpeg options without losing the channel assignment in tvheadend.
+I recommend using the --usebash variant because it allows easy adjustments to the ffmpeg or streamlink options without losing the channel assignment in tvheadend.
 
-If installed, the script will use streamlink instead of ffmpeg to read the stream.
+If using streamlink, usage of version 2.0.0 or higher is recommended.
 
 
 ## install used modules
