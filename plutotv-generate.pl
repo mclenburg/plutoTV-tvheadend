@@ -98,6 +98,7 @@ if ($response->is_success) {
     my $fhm;
     if( $createm3u or $jalle19) {
       open($fhm, '>', $m3ufile) or die "Could not open file '$m3ufile' $!";
+      print $fhm "#EXTM3U\n";
     }
     my $fhj;
     if( $jalle19 ) {
@@ -106,11 +107,7 @@ if ($response->is_success) {
     }
     
     print $fh "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
-    print $fh "<tv>\n";  
-
-    if( $createm3u or $jalle19 ) {
-      print $fhm "#EXTM3U\n";  
-    }
+    print $fh "<tv>\n";
 
     my $pre = "";
     my $uuid = uuid_to_string(create_uuid(UUID_V1));
@@ -155,7 +152,7 @@ if ($response->is_success) {
                         print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                     }
                     else {
-                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 \"".$url."\" 720,best \n";
+                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-key-uri \"\" --hls-segment-timeout 5 \"".$url."\" 720,best \n";
                     }
                   }
                 elsif( $jalle19 ) {
@@ -172,10 +169,12 @@ if ($response->is_success) {
                   $filename=~s/ /_/ig;
                   $filename=~s/\'//ig;
                   $filename=~s/\//_/ig;
-                    $filename=~s/\(//ig;
-                    $filename=~s/\)//ig;
+                  $filename=~s/\(//ig;
+                  $filename=~s/\)//ig;
                   create_bashfile ($sender, $url, $deviceid, $filename);
-                  print $fhm "pipe://".$programpath."/".$filename.".sh \n";
+                  if($createm3u) {
+                      print $fhm "pipe://".$programpath."/".$filename.".sh \n";
+                  }
                 }
                 else {	
 		          print $fhm $url."\n";
