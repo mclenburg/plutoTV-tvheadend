@@ -12,10 +12,28 @@ use HTTP::Request::Common;
 use HTTP::Cookies;
 use DateTime;
 use DateTime::Format::Strptime qw(strptime);
+use JSON;
+use JSON::Parse ':all';
+use HTTP::Request ();
+use LWP::UserAgent;
+use URI::Escape;
 
 my $hostip = "127.0.0.1";
 my $port   = "9000";
 my $apiurl = "http://api.pluto.tv/v2/channels?start={from}Z&stop={to}Z";
+
+sub get_channel_json {
+    my $url = $_;
+    my $request = HTTP::Request->new(GET => $url);
+    my $useragent = LWP::UserAgent->new;
+    my $response = $useragent->request($request);
+    if ($response->is_success) {
+        return $response;
+    }
+    else{
+        return undef;
+    }
+}
 
 sub process_request {
     my $from = DateTime->now();
@@ -33,7 +51,12 @@ sub process_request {
     #http://localhost:9000/channel?id=xxxx <-- liefert Stream des angefragten Senders
 
     if($request->uri->path eq "/playlist") {
-        my $response = HTTP::Response->parse("This is playlist-response." );
+        my $response = get_channel_json($apiurl);
+        if(!defined $response) {
+            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
+            return;
+        }
+        my @senderListe = @{parse_json($response->decoded_content)};
 
         $client->send_response($response);
     }
@@ -49,7 +72,7 @@ sub process_request {
         $client->send_response($response);
     }
     else {
-        $client->send_error(RC_NOT_FOUND, "no such path available: ".$request->uri->path);
+        $client->send_error(RC_NOT_FOUND, "No such path available: ".$request->uri->path);
     }
 }
 
