@@ -2,6 +2,8 @@
 
 package server;
 
+$| = 1;
+
 use strict;
 use warnings;
 
@@ -23,16 +25,28 @@ my $port   = "9000";
 my $apiurl = "http://api.pluto.tv/v2/channels?start={from}Z&stop={to}Z";
 
 sub get_channel_json {
-    my $url = $_;
-    my $request = HTTP::Request->new(GET => $url);
+    my $request = HTTP::Request->new(GET => $apiurl);
     my $useragent = LWP::UserAgent->new;
     my $response = $useragent->request($request);
+    printf($response->code);
     if ($response->is_success) {
-        return $response;
+        return @{parse_json($response->decoded_content)};
     }
     else{
-        return undef;
+        return ();
     }
+}
+
+sub buildM3U {
+    my @senderliste = @_;
+    my $m3u = "#EXTM3U\n";
+    for my $sender( @senderliste ) {
+        if($sender->{number} > 0) {
+            $m3u = $m3u."#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sender->{name})."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$sender->{logo}->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
+            $m3u = $m3u."http://$hostip:$port/channel?id=".$sender->{id}."\n";
+        }
+    }
+    return $m3u;
 }
 
 sub process_request {
@@ -51,12 +65,13 @@ sub process_request {
     #http://localhost:9000/channel?id=xxxx <-- liefert Stream des angefragten Senders
 
     if($request->uri->path eq "/playlist") {
-        my $response = get_channel_json($apiurl);
-        if(!defined $response) {
+        my @senderListe = get_channel_json;
+        if(scalar @senderListe <= 0) {
             $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
             return;
         }
-        my @senderListe = @{parse_json($response->decoded_content)};
+        my $m3uContent = buildM3U(@senderListe);
+        my $response = HTTP::Response->parse($m3uContent);
 
         $client->send_response($response);
     }
