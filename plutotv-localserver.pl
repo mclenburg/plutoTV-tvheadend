@@ -43,7 +43,7 @@ sub buildM3U {
     for my $sender( @senderliste ) {
         if($sender->{number} > 0) {
             $m3u = $m3u."#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sender->{name})."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$sender->{logo}->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-            $m3u = $m3u."http://$hostip:$port/channel?id=".$sender->{id}."\n";
+            $m3u = $m3u."http://$hostip:$port/channel?id=".$sender->{_id}."\n";
         }
     }
     return $m3u;
@@ -71,7 +71,11 @@ sub process_request {
             return;
         }
         my $m3uContent = buildM3U(@senderListe);
-        my $response = HTTP::Response->parse($m3uContent);
+        my $response = HTTP::Response->new();
+        $response->header("content-disposition", "filename=\"plutotv.m3u\"");
+        $response->code(200);
+        $response->message("OK");
+        $response->content($m3uContent);
 
         $client->send_response($response);
     }
