@@ -28,7 +28,6 @@ sub get_channel_json {
     my $request = HTTP::Request->new(GET => $apiurl);
     my $useragent = LWP::UserAgent->new;
     my $response = $useragent->request($request);
-    printf($response->code);
     if ($response->is_success) {
         return @{parse_json($response->decoded_content)};
     }
@@ -67,14 +66,22 @@ sub send_m3ufile {
 }
 
 sub send_m3u8file {
-    my $client = @_;
+    my ($client, $request) = @_;
     my $parse_params = HTTP::Request::Params->new({
         req => $request,
     });
     my $params = $parse_params->params;
     my $channelid = $params->{'id'};
 
-    my $response = HTTP::Response->parse("This is channel-response with id $channelid." );
+    my @senderListe = get_channel_json;
+    if(scalar @senderListe <= 0) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
+        return;
+    }
+    my @sender = grep($_->{_id} =~ /$channelid/ , @senderListe);
+
+
+    my $response = HTTP::Response->parse("This is channel-response with id $sender[0]->{name}." );
 
     $client->send_response($response);
 }
@@ -98,7 +105,7 @@ sub process_request {
         send_m3ufile($client);
     }
     elsif($request->uri->path eq "/channel") {
-        send_m3u8file($client);
+        send_m3u8file($client, $request);
     }
     else {
         $client->send_error(RC_NOT_FOUND, "No such path available: ".$request->uri->path);
