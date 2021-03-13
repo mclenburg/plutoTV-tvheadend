@@ -49,6 +49,36 @@ sub buildM3U {
     return $m3u;
 }
 
+sub send_m3ufile {
+    my $client = $_;
+    my @senderListe = get_channel_json;
+    if(scalar @senderListe <= 0) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
+        return;
+    }
+    my $m3uContent = buildM3U(@senderListe);
+    my $response = HTTP::Response->new();
+    $response->header("content-disposition", "filename=\"plutotv.m3u\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content($m3uContent);
+
+    $client->send_response($response);
+}
+
+sub send_m3u8file {
+    my $client = @_;
+    my $parse_params = HTTP::Request::Params->new({
+        req => $request,
+    });
+    my $params = $parse_params->params;
+    my $channelid = $params->{'id'};
+
+    my $response = HTTP::Response->parse("This is channel-response with id $channelid." );
+
+    $client->send_response($response);
+}
+
 sub process_request {
     my $from = DateTime->now();
     my $to = $from->add(hours => 6);
@@ -65,30 +95,10 @@ sub process_request {
     #http://localhost:9000/channel?id=xxxx <-- liefert Stream des angefragten Senders
 
     if($request->uri->path eq "/playlist") {
-        my @senderListe = get_channel_json;
-        if(scalar @senderListe <= 0) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
-            return;
-        }
-        my $m3uContent = buildM3U(@senderListe);
-        my $response = HTTP::Response->new();
-        $response->header("content-disposition", "filename=\"plutotv.m3u\"");
-        $response->code(200);
-        $response->message("OK");
-        $response->content($m3uContent);
-
-        $client->send_response($response);
+        send_m3ufile($client);
     }
     elsif($request->uri->path eq "/channel") {
-        my $parse_params = HTTP::Request::Params->new({
-            req => $request,
-        });
-        my $params = $parse_params->params;
-        my $channelid = $params->{'id'};
-
-        my $response = HTTP::Response->parse("This is channel-response with id $channelid." );
-
-        $client->send_response($response);
+        send_m3u8file($client);
     }
     else {
         $client->send_error(RC_NOT_FOUND, "No such path available: ".$request->uri->path);
