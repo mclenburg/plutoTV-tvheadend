@@ -111,6 +111,29 @@ sub send_m3u8file {
 
 
     my $master = get_from_url($url);
+    my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
+
+    $master =~ s/terminate=true/terminate=false/ig;
+    my $lines = () = $master =~ m/\n/g;
+
+    my $linebreakpos = 0;
+    my $readnextline = 0;
+    my $m3u8 = "";
+    for (my $linenum=0; $linenum<$lines; $linenum++) {
+        my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
+        if($readnextline == 1) {
+            $m3u8 .= $baseurl.$line;
+        }
+        if(index($line, "#EXT-X-STREAM-INF:PROGRAM-ID=") >=0) {
+           $readnextline = 1;
+        }
+        else {
+            $readnextline = 0;
+        }
+        $linebreakpos = index($master, "\n", $linebreakpos+1);
+    }
+
+
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"master.m3u8\"");
