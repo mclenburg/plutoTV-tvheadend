@@ -19,10 +19,14 @@ use JSON::Parse ':all';
 use HTTP::Request ();
 use LWP::UserAgent;
 use URI::Escape;
+use UUID::Tiny ':std';
 
 my $hostip = "127.0.0.1";
 my $port   = "9000";
 my $apiurl = "http://api.pluto.tv/v2/channels?start={from}Z&stop={to}Z";
+#channel-id: 5ddbf866b1862a0009a0648e
+
+my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
 sub get_channel_json {
     my $request = HTTP::Request->new(GET => $apiurl);
@@ -30,6 +34,18 @@ sub get_channel_json {
     my $response = $useragent->request($request);
     if ($response->is_success) {
         return @{parse_json($response->decoded_content)};
+    }
+    else{
+        return ();
+    }
+}
+
+sub get_from_url {
+    my $request = HTTP::Request->new(GET => @_);
+    my $useragent = LWP::UserAgent->new;
+    my $response = $useragent->request($request);
+    if ($response->is_success) {
+        return $response->content;
     }
     else{
         return ();
@@ -79,9 +95,28 @@ sub send_m3u8file {
         return;
     }
     my @sender = grep($_->{_id} =~ /$channelid/ , @senderListe);
+    my $url = $sender[0]->{stitched}->{urls}[0]->{url};
+
+    my $sessionuuid = uuid_to_string(create_uuid(UUID_V1));
+    $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
+    $url =~ s/&deviceType=/&deviceType=web/ig;
+    $url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
+    $url =~ s/&deviceModel=/&deviceModel=web/ig;
+    $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
+    $url =~ s/&appName=&/&appName=web&/ig;
+    $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
+    $url =~ s/&sid=/&sid=$sessionuuid&sessionID=$sessionuuid/ig;
+    $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
+    $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".uuid_to_string(create_uuid(UUID_V1));
 
 
-    my $response = HTTP::Response->parse("This is channel-response with id $sender[0]->{name}." );
+    my $master = get_from_url($url);
+
+    my $response = HTTP::Response->new();
+    $response->header("content-disposition", "filename=\"master.m3u8\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content($master);
 
     $client->send_response($response);
 }
