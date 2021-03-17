@@ -81,6 +81,29 @@ sub send_m3ufile {
     $client->send_response($response);
 }
 
+sub getPlaylistsFromMaster {
+    my $master = @_;
+    my $lines = () = $master =~ m/\n/g;
+
+    my $linebreakpos = 0;
+    my $readnextline = 0;
+    my $m3u8 = "";
+    for (my $linenum=0; $linenum<$lines; $linenum++) {
+        my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
+        if($readnextline == 1) {
+            $m3u8 .= $baseurl.$line;
+        }
+        if(index($line, "#EXT-X-STREAM-INF:PROGRAM-ID=") >=0) {
+            $readnextline = 1;
+        }
+        else {
+            $readnextline = 0;
+        }
+        $linebreakpos = index($master, "\n", $linebreakpos+1);
+    }
+    return $m3u8;
+}
+
 sub send_m3u8file {
     my ($client, $request) = @_;
     my $parse_params = HTTP::Request::Params->new({
@@ -114,25 +137,8 @@ sub send_m3u8file {
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
     $master =~ s/terminate=true/terminate=false/ig;
-    my $lines = () = $master =~ m/\n/g;
-
-    my $linebreakpos = 0;
-    my $readnextline = 0;
-    my $m3u8 = "";
-    for (my $linenum=0; $linenum<$lines; $linenum++) {
-        my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
-        if($readnextline == 1) {
-            $m3u8 .= $baseurl.$line;
-        }
-        if(index($line, "#EXT-X-STREAM-INF:PROGRAM-ID=") >=0) {
-           $readnextline = 1;
-        }
-        else {
-            $readnextline = 0;
-        }
-        $linebreakpos = index($master, "\n", $linebreakpos+1);
-    }
-
+    my $playlists = getPlaylistsFromMaster($master);
+    $playlists =~ s/terminate=true/terminate=false/ig;
 
 
     my $response = HTTP::Response->new();
