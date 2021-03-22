@@ -140,6 +140,21 @@ sub buildM3U {
     return $m3u;
 }
 
+sub get_sessionId {
+    my $channelId = $_[0];
+    my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&serverSideAds=false&channelSlug=&episodeSlugs=&channelID=".$channelId."&clientID=".$deviceid."&clientModelNumber=na";
+    my $request = HTTP::Request->new(GET => $url);
+    my $useragent = LWP::UserAgent->new;
+    my $response = $useragent->request($request);
+    if ($response->is_success) {
+        my $boot = parse_json($response->decoded_content);
+        return $boot->{session}->{sessionID};
+    }
+    else{
+        return ();
+    }
+    }
+
 sub send_m3ufile {
     my $client = $_[0];
     my @senderListe = get_channel_json;
@@ -215,6 +230,8 @@ sub send_masterm3u8file {
     my $params = $parse_params->params;
     my $channelid = $params->{'id'};
 
+    my $sessionId = get_sessionId($channelid);
+
     my @senderListe = get_channel_json;
     if(scalar @senderListe <= 0) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
@@ -223,7 +240,6 @@ sub send_masterm3u8file {
     my @sender = grep($_->{_id} =~ /$channelid/ , @senderListe);
     my $url = $sender[0]->{stitched}->{urls}[0]->{url};
 
-    my $sessionuuid = uuid_to_string(create_uuid(UUID_V1));
     $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
     $url =~ s/&deviceType=/&deviceType=web/ig;
     $url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
@@ -231,7 +247,7 @@ sub send_masterm3u8file {
     $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
     $url =~ s/&appName=&/&appName=web&/ig;
     $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
-    $url =~ s/&sid=/&sid=$sessionuuid&sessionID=$sessionuuid/ig;
+    $url =~ s/&sid=/&sid=$sessionId&sessionID=$sessionId/ig;
     $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
     $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
 
