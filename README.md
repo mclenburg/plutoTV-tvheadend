@@ -2,16 +2,23 @@
 Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.  
 So far, there are still short interruptions when advertising starts or ends.  
       
-I recommend using the --usebash variant because it allows easy adjustments to the ffmpeg or streamlink options without losing the channel assignment in tvheadend.
-
-If using streamlink, usage of version 2.0.0 or higher is recommended.
+There are two ways to use these scripts:
+* you can generate a static m3u by using the `plutotv-generate.pl`-script with params 
+* you can start `plutotv-localserver.pl` as local HTTP-Server and call it via URLs
 
 
 ## install used modules
 `sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny File::Which`
 
+when using `--localserver` also:
+`sudo cpan install HTTP::Request::Params HTTP::Deamon HTTP::Status HTTP::Requst::Common HTTP::Cookies`
+
+
 ## usage
 `perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
+
+### or
+`perl plutotv-localserver.pl` (or start as systemd-daemon)
 
 ## how to load xmltv-guide into tvheadend
 * Go to menu option "Configuration" > "Channel/EPG" > "EPG Grabber Modules" and enable "External: XMLTV"

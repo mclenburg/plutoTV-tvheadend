@@ -1,0 +1,19 @@
+[Unit]
+Description=PlutoTV-LocalServer
+After=network.target
+
+[Service]
+Type=simple
+#ExecStart=perl /home/pi/telerising/zattoo.pl & disown
+#WorkingDirectory=/home/pi/telerising
+ExecStart=/home/pi/plutoTV-tvheadend/plutotv-localserver.pl
+WorkingDirectory=/home/pi/plutoTV-tvheadend/
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

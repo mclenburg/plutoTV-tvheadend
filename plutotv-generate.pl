@@ -36,6 +36,9 @@ my $usebash = grep { $_ eq '--usebash'} @ARGV;
 my $jalle19 = grep { $_ eq '--usejalle19proxy'} @ARGV;  # https://github.com/Jalle19/node-ffmpeg-mpegts-proxy
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
+my $deviceid = uuid_to_string(create_uuid(UUID_V1));
+my $sessionid = uuid_to_string(create_uuid(UUID_V1));
+
 sub create_bashfile {
     my $bash = which 'bash';
 
@@ -124,16 +127,15 @@ if ($response->is_success) {
 
         $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
         $url =~ s/&deviceType=/&deviceType=web/ig;
-        $url =~ s/&deviceId=unknown/&deviceId=\{deviceid\}/ig;
+        $url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
         $url =~ s/&deviceModel=/&deviceModel=web/ig;
         $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
         $url =~ s/&appName=&/&appName=web&/ig;
         $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
         $url =~ s/&sid=/&sid=\{uuid\}&sessionID=\{uuid\}/ig;
         $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
-        $url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".uuid_to_string(create_uuid(UUID_V1));
+        $url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
-        my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
@@ -194,21 +196,21 @@ if ($response->is_success) {
 
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) {
-              my $sendername = $sender->{name};
+          my $sendername = $sender->{name};
 	      for my $sendung ( @{$sender->{timelines}}) {
-		my $start = $sendung->{start};
-		$start =~ s/[-:Z\.T]//ig;
-		#$start = substr($start, 0, 14);
+            my $start = $sendung->{start};
+            $start =~ s/[-:Z\.T]//ig;
+            $start = substr($start, 0, 14);
 
-		my $stop = $sendung->{stop};
-		$stop =~ s/[-:Z\.T]//ig;
-		$stop = substr($stop, 0, 14);
-		print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
-		my $episode = $sendung->{episode};
-		print $fh "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
-		
-		print $fh "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
-		print $fh "</programme>\n";
+            my $stop = $sendung->{stop};
+            $stop =~ s/[-:Z\.T]//ig;
+            $stop = substr($stop, 0, 14);
+            print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
+            my $episode = $sendung->{episode};
+            print $fh "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
+
+            print $fh "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
+            print $fh "</programme>\n";
 	      }
 	    }
     }
