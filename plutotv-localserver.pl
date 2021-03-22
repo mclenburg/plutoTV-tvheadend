@@ -24,14 +24,18 @@ use File::Which;
 
 my $hostip = "127.0.0.1";
 my $port   = "9000";
-my $apiurl = "http://api.pluto.tv/v2/channels?start={from}Z&stop={to}Z";
+my $apiurl = "http://api.pluto.tv/v2/channels";
 #channel-id: 5ddbf866b1862a0009a0648e
 
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 
 sub get_channel_json {
-    my $request = HTTP::Request->new(GET => $apiurl);
+    my $from = DateTime->now();
+    my $to = DateTime->now();
+    $to=$to->add(days => 2);
+    my $url = $apiurl."?start=".$from."Z&stop=".$to."Z";
+    my $request = HTTP::Request->new(GET => $url);
     my $useragent = LWP::UserAgent->new;
     my $response = $useragent->request($request);
     if ($response->is_success) {
@@ -40,6 +44,67 @@ sub get_channel_json {
     else{
         return ();
     }
+}
+
+sub send_help {
+    my ($client, $request) = @_;
+
+}
+
+sub send_xmltvepgfile {
+    my ($client, $request) = @_;
+
+    my @senderListe = get_channel_json;
+    if(scalar @senderListe <= 0) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
+        return;
+    }
+
+    my $langcode ="de";
+    my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
+    $epg .= "<tv>\n";
+
+    for my $sender( @senderListe ) {
+        if ($sender->{number} > 0) {
+            my $sendername = $sender->{name};
+            $epg .= "<channel id=\"".uri_escape($sendername)."\">\n";
+            $epg .= "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n";
+            my $logo = $sender->{logo};
+            if(defined($logo)) {
+                $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
+                $epg .= "<icon src=\"".$logo->{path}."\" />\n";
+            }
+            $epg .= "</channel>\n";
+        }
+    }
+    for my $sender( @senderListe ) {
+        if($sender->{number} > 0) {
+            my $sendername = $sender->{name};
+
+            for my $sendung ( @{$sender->{timelines}} ) {
+                my $start = $sendung->{start};
+                $start =~ s/[-:Z\.T]//ig;
+                my $stop = $sendung->{stop};
+                $stop =~ s/[-:Z\.T]//ig;
+                $stop = substr($stop, 0, 14);
+                $epg .= "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
+                my $episode = $sendung->{episode};
+                $epg .= "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
+
+                $epg .= "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
+                $epg .= "</programme>\n";
+            }
+        }
+    }
+    $epg .= "\n</tv>\n\n\n";
+
+    my $response = HTTP::Response->new();
+    $response->header("content-disposition", "filename=\"plutotv-epg.xml\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content($epg);
+
+    $client->send_response($response);
 }
 
 sub get_from_url {
@@ -63,7 +128,7 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u = $m3u . "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                $m3u = $m3u . "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts +ignidx +igndts -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
             }
         }
     }
@@ -198,12 +263,20 @@ sub process_request {
 
     #http://localhost:9000/playlist <-- liefert m3u aus
     #http://localhost:9000/channel?id=xxxx <-- liefert Stream des angefragten Senders
+    #http://localhost:9000/epg <-- liefert XMLTV-EPG
+    #http://localhost:9000/ <-- liefert Liste der möglichen Endpunkte
 
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
     }
     elsif($request->uri->path eq "/channel") {
         send_masterm3u8file($client, $request);
+    }
+    elsif($request->uri->path eq "/epg") {
+        send_xmltvepgfile($client, $request)
+    }
+    elsif($request->uri->path eq "/") {
+        send_help($client, $request);
     }
     else {
         $client->send_error(RC_NOT_FOUND, "No such path available: ".$request->uri->path);
