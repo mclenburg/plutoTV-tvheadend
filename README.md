@@ -15,7 +15,7 @@ when using `--localserver` also:
 
 
 ## usage
-`perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]
+`perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
 
 ### or
 `perl plutotv-localserver.pl` (or start as systemd-daemon)
