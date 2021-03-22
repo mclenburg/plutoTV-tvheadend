@@ -165,7 +165,7 @@ sub send_masterm3u8file {
     $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
     $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
 
-    printf("Request for Channel ".$sender[0]->{name});
+    printf("Request for Channel ".$sender[0]->{name}." received");
     my $master = get_from_url($url);
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
@@ -181,6 +181,7 @@ sub send_masterm3u8file {
     $response->content($master);
 
     $client->send_response($response);
+    printf(" and served.\n");
 }
 
 sub process_request {
