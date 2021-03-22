@@ -48,7 +48,12 @@ sub get_channel_json {
 
 sub send_help {
     my ($client, $request) = @_;
+    my $response = HTTP::Response->new();
+    $response->code(200);
+    $response->message("OK");
+    $response->content("Following endpoints are available:\n\t/playlist\tfor full m3u-file\n\t/channel?id=\tfor master.m3u8 of specific channel\n\t/epg\t\tfor xmltv-epg-file\n");
 
+    $client->send_response($response);
 }
 
 sub send_xmltvepgfile {
