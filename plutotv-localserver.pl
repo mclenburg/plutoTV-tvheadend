@@ -57,17 +57,21 @@ sub get_from_url {
 sub buildM3U {
     my @senderliste = @_;
     my $m3u = "#EXTM3U\n";
+    my $i = 0;
     for my $sender( @senderliste ) {
         if($sender->{number} > 0) {
-            $m3u = $m3u."#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sender->{name})."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$sender->{logo}->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-            $m3u = $m3u."pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"http://".$hostip.":".$port."/channel?id=".$sender->{_id}."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
+            my $logo = $sender->{logo}->{path};
+            if(defined $logo) {
+                $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
+                $m3u = $m3u . "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+            }
         }
     }
     return $m3u;
 }
 
 sub send_m3ufile {
-    my $client = $_;
+    my $client = $_[0];
     my @senderListe = get_channel_json;
     if(scalar @senderListe <= 0) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
