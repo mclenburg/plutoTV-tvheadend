@@ -110,6 +110,33 @@ sub getPlaylistsFromMaster {
     return $m3u8;
 }
 
+sub fixPlaylistUrlsInMaster {
+    my ($master, $baseurl) = @_;
+    my $lines = () = $master =~ m/\n/g;
+
+    my $linebreakpos = 0;
+    my $readnextline = 0;
+    my $m3u8 = "";
+    for (my $linenum=0; $linenum<$lines; $linenum++) {
+        my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
+        if($readnextline == 1) {
+            $m3u8 .= $baseurl.$line;
+            $readnextline = 0;
+            $linebreakpos = index($master, "\n", $linebreakpos+1);
+            next;
+        }
+        if(index($line, "#EXT-X-STREAM-INF:PROGRAM-ID=") >=0) {
+            $m3u8 .= $line;
+            $readnextline = 1;
+        }
+        else {
+          $m3u8 .= $line;
+        }
+        $linebreakpos = index($master, "\n", $linebreakpos+1);
+    }
+    return $m3u8;
+}
+
 sub send_masterm3u8file {
     my ($client, $request) = @_;
     my $parse_params = HTTP::Request::Params->new({
@@ -143,7 +170,7 @@ sub send_masterm3u8file {
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
     $master =~ s/terminate=true/terminate=false/ig;
-    #my $playlists = getPlaylistsFromMaster($master, $baseurl);
+    $master = fixPlaylistUrlsInMaster($master, $baseurl);
     #$playlists =~ s/terminate=true/terminate=false/ig;
 
 
