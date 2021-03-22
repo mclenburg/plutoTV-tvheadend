@@ -63,7 +63,7 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u = $m3u . "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                $m3u = $m3u . "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
             }
         }
     }
@@ -114,7 +114,7 @@ sub fixPlaylistUrlsInMaster {
     my ($master, $baseurl) = @_;
     my $lines = () = $master =~ m/\n/g;
 
-    my $linebreakpos = 0;
+    my $linebreakpos = -1;
     my $readnextline = 0;
     my $m3u8 = "";
     for (my $linenum=0; $linenum<$lines; $linenum++) {
