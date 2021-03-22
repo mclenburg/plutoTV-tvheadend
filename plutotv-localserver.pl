@@ -27,6 +27,7 @@ my $apiurl = "http://api.pluto.tv/v2/channels?start={from}Z&stop={to}Z";
 #channel-id: 5ddbf866b1862a0009a0648e
 
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
+my $ffmpeg = which 'ffmpeg';
 
 sub get_channel_json {
     my $request = HTTP::Request->new(GET => $apiurl);
@@ -58,7 +59,7 @@ sub buildM3U {
     for my $sender( @senderliste ) {
         if($sender->{number} > 0) {
             $m3u = $m3u."#EXTINF:-1 tvg-chno=\"".$sender->{number}."\" tvg-id=\"".uri_escape($sender->{name})."\" tvg-name=\"".$sender->{name}."\" tvg-logo=\"".$sender->{logo}->{path}."\" group-title=\"PlutoTV\",".$sender->{name}."\n";
-            $m3u = $m3u."http://$hostip:$port/channel?id=".$sender->{_id}."\n";
+            $m3u = $m3u."pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"http://".$hostip.":".$port."/channel?id=".$sender->{_id}."\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
         }
     }
     return $m3u;
@@ -82,7 +83,7 @@ sub send_m3ufile {
 }
 
 sub getPlaylistsFromMaster {
-    my $master = @_;
+    my ($master, $baseurl) = @_;
     my $lines = () = $master =~ m/\n/g;
 
     my $linebreakpos = 0;
@@ -104,7 +105,7 @@ sub getPlaylistsFromMaster {
     return $m3u8;
 }
 
-sub send_m3u8file {
+sub send_masterm3u8file {
     my ($client, $request) = @_;
     my $parse_params = HTTP::Request::Params->new({
         req => $request,
@@ -130,14 +131,14 @@ sub send_m3u8file {
     $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
     $url =~ s/&sid=/&sid=$sessionuuid&sessionID=$sessionuuid/ig;
     $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
-    $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".uuid_to_string(create_uuid(UUID_V1));
+    $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
 
 
     my $master = get_from_url($url);
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
     $master =~ s/terminate=true/terminate=false/ig;
-    my $playlists = getPlaylistsFromMaster($master);
+    my $playlists = getPlaylistsFromMaster($master, $baseurl);
     $playlists =~ s/terminate=true/terminate=false/ig;
 
 
@@ -169,7 +170,7 @@ sub process_request {
         send_m3ufile($client);
     }
     elsif($request->uri->path eq "/channel") {
-        send_m3u8file($client, $request);
+        send_masterm3u8file($client, $request);
     }
     else {
         $client->send_error(RC_NOT_FOUND, "No such path available: ".$request->uri->path);
