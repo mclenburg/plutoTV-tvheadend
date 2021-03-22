@@ -20,6 +20,7 @@ use HTTP::Request ();
 use LWP::UserAgent;
 use URI::Escape;
 use UUID::Tiny ':std';
+use File::Which;
 
 my $hostip = "127.0.0.1";
 my $port   = "9000";
