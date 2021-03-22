@@ -200,21 +200,21 @@ if ($response->is_success) {
 
     for my $sender( @senderListe ) {
       if($sender->{number} > 0) {
-              my $sendername = $sender->{name};
+          my $sendername = $sender->{name};
 	      for my $sendung ( @{$sender->{timelines}}) {
-		my $start = $sendung->{start};
-		$start =~ s/[-:Z\.T]//ig;
-		#$start = substr($start, 0, 14);
+            my $start = $sendung->{start};
+            $start =~ s/[-:Z\.T]//ig;
+            $start = substr($start, 0, 14);
 
-		my $stop = $sendung->{stop};
-		$stop =~ s/[-:Z\.T]//ig;
-		$stop = substr($stop, 0, 14);
-		print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
-		my $episode = $sendung->{episode};
-		print $fh "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
-		
-		print $fh "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
-		print $fh "</programme>\n";
+            my $stop = $sendung->{stop};
+            $stop =~ s/[-:Z\.T]//ig;
+            $stop = substr($stop, 0, 14);
+            print $fh "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
+            my $episode = $sendung->{episode};
+            print $fh "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
+
+            print $fh "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
+            print $fh "</programme>\n";
 	      }
 	    }
     }
