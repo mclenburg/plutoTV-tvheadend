@@ -191,6 +191,8 @@ my $deamon = HTTP::Daemon->new(
     ReusePort => $port,
 ) or die "Server could not be started.\n\n";
 
+printf("Server started on port ".$port."\n");
 while (1) {
     process_request($deamon);
 }
+printf("Server stopped\n");
