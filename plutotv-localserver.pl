@@ -142,7 +142,7 @@ sub buildM3U {
 
 sub get_sessionId {
     my $channelId = $_[0];
-    my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&serverSideAds=false&channelSlug=&episodeSlugs=&channelID=".$channelId."&clientID=".$deviceid."&clientModelNumber=na";
+    my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&serverSideAds=true&channelSlug=&episodeSlugs=&channelID=".$channelId."&clientID=".$deviceid."&clientModelNumber=na";
     my $request = HTTP::Request->new(GET => $url);
     my $useragent = LWP::UserAgent->new;
     my $response = $useragent->request($request);
