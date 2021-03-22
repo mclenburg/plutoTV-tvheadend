@@ -138,13 +138,13 @@ sub send_masterm3u8file {
     $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
     $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
 
-
+    printf("Request for Channel ".$sender[0]->{name});
     my $master = get_from_url($url);
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
     $master =~ s/terminate=true/terminate=false/ig;
-    my $playlists = getPlaylistsFromMaster($master, $baseurl);
-    $playlists =~ s/terminate=true/terminate=false/ig;
+    #my $playlists = getPlaylistsFromMaster($master, $baseurl);
+    #$playlists =~ s/terminate=true/terminate=false/ig;
 
 
     my $response = HTTP::Response->new();
