@@ -20,6 +20,13 @@ when using `--localserver` also:
 ### or
 `perl plutotv-localserver.pl` (or start as systemd-daemon)
 
+### available endpoints for localserver
+|endpoint | task |
+|-|-|
+|`/playlist`|path to get m3u-file|
+|`/channel?id=`|path to get playlist.m3u8 for given channelid|
+|`/epg`|path to get xmltv-epg-file|
+
 ## how to load xmltv-guide into tvheadend
 * Go to menu option "Configuration" > "Channel/EPG" > "EPG Grabber Modules" and enable "External: XMLTV"
 * Go to menu option "Configuration" > "Channel/EPG" > "Channel" > "Map services" > "Map all services" and map the services
@@ -32,4 +39,8 @@ when using `--localserver` also:
 PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
 crontab:
 `15 */6 * * * perl plutotv-generate.pl`
+
+or
+
+`15 */6 * * * wget http://localhost:9000/epg -O plutotv-epg.xml`
 
