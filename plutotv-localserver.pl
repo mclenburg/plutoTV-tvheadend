@@ -165,7 +165,7 @@ sub get_bootJson {
     my $maxTime;
 
     if(defined $session) {
-        $maxTime = $bootTime->add(milliseconds=>$session->{session}->{restartThresholdMS});
+        $maxTime = $bootTime->add(seconds=>$session->{session}->{restartThresholdMS}/1000);
     }
     else {
         $maxTime = $now->subtract(hours=>2);
