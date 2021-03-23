@@ -234,17 +234,9 @@ sub send_masterm3u8file {
 
     my $bootJson = get_bootJson($channelid);
 
-    my @senderListe = get_channel_json;
-    if(scalar @senderListe <= 0) {
-        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
-        return;
-    }
-    my @sender = grep($_->{_id} =~ /$channelid/ , @senderListe);
-    my $url = $sender[0]->{stitched}->{urls}[0]->{url};
-    $url = substr($url, 0, index($url, "m3u8")+4);
-
+    my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/master.m3u8";
     $url.="?".$bootJson->{stitcherParams};
-    printf("Request for Channel ".$sender[0]->{name}." received");
+    printf("Request for Channel ".$channelid." received");
     my $master = get_from_url($url);
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
