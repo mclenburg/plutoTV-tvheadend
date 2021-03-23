@@ -234,11 +234,11 @@ sub send_masterm3u8file {
 
     my $bootJson = get_bootJson($channelid);
 
-    my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/master.m3u8";
+    my $baseurl = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/";
+    my $url = $baseurl."master.m3u8";
     $url.="?".$bootJson->{stitcherParams};
     printf("Request for Channel ".$channelid." received");
     my $master = get_from_url($url);
-    my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
 
     $master =~ s/terminate=true/terminate=false/ig;
     $master = fixPlaylistUrlsInMaster($master, $baseurl);
