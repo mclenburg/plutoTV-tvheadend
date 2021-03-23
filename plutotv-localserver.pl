@@ -29,6 +29,8 @@ my $apiurl = "http://api.pluto.tv/v2/channels";
 
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
+my $session;
+my $bootTime;
 
 sub get_channel_json {
     my $from = DateTime->now();
@@ -141,20 +143,41 @@ sub buildM3U {
     }
     return $m3u;
 }
-
-sub get_bootJson {
-    my $channelId = $_[0];
-    my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&serverSideAds=false&channelSlug=&episodeSlugs=&channelID=".$channelId."&clientID=".$deviceid."&clientModelNumber=na";
+sub getBootFromPluto {
+    printf("Refresh of current Session\n");
+    my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&clientID=".$deviceid."&clientModelNumber=na";
     my $request = HTTP::Request->new(GET => $url);
     my $useragent = LWP::UserAgent->new;
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
-        return parse_json($response->decoded_content);
+        $session = parse_json($response->decoded_content);
+        $bootTime = DateTime->now();
+        return $session;
     }
-    else{
+    else {
         return ();
     }
+}
+
+sub get_bootJson {
+    my $now = DateTime->now();
+    my $maxTime;
+
+    if(defined $session) {
+        $maxTime = $bootTime->add(milliseconds=>$session->{session}->{restartThresholdMS});
+    }
+    else {
+        $maxTime = $now->subtract(hours=>2);
+    }
+
+    if(!defined $session) {
+      return getBootFromPluto;
+    }
+    elsif($now > $maxTime) {
+      return getBootFromPluto;
+    }
+    return $session;
 }
 
 sub send_m3ufile {
