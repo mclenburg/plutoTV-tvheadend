@@ -142,7 +142,7 @@ sub buildM3U {
     return $m3u;
 }
 
-sub get_sessionId {
+sub get_bootJson {
     my $channelId = $_[0];
     my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&serverSideAds=false&channelSlug=&episodeSlugs=&channelID=".$channelId."&clientID=".$deviceid."&clientModelNumber=na";
     my $request = HTTP::Request->new(GET => $url);
@@ -150,13 +150,12 @@ sub get_sessionId {
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
-        my $boot = parse_json($response->decoded_content);
-        return $boot->{session}->{sessionID};
+        return parse_json($response->decoded_content);
     }
     else{
         return ();
     }
-    }
+}
 
 sub send_m3ufile {
     my $client = $_[0];
@@ -233,7 +232,7 @@ sub send_masterm3u8file {
     my $params = $parse_params->params;
     my $channelid = $params->{'id'};
 
-    my $sessionId = get_sessionId($channelid);
+    my $bootJson = get_bootJson($channelid);
 
     my @senderListe = get_channel_json;
     if(scalar @senderListe <= 0) {
@@ -242,20 +241,9 @@ sub send_masterm3u8file {
     }
     my @sender = grep($_->{_id} =~ /$channelid/ , @senderListe);
     my $url = $sender[0]->{stitched}->{urls}[0]->{url};
+    $url = substr($url, 0, index($url, "m3u8")+4);
 
-    $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
-    $url =~ s/&deviceType=/&deviceType=web/ig;
-    $url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
-    $url =~ s/&deviceModel=/&deviceModel=web/ig;
-    $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
-    $url =~ s/&appName=&/&appName=web&/ig;
-    $url =~ s/&appVersion=&/&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a/ig;
-    $url =~ s/&sid=/&sid=$sessionId&sessionID=$sessionId/ig;
-    $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
-    $url =~ s/&serverSideAds=true//ig;
-    $url =~ s/&serverSideAds=&//ig;
-    $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
-
+    $url.="?".$bootJson->{stitcherParams};
     printf("Request for Channel ".$sender[0]->{name}." received");
     my $master = get_from_url($url);
     my $baseurl = substr($url, 0, index($url, $channelid)+length($channelid)+1);
@@ -263,7 +251,6 @@ sub send_masterm3u8file {
     $master =~ s/terminate=true/terminate=false/ig;
     $master = fixPlaylistUrlsInMaster($master, $baseurl);
     #$playlists =~ s/terminate=true/terminate=false/ig;
-
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"master.m3u8\"");
