@@ -37,6 +37,7 @@ sub get_channel_json {
     my $url = $apiurl."?start=".$from."Z&stop=".$to."Z";
     my $request = HTTP::Request->new(GET => $url);
     my $useragent = LWP::UserAgent->new;
+    $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
         return @{parse_json($response->decoded_content)};
@@ -115,6 +116,7 @@ sub send_xmltvepgfile {
 sub get_from_url {
     my $request = HTTP::Request->new(GET => @_);
     my $useragent = LWP::UserAgent->new;
+    $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
         return $response->content;
@@ -145,6 +147,7 @@ sub get_sessionId {
     my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&serverSideAds=false&channelSlug=&episodeSlugs=&channelID=".$channelId."&clientID=".$deviceid."&clientModelNumber=na";
     my $request = HTTP::Request->new(GET => $url);
     my $useragent = LWP::UserAgent->new;
+    $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
         my $boot = parse_json($response->decoded_content);
@@ -246,9 +249,11 @@ sub send_masterm3u8file {
     $url =~ s/&deviceModel=/&deviceModel=web/ig;
     $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
     $url =~ s/&appName=&/&appName=web&/ig;
-    $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
+    $url =~ s/&appVersion=&/&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a/ig;
     $url =~ s/&sid=/&sid=$sessionId&sessionID=$sessionId/ig;
     $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
+    $url =~ s/&serverSideAds=true//ig;
+    $url =~ s/&serverSideAds=&//ig;
     $url = $url."&serverSideAds=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
 
     printf("Request for Channel ".$sender[0]->{name}." received");
