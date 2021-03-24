@@ -26,7 +26,7 @@ when using `plutotv-localserver.pl` also:
 | `--createm3u` | use with `perl-generate.pl` only, create playlist-file plutotv.m3u and xmltv-file plutotv-epg.xml |
 | `--usebash` | use with `perl-generate.pl` only, create bash-file for each pluto-tv-channel for starting service |
 | `--useffmpeg` | use with `perl-generate.pl` only, will use ffmpeg-pipe instead of using original URL to channel (default in localserver) |
-| `--usestreamlink` | same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
+| `--usestreamlink` | use with `perl-generate.pl` only, same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
 | `--localonly` | use with `plutotv-localserver` only, will configure server to listen on localhost 127.0.0.1 |
 
 ### available endpoints for localserver
