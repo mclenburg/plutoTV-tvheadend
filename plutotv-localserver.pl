@@ -21,6 +21,7 @@ use LWP::UserAgent;
 use URI::Escape;
 use UUID::Tiny ':std';
 use File::Which;
+use Net::Address::IP::Local;
 
 my $hostip = "127.0.0.1";
 my $port   = "9000";
@@ -29,8 +30,13 @@ my $apiurl = "http://api.pluto.tv/v2/channels";
 
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
+my $streamlink = which 'streamlink';
 my $session;
 my $bootTime;
+
+#check param
+my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
+my $localhost = grep { $_ eq '--localonly'} @ARGV;
 
 sub get_channel_json {
     my $from = DateTime->now();
@@ -137,7 +143,11 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u = $m3u . "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -dts_delta_threshold 3000000 -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                if($usestreamlink) {
+                    $m3u .= "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-key-uri \"\" --hls-segment-timeout 5 \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} ."\" 720,best \n";
+                } else {
+                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -dts_delta_threshold 3000000 -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                }
             }
         }
     }
@@ -311,6 +321,17 @@ sub process_request {
     }
 }
 
+#####  ---- starting the server
+#validate params
+if($usestreamlink and !defined($streamlink)) {
+    printf("WARNING: Usage of streamlink requested, but no streamlink found on system. Will use ffmpeg instead.\n");
+    $usestreamlink = 0;
+}
+
+if(!$localhost) {
+    $hostip = Net::Address::IP::Local->public_ipv4;
+}
+
 # START DAEMON
 my $deamon = HTTP::Daemon->new(
     LocalAddr => $hostip,
@@ -320,7 +341,7 @@ my $deamon = HTTP::Daemon->new(
     ReusePort => $port,
 ) or die "Server could not be started.\n\n";
 
-printf("Server started on port ".$port."\n");
+printf("Server started listening on $hostip using port ".$port."\n");
 while (1) {
     process_request($deamon);
 }

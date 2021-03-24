@@ -10,15 +10,24 @@ There are two ways to use these scripts:
 ## install used modules
 `sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny File::Which`
 
-when using `--localserver` also:
-`sudo cpan install HTTP::Request::Params HTTP::Deamon HTTP::Status HTTP::Requst::Common HTTP::Cookies`
+when using `plutotv-localserver.pl` also:
+`sudo cpan install HTTP::Request::Params HTTP::Deamon HTTP::Status HTTP::Requst::Common HTTP::Cookies Net::Address::IP::Local`
 
 
 ## usage
 `perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
 
 ### or
-`perl plutotv-localserver.pl` (or start as systemd-daemon)
+`perl plutotv-localserver.pl [--usestreamlink] [--localonly]` (or start as systemd-daemon)
+
+### meaning of params
+|parameter | effect |
+|-|-|
+| `--createm3u` | use with `perl-generate.pl` only, create playlist-file plutotv.m3u and xmltv-file plutotv-epg.xml |
+| `--usebash` | use with `perl-generate.pl` only, create bash-file for each pluto-tv-channel for starting service |
+| `--useffmpeg` | use with `perl-generate.pl` only, will use ffmpeg-pipe instead of using original URL to channel (default in localserver) |
+| `--usestreamlink` | same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
+| `--localonly` | use with `plutotv-localserver` only, will configure server to listen on localhost 127.0.0.1 |
 
 ### available endpoints for localserver
 |endpoint | task |
