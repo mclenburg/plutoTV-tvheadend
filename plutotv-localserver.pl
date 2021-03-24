@@ -142,7 +142,7 @@ sub buildM3U {
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
                 #$m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -fflags +genpts+ignidx+igndts -dts_delta_threshold 3000000 -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
-                $m3u .= "pipe://$ffmpeg -loglevel fatal -fflags +genpts+ignidx+igndts -i http://".$hostip.":".$port."/channel?id=$sender->{_id} -c copy -bsf:a aac_adtstoasc -tune zerolatency -metadata service_name=\"$sender->{name}\" pipe:1\n";
+                $m3u .= "pipe://$ffmpeg -loglevel fatal -fflags +genpts+ignidx+igndts -f mp4 -i http://".$hostip.":".$port."/channel?id=$sender->{_id} -c copy -bsf:a aac_adtstoasc -tune zerolatency -metadata service_name=\"$sender->{name}\" pipe:1\n";
             }
         }
     }
