@@ -141,7 +141,7 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mmpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
             }
         }
     }
