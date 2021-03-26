@@ -307,11 +307,12 @@ sub stream {
 
     my $stream_fh;
     if($usestreamlink && defined($streamlink)) {
-        open($stream_fh, "-|", $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best 2>&1") or die $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to start streamlink.");
+        open($stream_fh, "-|", $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best") or die $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to start streamlink.");
     }
     else {
         open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity pipe:1 2>&1") or die $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to start ffmpeg.");
     }
+
     $client->send_file($stream_fh);
     printf(" and served.\n");
 }

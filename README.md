@@ -34,7 +34,8 @@ when using `plutotv-localserver.pl` also:
 |endpoint | task |
 |-|-|
 |`/playlist`|path to get m3u-file|
-|`/channel?id=`|path to get playlist.m3u8 for given channelid|
+|`/master3u8?id=`|path to get playlist.m3u8 for given channelid|
+|`/channel?id=`|path to get ts via ffmpeg or streamlink for given channelid|
 |`/epg`|path to get xmltv-epg-file|
 
 ## how to load xmltv-guide into tvheadend
