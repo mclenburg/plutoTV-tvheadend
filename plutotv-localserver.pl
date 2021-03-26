@@ -36,7 +36,7 @@ my $bootTime;
 
 #check param
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
-my $usestreamlink = grep { $_ eq '--streamlink'} @ARGV;
+my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
 
 sub get_channel_json {
