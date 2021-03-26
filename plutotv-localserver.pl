@@ -30,11 +30,14 @@ my $apiurl = "http://api.pluto.tv/v2/channels";
 
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
+my $streamlink = which 'streamlink';
 my $session;
 my $bootTime;
 
 #check param
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
+my $usestreamlink = grep { $_ eq '--streamlink'} @ARGV;
+my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
 
 sub get_channel_json {
     my $from = DateTime->now();
@@ -141,7 +144,12 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/channel?id=" . $sender->{_id} . "\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                if($directstreaming || $usestreamlink) {
+                    $m3u .= "http://".$hostip.":$port/channel?id=$sender->{_id}\n";
+                }
+                else {
+                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                }
             }
         }
     }
@@ -282,6 +290,32 @@ sub send_masterm3u8file {
     printf(" and served.\n");
 }
 
+sub stream {
+    my ($client, $request) = @_;
+    my $parse_params = HTTP::Request::Params->new({
+        req => $request,
+    });
+    my $params = $parse_params->params;
+    my $channelid = $params->{'id'};
+
+    my $bootJson = get_bootJson($channelid);
+
+    my $baseurl = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/";
+    my $url = $baseurl."master.m3u8?".$bootJson->{stitcherParams};
+
+    printf("Request for Channel ".$channelid." received");
+
+    my $stream_fh;
+    if($usestreamlink && defined($streamlink)) {
+        open($stream_fh, "-|", $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best 2>&1") or die $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to start streamlink.");
+    }
+    else {
+        open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity pipe:1 2>&1") or die $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to start ffmpeg.");
+    }
+    $client->send_file($stream_fh);
+    printf(" and served.\n");
+}
+
 sub process_request {
     my $from = DateTime->now();
     my $to = $from->add(hours => 6);
@@ -302,8 +336,11 @@ sub process_request {
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
     }
-    elsif($request->uri->path eq "/channel") {
+    elsif($request->uri->path eq "/master3u8") {
         send_masterm3u8file($client, $request);
+    }
+    elsif($request->uri->path eq "/channel") {
+        stream($client, $request);
     }
     elsif($request->uri->path eq "/epg") {
         send_xmltvepgfile($client, $request)

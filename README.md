@@ -18,7 +18,7 @@ when using `plutotv-localserver.pl` also:
 `perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
 
 ### or
-`perl plutotv-localserver.pl [--usestreamlink] [--localonly]` (or start as systemd-daemon)
+`perl plutotv-localserver.pl [--usestreamlink] [--localonly] [--directstreaming]` (or start as systemd-daemon)
 
 ### meaning of params
 |parameter | effect |
@@ -26,8 +26,9 @@ when using `plutotv-localserver.pl` also:
 | `--createm3u` | use with `perl-generate.pl` only, create playlist-file plutotv.m3u and xmltv-file plutotv-epg.xml |
 | `--usebash` | use with `perl-generate.pl` only, create bash-file for each pluto-tv-channel for starting service |
 | `--useffmpeg` | use with `perl-generate.pl` only, will use ffmpeg-pipe instead of using original URL to channel (default in localserver) |
-| `--usestreamlink` | use with `perl-generate.pl` only, same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
+| `--usestreamlink` | same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
 | `--localonly` | use with `plutotv-localserver` only, will configure server to listen on localhost 127.0.0.1 |
+| `--directstreaming` | use with `plutotv-localserver` only, delivers m3u with URL to stream from localserver |
 
 ### available endpoints for localserver
 |endpoint | task |
