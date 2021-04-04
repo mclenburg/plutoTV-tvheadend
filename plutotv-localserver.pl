@@ -320,7 +320,7 @@ sub stream {
     else {
         open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv pipe:1");
     }
-
+    $client->send_header("Content-Type", "video/MP2T");
     $client->send_file($stream_fh);
 
     printf(" and served.\n");
