@@ -7,6 +7,11 @@ $| = 1;
 use strict;
 use warnings;
 
+$SIG{PIPE} = sub {
+    print "Got sigpipe \n";
+
+};
+
 use HTTP::Daemon;
 use HTTP::Status;
 use HTTP::Request::Params;
@@ -306,18 +311,17 @@ sub stream {
     printf("Request for Channel ".$channelid." received");
 
     # workaround until real streaming is working
-    $url = "http://".$hostip.":".$port."/master3u8?id=".$channelid;
+    #$url = "http://".$hostip.":".$port."/master3u8?id=".$channelid;
 
     my $stream_fh;
     if($usestreamlink && defined($streamlink)) {
-        $stream_fh = $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best";
+        open($stream_fh, "-|", $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --ffmpeg-fout mpegts --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best");
     }
     else {
-        $stream_fh = $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv pipe:1 2>&1";
+        open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv pipe:1");
     }
 
-    #$client->send_file($stream_fh);
-    $client->send_redirect("pipe://".$stream_fh);
+    $client->send_file($stream_fh);
 
     printf(" and served.\n");
 }
