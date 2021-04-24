@@ -44,6 +44,24 @@ my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
 
+#TODO: correct forking
+sub forkProcess {
+  my $pid = fork;
+  if($pid) {
+      waitpid $pid, 0;
+  }
+  else {
+      my $pid2 = fork;  #no zombies
+      if($pid2) {
+          exit(0);
+      }
+      else {
+          return 1;
+      }
+  }
+  return 0;
+}
+
 sub get_channel_json {
     my $from = DateTime->now();
     my $to = DateTime->now();
@@ -238,6 +256,8 @@ sub getPlaylistsFromMaster {
     return $m3u8;
 }
 
+#TODO: remove lines, if EXT-DISCONTINUITY appears
+#http://siloh.pluto.tv/c6009f_pluto/clip/ -> http://siloh.pluto.tv/d71341_Pluto_TV_OandO/ when advertising
 sub fixPlaylistUrlsInMaster {
     my ($master, $baseurl) = @_;
     my $lines = () = $master =~ m/\n/g;
@@ -338,10 +358,7 @@ sub process_request {
     my $request = $client->get_request() or die("could not get Client-Request.");
     $client->autoflush(1);
 
-    #http://localhost:9000/playlist <-- liefert m3u aus
-    #http://localhost:9000/channel?id=xxxx <-- liefert Stream des angefragten Senders
-    #http://localhost:9000/epg <-- liefert XMLTV-EPG
-    #http://localhost:9000/ <-- liefert Liste der möglichen Endpunkte
+    #TODO: forking and wait again
 
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
