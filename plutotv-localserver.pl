@@ -44,14 +44,14 @@ my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
 
-#TODO: correct forking
 sub forkProcess {
+  printf("Request received, forking.\n");
   my $pid = fork;
   if($pid) {
       waitpid $pid, 0;
   }
   else {
-      my $pid2 = fork;  #no zombies
+      my $pid2 = fork;  #no zombies, make orphans instead
       if($pid2) {
           exit(0);
       }
@@ -353,12 +353,22 @@ sub process_request {
     $apiurl =~ s/{from}/$from/ig;
     $apiurl =~ s/{to}/$to/ig;
 
+    my $loop = 0;
     my $deamon = shift;
-    my $client = $deamon->accept or die("could not get any Client");
-    my $request = $client->get_request() or die("could not get Client-Request.");
-    $client->autoflush(1);
+    my $client;
+    my $request;
 
-    #TODO: forking and wait again
+    while($loop == 0) {
+        printf("Waiting for incoming requests\n");
+        $client= $deamon->accept or die("could not get any Client");
+        $request = $client->get_request() or die("could not get Client-Request.");
+        $client->autoflush(1);
+        if($request->uri->path eq "/stop") {
+            printf("Stop of Server requested, stopping.\n");
+            exit(0);
+        }
+        $loop = forkProcess();
+    }
 
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
@@ -396,7 +406,4 @@ my $deamon = HTTP::Daemon->new(
 ) or die "Server could not be started.\n\n";
 
 printf("Server started listening on $hostip using port ".$port."\n");
-while (1) {
-    process_request($deamon);
-}
-printf("Server stopped\n");
+process_request($deamon);
