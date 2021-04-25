@@ -422,14 +422,11 @@ sub process_request {
     while($loop == 0) {
         printf("Waiting for incoming requests\n");
         $client= $deamon->accept or die("could not get any Client");
-        $request = $client->get_request() or die("could not get Client-Request.");
-        $client->autoflush(1);
-        if($request->uri->path eq "/stop") {
-            printf("Stop of Server requested, stopping.\n");
-            exit(0);
-        }
         $loop = forkProcess();
     }
+
+    $request = $client->get_request() or die("could not get Client-Request.");
+    $client->autoflush(1);
 
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
