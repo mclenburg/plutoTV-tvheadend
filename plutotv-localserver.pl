@@ -146,7 +146,6 @@ sub send_xmltvepgfile {
 }
 
 sub get_from_url {
-    printf(@_);
     my $request = HTTP::Request->new(GET => @_);
     my $useragent = LWP::UserAgent->new;
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
