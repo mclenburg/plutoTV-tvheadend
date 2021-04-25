@@ -309,6 +309,7 @@ sub removeAdsFromPlaylist {
               $writeline = 1;
             }
         }
+        $linebreakpos = index($playlist, "\n", $linebreakpos+1);
     }
     my $returnlist = $opening."#EXT-X-TARGETDURATION:".$targetduration."\n".$m3u8;
     return $m3u8;
