@@ -6,6 +6,7 @@ $| = 1;
 
 use strict;
 use warnings;
+use threads;
 
 $SIG{PIPE} = sub {
     print "Got sigpipe \n";
@@ -36,8 +37,8 @@ my $apiurl = "http://api.pluto.tv/v2/channels";
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $session;
-my $bootTime;
+our $session;
+our $bootTime;
 
 #check param
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
@@ -45,7 +46,6 @@ my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
 
 sub forkProcess {
-  printf("Request received, forking.\n");
   my $pid = fork;
   if($pid) {
       waitpid $pid, 0;
@@ -207,10 +207,10 @@ sub get_bootJson {
     }
 
     if(!defined $session) {
-      return getBootFromPluto;
+      $session = getBootFromPluto;
     }
     elsif($now > $maxTime) {
-      return getBootFromPluto;
+      $session = getBootFromPluto;
     }
     return $session;
 }
@@ -336,7 +336,7 @@ sub send_playlistm3u8file {
 
     my $playlist = get_from_url($url);
 
-    #$playlist = removeAdsFromPlaylist($playlist);
+    $playlist = removeAdsFromPlaylist($playlist);
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"playlist.m3u8\"");
@@ -360,7 +360,6 @@ sub send_masterm3u8file {
     my $baseurl = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/";
     my $url = $baseurl."master.m3u8";
     $url.="?".$bootJson->{stitcherParams};
-    printf("Request for Channel ".$channelid." received");
     my $master = get_from_url($url);
 
     $master =~ s/terminate=true/terminate=false/ig;
@@ -373,7 +372,6 @@ sub send_masterm3u8file {
     $response->content($master);
 
     $client->send_response($response);
-    printf(" and served.\n");
 }
 
 sub stream {
@@ -415,19 +413,13 @@ sub process_request {
     $apiurl =~ s/{to}/$to/ig;
 
     my $loop = 0;
-    my $deamon = shift;
-    my $client;
+    my $client = shift;
     my $request;
-
-    while($loop == 0) {
-        printf("Waiting for incoming requests\n");
-        $client= $deamon->accept or die("could not get any Client");
-        $loop = forkProcess();
-    }
 
     $request = $client->get_request() or die("could not get Client-Request.");
     $client->autoflush(1);
 
+    printf(" for path ".$request->uri->path."\n");
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
     }
@@ -458,7 +450,7 @@ if(!$localhost) {
 }
 
 # START DAEMON
-my $deamon = HTTP::Daemon->new(
+my $daemon = HTTP::Daemon->new(
     LocalAddr => $hostip,
     LocalPort => $port,
     Reuse => 1,
@@ -466,5 +458,12 @@ my $deamon = HTTP::Daemon->new(
     ReusePort => $port,
 ) or die "Server could not be started.\n\n";
 
+$session = get_bootJson;
+
 printf("Server started listening on $hostip using port ".$port."\n");
-process_request($deamon);
+while (my $client = $daemon->accept) {
+    if(forkProcess == 1) {
+        process_request($client);
+        exit(0);
+    }
+}
