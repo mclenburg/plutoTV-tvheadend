@@ -413,13 +413,13 @@ sub process_request {
     $apiurl =~ s/{to}/$to/ig;
 
     my $loop = 0;
-    my $client = shift;
+    my $client = $_[0];
     my $request;
 
-    $request = $client->get_request() or die("could not get Client-Request.");
+    $request = $client->get_request() or die("could not get Client-Request.\n");
     $client->autoflush(1);
 
-    printf(" for path ".$request->uri->path."\n");
+    printf(" Request received for path ".$request->uri->path."\n");
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
     }
