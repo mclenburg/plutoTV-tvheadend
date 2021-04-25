@@ -285,7 +285,7 @@ sub fixPlaylistUrlsInMaster {
 }
 
 sub removeAdsFromPlaylist {
-    my $playlist = @_[0];
+    my $playlist = $_[0];
     my $lines = () = $playlist =~ m/\n/g;
 
     my $targetduration = 0;
@@ -336,7 +336,7 @@ sub send_playlistm3u8file {
 
     my $playlist = get_from_url($url);
 
-    $playlist = removeAdsFromPlaylist($playlist);
+    #$playlist = removeAdsFromPlaylist($playlist);
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"playlist.m3u8\"");
