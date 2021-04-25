@@ -6,6 +6,12 @@ $| = 1;
 
 use strict;
 use warnings;
+use threads;
+
+$SIG{PIPE} = sub {
+    print "Got sigpipe \n";
+
+};
 
 use HTTP::Daemon;
 use HTTP::Status;
@@ -31,13 +37,30 @@ my $apiurl = "http://api.pluto.tv/v2/channels";
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $session;
-my $bootTime;
+our $session;
+our $bootTime;
 
 #check param
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
+
+sub forkProcess {
+  my $pid = fork;
+  if($pid) {
+      waitpid $pid, 0;
+  }
+  else {
+      my $pid2 = fork;  #no zombies, make orphans instead
+      if($pid2) {
+          exit(0);
+      }
+      else {
+          return 1;
+      }
+  }
+  return 0;
+}
 
 sub get_channel_json {
     my $from = DateTime->now();
@@ -148,7 +171,7 @@ sub buildM3U {
                     $m3u .= "http://".$hostip.":$port/channel?id=$sender->{_id}\n";
                 }
                 else {
-                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
                 }
             }
         }
@@ -184,10 +207,10 @@ sub get_bootJson {
     }
 
     if(!defined $session) {
-      return getBootFromPluto;
+      $session = getBootFromPluto;
     }
     elsif($now > $maxTime) {
-      return getBootFromPluto;
+      $session = getBootFromPluto;
     }
     return $session;
 }
@@ -234,7 +257,7 @@ sub getPlaylistsFromMaster {
 }
 
 sub fixPlaylistUrlsInMaster {
-    my ($master, $baseurl) = @_;
+    my ($master, $channelid, $sessionid) = @_;
     my $lines = () = $master =~ m/\n/g;
 
     my $linebreakpos = -1;
@@ -243,7 +266,8 @@ sub fixPlaylistUrlsInMaster {
     for (my $linenum=0; $linenum<$lines; $linenum++) {
         my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
         if($readnextline == 1) {
-            $m3u8 .= $baseurl.$line;
+            #$m3u8 .= $baseurl.$line;
+            $m3u8 .= "http://".$hostip.":".$port."/playlist3u8?id=".substr($line,0,index($line, "/"))."&channelid=".$channelid."&session=".$sessionid."\n";
             $readnextline = 0;
             $linebreakpos = index($master, "\n", $linebreakpos+1);
             next;
@@ -260,6 +284,69 @@ sub fixPlaylistUrlsInMaster {
     return $m3u8;
 }
 
+sub removeAdsFromPlaylist {
+    my $playlist = $_[0];
+    my $lines = () = $playlist =~ m/\n/g;
+
+    my $targetduration = 0;
+    my $opening = "#EXTM3U\n#EXT-X-VERSION:3\n";
+    my $linebreakpos = -1;
+    my $writeline = 1;
+    my $m3u8 = "";
+    for (my $linenum=0; $linenum<$lines; $linenum++) {
+        if($linenum < 4) {
+            $linebreakpos = index($playlist, "\n", $linebreakpos+1);
+            next;
+        }
+        my $line = substr($playlist, $linebreakpos+1, index($playlist, "\n", $linebreakpos+1)-$linebreakpos);
+        if(substr($line, 0, 18) eq "#EXT-X-DISCONTINUITY") {
+            $writeline = 0;
+        }
+        if($writeline == 1) {
+            if(substr($line, 0, 7) eq "#EXTINF") {
+                $targetduration++;
+            }
+            $m3u8 .= $line;
+        }
+        else {
+            if(substr($line, 0, 4) eq "http") {
+              $writeline = 1;
+            }
+        }
+        $linebreakpos = index($playlist, "\n", $linebreakpos+1);
+    }
+    my $returnlist = $opening."#EXT-X-TARGETDURATION:".$targetduration."\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n".$m3u8;
+    return $returnlist;
+}
+
+sub send_playlistm3u8file {
+    my ($client, $request) = @_;
+    my $parse_params = HTTP::Request::Params->new({
+        req => $request,
+    });
+    my $params = $parse_params->params;
+    my $playlistid = $params->{'id'};
+    my $channelid = $params->{'channelid'};
+    my $sessionid = $params->{'session'};
+
+    my $bootJson = get_bootJson($channelid);
+
+    my $getparams = "terminate=false&embedPartner=&serverSideAds=false&paln=&includeExtendedEvents=false&architecture=&deviceId=unknown&deviceVersion=unknown&appVersion=unknown&deviceType=web&deviceMake=Firefox&sid=".$sessionid."&advertisingId=&deviceLat=54.1241&deviceLon=12.1247&deviceDNT=0&deviceModel=web&userId=&appName=";
+    my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/".$playlistid."/playlist.m3u8?".$getparams;
+
+    my $playlist = get_from_url($url);
+
+    $playlist = removeAdsFromPlaylist($playlist);
+
+    my $response = HTTP::Response->new();
+    $response->header("content-disposition", "filename=\"playlist.m3u8\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content($playlist);
+
+    $client->send_response($response);
+}
+
 sub send_masterm3u8file {
     my ($client, $request) = @_;
     my $parse_params = HTTP::Request::Params->new({
@@ -273,12 +360,10 @@ sub send_masterm3u8file {
     my $baseurl = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/";
     my $url = $baseurl."master.m3u8";
     $url.="?".$bootJson->{stitcherParams};
-    printf("Request for Channel ".$channelid." received");
     my $master = get_from_url($url);
 
     $master =~ s/terminate=true/terminate=false/ig;
-    $master = fixPlaylistUrlsInMaster($master, $baseurl);
-    #$playlists =~ s/terminate=true/terminate=false/ig;
+    $master = fixPlaylistUrlsInMaster($master, $channelid, $bootJson->{session}->{sessionID});
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"master.m3u8\"");
@@ -287,7 +372,6 @@ sub send_masterm3u8file {
     $response->content($master);
 
     $client->send_response($response);
-    printf(" and served.\n");
 }
 
 sub stream {
@@ -306,18 +390,17 @@ sub stream {
     printf("Request for Channel ".$channelid." received");
 
     # workaround until real streaming is working
-    $url = "http://".$hostip.":".$port."/master3u8?id=".$channelid;
+    #$url = "http://".$hostip.":".$port."/master3u8?id=".$channelid;
 
     my $stream_fh;
     if($usestreamlink && defined($streamlink)) {
-        $stream_fh = $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best";
+        open($stream_fh, "-|", $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --ffmpeg-fout mpegts --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best");
     }
     else {
-        $stream_fh = $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv pipe:1 2>&1";
+        open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -c copy -mpegts_service_type advanced_codec_digital_hdtv pipe:1");
     }
-
-    #$client->send_file($stream_fh);
-    $client->send_redirect("pipe://".$stream_fh);
+    $client->send_header("Content-Type", "video/MP2T");
+    $client->send_file($stream_fh);
 
     printf(" and served.\n");
 }
@@ -329,21 +412,22 @@ sub process_request {
     $apiurl =~ s/{from}/$from/ig;
     $apiurl =~ s/{to}/$to/ig;
 
-    my $deamon = shift;
-    my $client = $deamon->accept or die("could not get any Client");
-    my $request = $client->get_request() or die("could not get Client-Request.");
+    my $loop = 0;
+    my $client = $_[0];
+    my $request;
+
+    $request = $client->get_request() or die("could not get Client-Request.\n");
     $client->autoflush(1);
 
-    #http://localhost:9000/playlist <-- liefert m3u aus
-    #http://localhost:9000/channel?id=xxxx <-- liefert Stream des angefragten Senders
-    #http://localhost:9000/epg <-- liefert XMLTV-EPG
-    #http://localhost:9000/ <-- liefert Liste der möglichen Endpunkte
-
+    printf(" Request received for path ".$request->uri->path."\n");
     if($request->uri->path eq "/playlist") {
         send_m3ufile($client);
     }
     elsif($request->uri->path eq "/master3u8") {
         send_masterm3u8file($client, $request);
+    }
+    elsif($request->uri->path eq "/playlist3u8") {
+        send_playlistm3u8file($client, $request);
     }
     elsif($request->uri->path eq "/channel") {
         stream($client, $request);
@@ -366,7 +450,7 @@ if(!$localhost) {
 }
 
 # START DAEMON
-my $deamon = HTTP::Daemon->new(
+my $daemon = HTTP::Daemon->new(
     LocalAddr => $hostip,
     LocalPort => $port,
     Reuse => 1,
@@ -374,8 +458,12 @@ my $deamon = HTTP::Daemon->new(
     ReusePort => $port,
 ) or die "Server could not be started.\n\n";
 
+$session = get_bootJson;
+
 printf("Server started listening on $hostip using port ".$port."\n");
-while (1) {
-    process_request($deamon);
+while (my $client = $daemon->accept) {
+    if(forkProcess == 1) {
+        process_request($client);
+        exit(0);
+    }
 }
-printf("Server stopped\n");
