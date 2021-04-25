@@ -285,7 +285,7 @@ sub fixPlaylistUrlsInMaster {
 }
 
 sub removeAdsFromPlaylist {
-    my $playlist = @_;
+    my $playlist = @_[0];
     my $lines = () = $playlist =~ m/\n/g;
 
     my $targetduration = 0;
@@ -293,9 +293,13 @@ sub removeAdsFromPlaylist {
     my $linebreakpos = -1;
     my $writeline = 1;
     my $m3u8 = "";
-    for (my $linenum=3; $linenum<$lines; $linenum++) {
+    for (my $linenum=0; $linenum<$lines; $linenum++) {
+        if($linenum < 4) {
+            $linebreakpos = index($playlist, "\n", $linebreakpos+1);
+            next;
+        }
         my $line = substr($playlist, $linebreakpos+1, index($playlist, "\n", $linebreakpos+1)-$linebreakpos);
-        if(substr($line, 0, 18) eq "#EXT-DISCONTINUITY") {
+        if(substr($line, 0, 18) eq "#EXT-X-DISCONTINUITY") {
             $writeline = 0;
         }
         if($writeline == 1) {
@@ -311,8 +315,8 @@ sub removeAdsFromPlaylist {
         }
         $linebreakpos = index($playlist, "\n", $linebreakpos+1);
     }
-    my $returnlist = $opening."#EXT-X-TARGETDURATION:".$targetduration."\n".$m3u8;
-    return $m3u8;
+    my $returnlist = $opening."#EXT-X-TARGETDURATION:".$targetduration."\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n".$m3u8;
+    return $returnlist;
 }
 
 sub send_playlistm3u8file {
