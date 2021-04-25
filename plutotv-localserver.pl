@@ -284,8 +284,36 @@ sub fixPlaylistUrlsInMaster {
     return $m3u8;
 }
 
-#TODO: remove lines, if EXT-DISCONTINUITY appears
-#http://siloh.pluto.tv/c6009f_pluto/clip/ -> http://siloh.pluto.tv/d71341_Pluto_TV_OandO/ when advertising
+sub removeAdsFromPlaylist {
+    my $playlist = @_;
+    my $lines = () = $playlist =~ m/\n/g;
+
+    my $targetduration = 0;
+    my $opening = "#EXTM3U\n#EXT-X-VERSION:3\n";
+    my $linebreakpos = -1;
+    my $writeline = 1;
+    my $m3u8 = "";
+    for (my $linenum=3; $linenum<$lines; $linenum++) {
+        my $line = substr($playlist, $linebreakpos+1, index($playlist, "\n", $linebreakpos+1)-$linebreakpos);
+        if(substr($line, 0, 18) eq "#EXT-DISCONTINUITY") {
+            $writeline = 0;
+        }
+        if($writeline == 1) {
+            if(substr($line, 0, 7) eq "#EXTINF") {
+                $targetduration++;
+            }
+            $m3u8 .= $line;
+        }
+        else {
+            if(substr($line, 0, 4) eq "http") {
+              $writeline = 1;
+            }
+        }
+    }
+    my $returnlist = $opening."#EXT-X-TARGETDURATION:".$targetduration."\n".$m3u8;
+    return $m3u8;
+}
+
 sub send_playlistm3u8file {
     my ($client, $request) = @_;
     my $parse_params = HTTP::Request::Params->new({
@@ -302,6 +330,8 @@ sub send_playlistm3u8file {
     my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/".$playlistid."/playlist.m3u8?".$getparams;
 
     my $playlist = get_from_url($url);
+
+    $playlist = removeAdsFromPlaylist($playlist);
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"playlist.m3u8\"");
