@@ -146,6 +146,7 @@ sub send_xmltvepgfile {
 }
 
 sub get_from_url {
+    printf(@_);
     my $request = HTTP::Request->new(GET => @_);
     my $useragent = LWP::UserAgent->new;
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
@@ -256,10 +257,8 @@ sub getPlaylistsFromMaster {
     return $m3u8;
 }
 
-#TODO: remove lines, if EXT-DISCONTINUITY appears
-#http://siloh.pluto.tv/c6009f_pluto/clip/ -> http://siloh.pluto.tv/d71341_Pluto_TV_OandO/ when advertising
 sub fixPlaylistUrlsInMaster {
-    my ($master, $baseurl) = @_;
+    my ($master, $channelid, $sessionid) = @_;
     my $lines = () = $master =~ m/\n/g;
 
     my $linebreakpos = -1;
@@ -268,7 +267,8 @@ sub fixPlaylistUrlsInMaster {
     for (my $linenum=0; $linenum<$lines; $linenum++) {
         my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
         if($readnextline == 1) {
-            $m3u8 .= $baseurl.$line;
+            #$m3u8 .= $baseurl.$line;
+            $m3u8 .= "http://".$hostip.":".$port."/playlist3u8?id=".substr($line,0,index($line, "/"))."&channelid=".$channelid."&session=".$sessionid."\n";
             $readnextline = 0;
             $linebreakpos = index($master, "\n", $linebreakpos+1);
             next;
@@ -283,6 +283,34 @@ sub fixPlaylistUrlsInMaster {
         $linebreakpos = index($master, "\n", $linebreakpos+1);
     }
     return $m3u8;
+}
+
+#TODO: remove lines, if EXT-DISCONTINUITY appears
+#http://siloh.pluto.tv/c6009f_pluto/clip/ -> http://siloh.pluto.tv/d71341_Pluto_TV_OandO/ when advertising
+sub send_playlistm3u8file {
+    my ($client, $request) = @_;
+    my $parse_params = HTTP::Request::Params->new({
+        req => $request,
+    });
+    my $params = $parse_params->params;
+    my $playlistid = $params->{'id'};
+    my $channelid = $params->{'channelid'};
+    my $sessionid = $params->{'session'};
+
+    my $bootJson = get_bootJson($channelid);
+
+    my $getparams = "terminate=false&embedPartner=&serverSideAds=false&paln=&includeExtendedEvents=false&architecture=&deviceId=unknown&deviceVersion=unknown&appVersion=unknown&deviceType=web&deviceMake=Firefox&sid=".$sessionid."&advertisingId=&deviceLat=54.1241&deviceLon=12.1247&deviceDNT=0&deviceModel=web&userId=&appName=";
+    my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/".$playlistid."/playlist.m3u8?".$getparams;
+
+    my $playlist = get_from_url($url);
+
+    my $response = HTTP::Response->new();
+    $response->header("content-disposition", "filename=\"playlist.m3u8\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content($playlist);
+
+    $client->send_response($response);
 }
 
 sub send_masterm3u8file {
@@ -302,8 +330,7 @@ sub send_masterm3u8file {
     my $master = get_from_url($url);
 
     $master =~ s/terminate=true/terminate=false/ig;
-    $master = fixPlaylistUrlsInMaster($master, $baseurl);
-    #$playlists =~ s/terminate=true/terminate=false/ig;
+    $master = fixPlaylistUrlsInMaster($master, $channelid, $bootJson->{session}->{sessionID});
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"master.m3u8\"");
@@ -375,6 +402,9 @@ sub process_request {
     }
     elsif($request->uri->path eq "/master3u8") {
         send_masterm3u8file($client, $request);
+    }
+    elsif($request->uri->path eq "/playlist3u8") {
+        send_playlistm3u8file($client, $request);
     }
     elsif($request->uri->path eq "/channel") {
         stream($client, $request);
