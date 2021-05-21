@@ -3,7 +3,7 @@ Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.
 So far, there are still short interruptions when advertising starts or ends.  
       
 There are two ways to use these scripts:
-* you can generate a static m3u by using the `plutotv-generate.pl`-script with params 
+* you can generate a static m3u8 by using the `plutotv-generate.pl`-script with params 
 * you can start `plutotv-localserver.pl` as local HTTP-Server and call it via URLs
 
 
@@ -23,7 +23,7 @@ when using `plutotv-localserver.pl` also:
 ### meaning of params
 |parameter | effect |
 |-|-|
-| `--createm3u` | use with `perl-generate.pl` only, create playlist-file plutotv.m3u and xmltv-file plutotv-epg.xml |
+| `--createm3u` | use with `perl-generate.pl` only, create playlist-file plutotv.m3u8 and xmltv-file plutotv-epg.xml |
 | `--usebash` | use with `perl-generate.pl` only, create bash-file for each pluto-tv-channel for starting service |
 | `--useffmpeg` | use with `perl-generate.pl` only, will use ffmpeg-pipe instead of using original URL to channel (default in localserver) |
 | `--usestreamlink` | use with `perl-generate.pl` only, same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
@@ -32,7 +32,7 @@ when using `plutotv-localserver.pl` also:
 ### available endpoints for localserver
 |endpoint | task |
 |-|-|
-|`/playlist`|path to get m3u-file|
+|`/playlist`|path to get m3u8-file|
 |`/channel?id=`|path to get playlist.m3u8 for given channelid|
 |`/epg`|path to get xmltv-epg-file|
 

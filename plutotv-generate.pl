@@ -95,7 +95,7 @@ if($useffmpeg and $usestreamlink) {
 
 if ($response->is_success) {
     my $epgfile = 'plutotv-epg.xml';
-    my $m3ufile = 'plutotv.m3u';
+    my $m3ufile = 'plutotv.m3u8';
     my $sourcesfile = 'sources.json';
     open(my $fh, '>', $epgfile) or die "Could not open file '$epgfile' $!";
     my $fhm;

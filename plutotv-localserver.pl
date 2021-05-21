@@ -58,7 +58,7 @@ sub send_help {
     my $response = HTTP::Response->new();
     $response->code(200);
     $response->message("OK");
-    $response->content("Following endpoints are available:\n\t/playlist\tfor full m3u-file\n\t/channel?id=\tfor master.m3u8 of specific channel\n\t/epg\t\tfor xmltv-epg-file\n");
+    $response->content("Following endpoints are available:\n\t/playlist\tfor full m3u8-file\n\t/channel?id=\tfor master.m3u8 of specific channel\n\t/epg\t\tfor xmltv-epg-file\n");
 
     $client->send_response($response);
 }
@@ -194,7 +194,7 @@ sub send_m3ufile {
     my $m3uContent = buildM3U(@senderListe);
     my $response = HTTP::Response->new();
     $response->header("content-type", "audio/x-mpegurl");
-    $response->header("content-disposition", "filename=\"plutotv.m3u\"");
+    $response->header("content-disposition", "filename=\"plutotv.m3u8\"");
     $response->code(200);
     $response->message("OK");
     $response->content($m3uContent);
