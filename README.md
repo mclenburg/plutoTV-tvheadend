@@ -33,7 +33,7 @@ when using `plutotv-localserver.pl` also:
 ### available endpoints for localserver
 |endpoint | task |
 |-|-|
-|`/playlist`|path to get m3u-file|
+|`/playlist`|path to get m3u8-file|
 |`/master3u8?id=`|path to get playlist.m3u8 for given channelid|
 |`/channel?id=`|path to get ts via ffmpeg or streamlink for given channelid|
 |`/epg`|path to get xmltv-epg-file|
