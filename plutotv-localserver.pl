@@ -336,7 +336,7 @@ sub send_playlistm3u8file {
 
     my $playlist = get_from_url($url);
 
-    $playlist = removeAdsFromPlaylist($playlist);
+    #$playlist = removeAdsFromPlaylist($playlist);
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"playlist.m3u8\"");
