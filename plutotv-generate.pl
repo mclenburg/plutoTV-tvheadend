@@ -154,7 +154,7 @@ if ($response->is_success) {
                         print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                     }
                     else {
-                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-key-uri \"\" --hls-segment-timeout 5 \"".$url."\" best \n";
+                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" best \n";
                     }
                   }
                 elsif( $jalle19 ) {
