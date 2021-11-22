@@ -1,7 +1,8 @@
 # plutoTV-tvheadend
 Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.  
 So far, there are still short interruptions when advertising starts or ends.  
-      
+This is due to an [issue in ffmpeg](https://trac.ffmpeg.org/ticket/5419).    
+   
 There are two ways to use these scripts:
 * you can generate a static m3u8 by using the `plutotv-generate.pl`-script with params 
 * you can start `plutotv-localserver.pl` as local HTTP-Server and call it via URLs
@@ -21,18 +22,25 @@ when using `plutotv-localserver.pl` also:
 `perl plutotv-localserver.pl [--usestreamlink] [--localonly] [--directstreaming]` (or start as systemd-daemon)
 
 ### meaning of params
-|parameter | effect |
-|-|-|
-| `--createm3u` | use with `perl-generate.pl` only, create playlist-file plutotv.m3u8 and xmltv-file plutotv-epg.xml |
-| `--usebash` | use with `perl-generate.pl` only, create bash-file for each pluto-tv-channel for starting service |
-| `--useffmpeg` | use with `perl-generate.pl` only, will use ffmpeg-pipe instead of using original URL to channel (default in localserver) |
+
+#### plutotv-generate.pl
+
+| parameter | effect |  
+|---|---|  
+| `--createm3u` | create playlist-file plutotv.m3u8 and xmltv-file plutotv-epg.xml |
+| `--usebash` | create bash-file for each pluto-tv-channel for starting service |
+| `--useffmpeg` | will use ffmpeg-pipe instead of using original URL to channel |
 | `--usestreamlink` | same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
-| `--localonly` | use with `plutotv-localserver` only, will configure server to listen on localhost 127.0.0.1 |
-| `--directstreaming` | use with `plutotv-localserver` only, delivers m3u with URL to stream from localserver |
+
+#### plutotv-localserver.pl  
+
+|parameter | effect |
+|---|---|
+| `--localonly` | will configure server to listen on localhost 127.0.0.1 |
 
 ### available endpoints for localserver
 |endpoint | task |
-|-|-|
+|---|---|
 |`/playlist`|path to get m3u8-file|
 |`/master3u8?id=`|path to get playlist.m3u8 for given channelid|
 |`/channel?id=`|path to get ts via ffmpeg or streamlink for given channelid|
