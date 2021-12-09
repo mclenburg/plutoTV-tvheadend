@@ -57,6 +57,12 @@ or using pluto-localserver.pl
 
 `curl http://127.0.0.1:9120/epg | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock`
 
+## how to Add localserver to Tvheadend
+Go to Configuration -> DVB-Inputs -> Networks
+Add a new IPTV-Automatic Network, settings see below
+
+![alt_text](https://https://github.com/phil2sat/plutoTV-tvheadend/edit/master/tvheadend.png?raw=true)
+
 
 ## more
 PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
