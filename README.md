@@ -61,6 +61,7 @@ or using pluto-localserver.pl
 ## more
 PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
 crontab:
+
 `15 */6 * * * perl plutotv-generate.pl`
 
 or to push the changes directly to Tvheadend
