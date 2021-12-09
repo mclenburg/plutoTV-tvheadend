@@ -53,13 +53,16 @@ when using `plutotv-localserver.pl` also:
 
 `cat plutotv-epg.xml | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock`
 
+or using pluto-localserver.pl
+
+`curl http://127.0.0.1:9120/epg | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock`
+
 
 ## more
 PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
 crontab:
 `15 */6 * * * perl plutotv-generate.pl`
 
-or
+or to push the changes directly to Tvheadend
 
-`15 */6 * * * wget http://localhost:9000/epg -O plutotv-epg.xml`
-
+`15 */6 * * * curl http://127.0.0.1:9120/epg | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock`
