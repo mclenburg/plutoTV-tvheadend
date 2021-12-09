@@ -30,7 +30,7 @@ use File::Which;
 use Net::Address::IP::Local;
 
 my $hostip = "127.0.0.1";
-my $port   = "9000";
+my $port   = "9120";
 my $apiurl = "http://api.pluto.tv/v2/channels";
 #channel-id: 5ddbf866b1862a0009a0648e
 
@@ -171,7 +171,7 @@ sub buildM3U {
                     $m3u .= "http://".$hostip.":$port/channel?id=$sender->{_id}\n";
                 }
                 else {
-                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                    $m3u .= "pipe://" . $ffmpeg . " -loglevel debug -threads 2 -re -stream_loop -1 -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
                 }
             }
         }
@@ -394,10 +394,11 @@ sub stream {
 
     my $stream_fh;
     if($usestreamlink && defined($streamlink)) {
-        open($stream_fh, "-|", $streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --ffmpeg-fout mpegts --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" 720,best");
+        open($stream_fh, "-|", $streamlink." --stdout --ffmpeg-verbose --loglevel debug --ffmpeg-fout mpegts \"".$url."\" 720,best");
     }
     else {
-        open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -c copy -mpegts_service_type advanced_codec_digital_hdtv pipe:1");
+        open($stream_fh, "-|", $ffmpeg . " -loglevel debug -threads 2 -re -stream_loop -1 -i '$url' -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -c copy -mpegts_service_type advanced_codec_digital_hdtv pipe:1");
+## Orig        open($stream_fh, "-|", $ffmpeg . " -loglevel fatal -threads 2 -re -i '$url' -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_flags +initial_discontinuity -c copy -mpegts_service_type advanced_codec_digital_hdtv pipe:1");
     }
     $client->send_header("Content-Type", "video/MP2T");
     $client->send_file($stream_fh);
