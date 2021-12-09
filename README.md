@@ -61,7 +61,7 @@ or using pluto-localserver.pl
 Go to Configuration -> DVB-Inputs -> Networks
 Add a new IPTV-Automatic Network, settings see below
 
-![alt_text](https://https://github.com/phil2sat/plutoTV-tvheadend/edit/master/tvheadend.png?raw=true)
+![alt_text](https://github.com/phil2sat/plutoTV-tvheadend/edit/master/tvheadend.png?raw=true)
 
 
 ## more
