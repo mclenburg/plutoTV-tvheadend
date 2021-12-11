@@ -268,7 +268,13 @@ sub fixPlaylistUrlsInMaster {
         my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
         if($readnextline == 1) {
             #$m3u8 .= $baseurl.$line;
-            $m3u8 .= "http://".$hostip.":".$port."/playlist3u8?id=".substr($line,0,index($line, "/"))."&channelid=".$channelid."&session=".$sessionid."\n";
+            my $url = "http://".$hostip.":".$port."/playlist3u8?id=".substr($line,0,index($line, "/"))."&channelid=".$channelid."&session=".$sessionid."\n";
+            if($latepipe) {
+                $m3u8 .= $ffmpeg . "-loglevel debug -i \"" . $url . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n";
+            }
+            else {
+                $m3u8 .= $url;
+            }
             $readnextline = 0;
             $linebreakpos = index($master, "\n", $linebreakpos+1);
             next;
@@ -299,7 +305,7 @@ sub ffmpegEachSingleFile {
         my $line = substr($playlist, $linebreakpos+1, index($playlist, "\n", $linebreakpos+1)-$linebreakpos);
         if(substr($line, 0, 4) eq "http") {
             $line =~ s/\n//ig;
-            $m3u8 .= $ffmpeg . "-loglevel debug -i \"" . $line . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n"
+            $m3u8 .= $ffmpeg . "-loglevel debug -i \"" . $line . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n";
         }
         else {
             $m3u8 .= $line;
