@@ -269,12 +269,7 @@ sub fixPlaylistUrlsInMaster {
         if($readnextline == 1) {
             #$m3u8 .= $baseurl.$line;
             my $url = "http://".$hostip.":".$port."/playlist3u8?id=".substr($line,0,index($line, "/"))."&channelid=".$channelid."&session=".$sessionid."\n";
-            if($latepipe) {
-                $m3u8 .= "pipe://" . $ffmpeg . " -loglevel debug -i \"" . $url . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n";
-            }
-            else {
-                $m3u8 .= $url;
-            }
+            $m3u8 .= $url;
             $readnextline = 0;
             $linebreakpos = index($master, "\n", $linebreakpos+1);
             next;
