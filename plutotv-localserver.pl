@@ -284,6 +284,29 @@ sub fixPlaylistUrlsInMaster {
     return $m3u8;
 }
 
+sub ffmpegEachSingleFile {
+    my $playlist = $_[0];
+    my $lines = () = $playlist =~ m/\n/g;
+
+    my $opening = "#EXTM3U\n#EXT-X-VERSION:3\n";
+    my $m3u8 = "";
+
+    my $linebreakpos = -1;
+
+    for (my $linenum=0; $linenum<$lines; $linenum++) {
+        $linebreakpos = index($playlist, "\n", $linebreakpos+1);
+        my $line = substr($playlist, $linebreakpos+1, index($playlist, "\n", $linebreakpos+1)-$linebreakpos);
+        if(substr($line, 0, 4) eq "http") {
+            $line =~ s/\n//ig;
+            $m3u8 .= $ffmpeg . "-loglevel fatal -i \"" . $line . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n"
+        }
+        else {
+            $m3u8 .= $line;
+        }
+    }
+    return $m3u8;
+}
+
 sub removeAdsFromPlaylist {
     my $playlist = $_[0];
     my $lines = () = $playlist =~ m/\n/g;
@@ -337,6 +360,7 @@ sub send_playlistm3u8file {
     my $playlist = get_from_url($url);
 
     #$playlist = removeAdsFromPlaylist($playlist);
+    $playlist = ffmpegEachSingleFile($playlist);
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"playlist.m3u8\"");
