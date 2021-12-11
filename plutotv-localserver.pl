@@ -44,6 +44,7 @@ our $bootTime;
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $directstreaming = grep { $_ eq '--directstreaming'} @ARGV;
+my $latepipe = grep { $_ eq '--latepipe'} @ARGV;
 
 sub forkProcess {
   my $pid = fork;
@@ -169,6 +170,9 @@ sub buildM3U {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
                 if($directstreaming || $usestreamlink) {
                     $m3u .= "http://".$hostip.":$port/channel?id=$sender->{_id}\n";
+                }
+                elsif($latepipe) {
+                    $m3u .= "http://".$hostip.":$port/master3u8?id=$sender->{_id}\n";
                 }
                 else {
                     $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -stream_loop -1 -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
@@ -360,7 +364,9 @@ sub send_playlistm3u8file {
     my $playlist = get_from_url($url);
 
     #$playlist = removeAdsFromPlaylist($playlist);
-    $playlist = ffmpegEachSingleFile($playlist);
+    if($latepipe) {
+        $playlist = ffmpegEachSingleFile($playlist);
+    }
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"playlist.m3u8\"");
