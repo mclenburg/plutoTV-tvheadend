@@ -302,7 +302,7 @@ sub ffmpegEachSingleFile {
         my $line = substr($playlist, $linebreakpos+1, index($playlist, "\n", $linebreakpos+1)-$linebreakpos);
         if(substr($line, 0, 4) eq "http") {
             $line =~ s/\n//ig;
-            $m3u8 .= $ffmpeg . "-loglevel fatal -i \"" . $line . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n"
+            $m3u8 .= $ffmpeg . "-loglevel debug -i \"" . $line . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n"
         }
         else {
             $m3u8 .= $line;
