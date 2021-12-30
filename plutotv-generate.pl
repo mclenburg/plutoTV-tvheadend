@@ -57,7 +57,7 @@ sub create_bashfile {
         print $fhb $ffmpeg." -loglevel fatal -copytb 1 -headers \"Connection: Keep-Alive\" -threads 2 -re -stream_loop -1 -vsync cfr -dts_delta_threshold 30 -err_detect ignore_err -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:82.0) Gecko/20100101 Firefox/76.0\" -i \$repurl -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -f mpegts -tune zerolatency -preset ultrafast -metadata service_name='".$_[0]->{name}."' -mpegts_service_type advanced_codec_digital_hdtv pipe:1\n";
     }
     else {
-        print $fhb "$streamlink --stdout --http-header \"Connection=keep-alive\" --http-header \"DNT=1\" --http-header \"TE=Trailers\" --quiet --hls-live-restart --hds-segment-threads 2 \"\$repurl\" best \n";
+        print $fhb "$streamlink --stdout --http-header \"Connection=keep-alive\" --http-header \"DNT=1\" --http-header \"TE=Trailers\" --quiet --hls-live-restart \"\$repurl\" best \n";
     }
     close $fhb;
     chmod 0777, $_[3].".sh";
@@ -154,7 +154,7 @@ if ($response->is_success) {
                         print $fhm "pipe://".$ffmpeg." -loglevel fatal -threads 2 -re -stream_loop -1 -user-agent \"Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:76.0) Gecko/20100101 Firefox/76.0\" -i \"".$url."\" -fflags +genpts+ignidx+igndts -vcodec copy -acodec copy -f mpegts -tune zerolatency -metadata service_name=\"".$sender->{name}."\" pipe:1\n";
                     }
                     else {
-                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hds-segment-threads 2 --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" best \n";
+                        print $fhm "pipe://".$streamlink." --stdout --quiet --twitch-disable-hosting --ringbuffer-size 8M --hls-segment-attempts 2 --hls-segment-timeout 5 \"".$url."\" best \n";
                     }
                   }
                 elsif( $jalle19 ) {
