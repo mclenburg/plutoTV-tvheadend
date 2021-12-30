@@ -19,7 +19,7 @@ when using `plutotv-localserver.pl` also:
 `perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
 
 ### or
-`perl plutotv-localserver.pl [--usestreamlink] [--localonly] [--directstreaming]` (or start as systemd-daemon)
+`perl plutotv-localserver.pl [--localonly]` (or start as systemd-daemon)
 
 ### meaning of params
 
