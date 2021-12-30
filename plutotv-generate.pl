@@ -136,10 +136,10 @@ if ($response->is_success) {
         $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
         $url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
         $uuid = uuid_to_string(create_uuid(UUID_V1));
-
+        my $logo = $sender->{logo};
+        if(undef $logo->{path}) {next;}
         print $fh "<channel id=\"".uri_escape($sendername)."\">\n";
         print $fh "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n" ;
-        my $logo = $sender->{logo};
         $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
         print $fh "<icon src=\"".$logo->{path}."\" />\n";
         print $fh "</channel>\n";
