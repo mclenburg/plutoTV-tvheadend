@@ -40,7 +40,7 @@ my $localhost = grep { $_ eq '--localonly'} @ARGV;
 
 sub getArgsValue {
     my ($param) = @_;
-    foreach $argnum (0 .. $#ARGV) {
+    foreach my $argnum (0 .. $#ARGV) {
         if($ARGV[$argnum] eq "--port") {
             return $ARGV[$argnum+1];
         }
