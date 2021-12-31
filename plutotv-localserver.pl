@@ -42,7 +42,6 @@ sub getArgsValue {
     my ($param) = @_;
     foreach my $argnum (0 .. $#ARGV) {
         if($ARGV[$argnum] eq "--port") {
-            printf($ARGV[$argnum+1]);
             return $ARGV[$argnum+1];
         }
     }
