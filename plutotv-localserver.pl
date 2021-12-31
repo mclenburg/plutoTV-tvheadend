@@ -377,7 +377,7 @@ if(!$localhost) {
     $hostip = Net::Address::IP::Local->public_ipv4;
 }
 
-if(getArgsValue("--port") != undef) {
+if(defined(getArgsValue("--port"))) {
     $port = getArgsValue("--port");
 }
 
