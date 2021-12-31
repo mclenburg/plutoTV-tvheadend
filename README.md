@@ -37,6 +37,7 @@ when using `plutotv-localserver.pl` also:
 |parameter | effect |
 |---|---|
 | `--localonly` | will configure server to listen on localhost 127.0.0.1 |
+| `--port <number>` | set listening-port for server (default: 9000) | 
 
 ### available endpoints for localserver
 |endpoint | task |
