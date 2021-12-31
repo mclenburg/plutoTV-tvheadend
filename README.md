@@ -12,7 +12,7 @@ There are two ways to use these scripts:
 `sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny File::Which`
 
 when using `plutotv-localserver.pl` also:
-`sudo cpan install HTTP::Request::Params HTTP::Deamon HTTP::Status HTTP::Requst::Common HTTP::Cookies Net::Address::IP::Local`
+`sudo cpan install HTTP::Request::Params HTTP::Daemon HTTP::Status HTTP::Request::Common HTTP::Cookies Net::Address::IP::Local`
 
 
 ## usage
