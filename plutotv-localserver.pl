@@ -180,7 +180,7 @@ sub buildM3U {
                     $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
                     $url =~ s/&appName=&/&appName=web&/ig;
                     $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
-                    my $sessionid = $bootJson->{session}->{sessionID};
+                    my $sessionid = $session->{session}->{sessionID};
                     $url =~ s/&sid=/&sid=$sessionid&sessionID=$sessionid/ig;
                     $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
                     $url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
