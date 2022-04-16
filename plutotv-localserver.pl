@@ -71,7 +71,7 @@ sub get_channel_json {
     $to=$to->add(days => 2);
     my $url = $apiurl."?start=".$from."Z&stop=".$to."Z";
     my $request = HTTP::Request->new(GET => $url);
-    my $useragent = LWP::UserAgent->new;
+    my $useragent = LWP::UserAgent->new(keep_alive => 1);
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
@@ -150,7 +150,7 @@ sub send_xmltvepgfile {
 
 sub get_from_url {
     my $request = HTTP::Request->new(GET => @_);
-    my $useragent = LWP::UserAgent->new;
+    my $useragent = LWP::UserAgent->new(keep_alive => 1);
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
@@ -170,7 +170,7 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 2 -re -stream_loop -1 -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 0 -nostdin -re -stream_loop -1 -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
             }
         }
     }
@@ -180,7 +180,7 @@ sub getBootFromPluto {
     printf("Refresh of current Session\n");
     my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&clientID=".$deviceid."&clientModelNumber=na";
     my $request = HTTP::Request->new(GET => $url);
-    my $useragent = LWP::UserAgent->new;
+    my $useragent = LWP::UserAgent->new(keep_alive => 1);
     $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
     my $response = $useragent->request($request);
     if ($response->is_success) {
