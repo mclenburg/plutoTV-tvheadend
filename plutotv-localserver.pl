@@ -37,6 +37,7 @@ our $bootTime;
 
 #check param
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
+my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
 sub getArgsValue {
     my ($param) = @_;
@@ -170,7 +171,11 @@ sub buildM3U {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 0 -nostdin -re -stream_loop -1 -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                if($usestreamlink) {
+                    $m3u .= "pipe://$streamlink --stdout --http-header \"Connection=keep-alive\" --quiet --hls-segment-stream-data --ffmpeg-fout mpegts --ffmpeg-copyts --ffmpeg-start-at-zero  \"$sender->{stitched}->{urls}[0]->{url}\" best \n";
+                } else {
+                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 0 -nostdin -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                }
             }
         }
     }
