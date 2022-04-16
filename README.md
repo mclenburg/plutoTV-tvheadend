@@ -19,7 +19,7 @@ when using `plutotv-localserver.pl` also:
 `perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
 
 ### or
-`perl plutotv-localserver.pl [--localonly] [--port <portnumber>]` (or start as systemd-daemon)
+`perl plutotv-localserver.pl [--localonly] [--port <portnumber>] [--usestreamlink]` (or start as systemd-daemon)
 
 ### meaning of params
 
@@ -38,6 +38,7 @@ when using `plutotv-localserver.pl` also:
 |---|---|
 | `--localonly` | will configure server to listen on localhost 127.0.0.1 |
 | `--port <number>` | set listening-port for server (default: 9000) | 
+| `--usestreamlink` | provide playlist with call for streamlink instead ffmpeg |
 
 ### available endpoints for localserver
 |endpoint | task |
