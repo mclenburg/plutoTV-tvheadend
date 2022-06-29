@@ -23,6 +23,7 @@ use URI::Escape;
 use UUID::Tiny ':std';
 use File::Which;
 use Net::Address::IP::Local;
+use Data::Dumper;
 
 my $hostip = "127.0.0.1";
 my $port   = "9000";
@@ -172,19 +173,20 @@ sub buildM3U {
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
                 if($usestreamlink) {
-                    my $url = $sender->{stitched}->{urls}[0]->{url};
-                    $url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
-                    $url =~ s/&deviceType=/&deviceType=web/ig;
-                    $url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
-                    $url =~ s/&deviceModel=/&deviceModel=web/ig;
-                    $url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
-                    $url =~ s/&appName=&/&appName=web&/ig;
-                    $url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
-                    my $sessionid = $session->{session}->{sessionID};
-                    $url =~ s/&sid=/&sid=$sessionid&sessionID=$sessionid/ig;
-                    $url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
-                    $url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
-
+                    #my $url = $sender->{stitched}->{urls}[0]->{url};
+                    #$url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
+                    #$url =~ s/&deviceType=/&deviceType=web/ig;
+                    #$url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
+                    #$url =~ s/&deviceModel=/&deviceModel=web/ig;
+                    #$url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
+                    #$url =~ s/&appName=&/&appName=web&/ig;
+                    #$url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
+                    #my $sessionid = $session->{session}->{sessionID};
+                    #$url =~ s/&sid=/&sid=$sessionid&sessionID=$sessionid/ig;
+                    #$url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
+                    #$url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
+                    #print Dumper($session);
+                    my $url = "https://pluto.tv/".$session->{session}->{activeRegion}."/live-tv/".$sender->{slug};
                     $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best --hls-segment-stream-data --hls-live-restart --ffmpeg-copyts --url \"$url\"\n";
                 } else {
                     $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 0 -nostdin -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
