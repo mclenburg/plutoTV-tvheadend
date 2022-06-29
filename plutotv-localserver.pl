@@ -187,7 +187,7 @@ sub buildM3U {
                     #$url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
                     #print Dumper($session);
                     my $url = "https://pluto.tv/".$session->{session}->{activeRegion}."/live-tv/".$sender->{slug};
-                    $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best --hls-segment-stream-data --hls-live-restart --ffmpeg-copyts --url \"$url\"\n";
+                    $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best --hls-live-restart --url \"$url\"\n";
                 } else {
                     $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 0 -nostdin -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
                 }
