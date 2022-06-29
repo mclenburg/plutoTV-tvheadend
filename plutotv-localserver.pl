@@ -168,7 +168,7 @@ sub buildM3U {
     my $m3u = "#EXTM3U\n";
     my $i = 0;
     for my $sender( @senderliste ) {
-        if($sender->{number} > 0) {
+        if($sender->{number} > 0 && $sender->{number} != 2000) {
             my $logo = $sender->{logo}->{path};
             if(defined $logo) {
                 $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
