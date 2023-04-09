@@ -1,12 +1,12 @@
 # plutoTV-tvheadend
-Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.  
-So far, there are still short interruptions when advertising starts or ends.  
-This is due to an [issue in ffmpeg](https://trac.ffmpeg.org/ticket/5419).    
+Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.   
+Works best using [streamlink](https://github.com/streamlink/streamlink) in current version.
    
 There are two ways to use these scripts:
 * you can generate a static m3u8 by using the `plutotv-generate.pl`-script with params 
 * you can start `plutotv-localserver.pl` as local HTTP-Server and call it via URLs
 
+I recommend using `plutotv-localserver.pl` to ensure that the channel list (m3u8) is always up-to-date.
 
 ## install used modules
 `sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny File::Which`
