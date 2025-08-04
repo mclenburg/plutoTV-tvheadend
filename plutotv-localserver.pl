@@ -32,14 +32,16 @@ my $ffmpeg : shared;
 my $streamlink : shared;
 
 our $session : shared;
-our $bootTime : shared;
+# Aenderung: $bootTime speichert jetzt einen Unix-Timestamp (numerisch)
+our $bootTime : shared = 0;
 our $usestreamlink : shared = 0;
 
 # Caching-Variablen
 our $cached_channels : shared;
-our $cached_channels_time : shared = DateTime->now()->subtract(hours => 100);
+# Aenderung: $cached_channels_time speichert jetzt einen Unix-Timestamp (numerisch)
+our $cached_channels_time : shared = 0;
 our $cached_epg : shared;
-our $cached_epg_time : shared = DateTime->now()->subtract(hours => 100);
+our $cached_epg_time : shared = 0;
 
 # HTTP-Client einmalig initialisieren
 my $ua : shared = LWP::UserAgent->new(
@@ -85,11 +87,12 @@ sub get_from_url {
 
 sub get_channel_json {
     # Caching-Logik
-    my $now = DateTime->now();
+    my $now = time(); # Aenderung: Aktuelle Zeit als Unix-Timestamp
     lock($cached_channels);
     lock($cached_channels_time);
 
-    if (defined $cached_channels && $now->subtract(minutes => 15) < $cached_channels_time) {
+    # Aenderung: Vergleich von Unix-Timestamps
+    if (defined $cached_channels && $now - $cached_channels_time < 15 * 60) {
         printf("Using cached channel list.\n");
         return @$cached_channels;
     }
@@ -97,7 +100,7 @@ sub get_channel_json {
     printf("Fetching fresh channel list from PlutoTV API.\n");
     my $from = DateTime->now();
     my $to = $from->clone->add(days => 2);
-    my $url = "$apiurl?start=$from" . "Z&stop=$to" . "Z";
+    my $url = "http://api.pluto.tv/v2/channels?start=" . $from->iso8601 . "Z&stop=" . $to->iso8601 . "Z";
     my $request = HTTP::Request->new(GET => $url);
     my $response = $ua->request($request);
 
@@ -114,7 +117,7 @@ sub get_channel_json {
 
     # Cache aktualisieren
     $cached_channels = $json_data;
-    $cached_channels_time = $now;
+    $cached_channels_time = $now; # Aenderung: Speichere den aktuellen Unix-Timestamp
     return @$json_data;
 }
 
@@ -136,16 +139,19 @@ sub getBootFromPluto {
     lock($session);
     lock($bootTime);
     $session = $json_data;
-    $bootTime = DateTime->now();
+    $bootTime = time(); # Aenderung: Speichere den aktuellen Unix-Timestamp
     return $session;
 }
 
 sub get_bootJson {
     my ($lat, $lon) = @_; # Übernimmt die Koordinaten vom Aufrufer
-    my $now = DateTime->now();
+    my $now = time(); # Aenderung: Aktuelle Zeit als Unix-Timestamp
     lock($session);
     lock($bootTime);
-    my $maxTime = defined($session) ? $bootTime->clone->add(seconds => $session->{session}->{restartThresholdMS} / 1000) : $now->clone->subtract(hours => 2);
+
+    # Aenderung: Vergleich von Unix-Timestamps
+    my $restartThresholdSec = defined($session) ? $session->{session}->{restartThresholdMS} / 1000 : 0;
+    my $maxTime = $bootTime + $restartThresholdSec;
 
     unless (defined $session && $now <= $maxTime) {
         return getBootFromPluto($lat, $lon);
