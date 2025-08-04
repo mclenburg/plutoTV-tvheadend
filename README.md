@@ -12,7 +12,7 @@ I recommend using `plutotv-localserver.pl` to ensure that the channel list (m3u8
 `sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny File::Which`
 
 when using `plutotv-localserver.pl` also:
-`sudo cpan install HTTP::Request::Params HTTP::Daemon HTTP::Status HTTP::Request::Common HTTP::Cookies Net::Address::IP::Local`
+`sudo cpan install HTTP::Request::Params HTTP::Daemon HTTP::Status HTTP::Request::Common HTTP::Cookies Net::Address::IP::Local Getopt::Long`
 
 
 ## usage
@@ -34,19 +34,23 @@ when using `plutotv-localserver.pl` also:
 
 #### plutotv-localserver.pl  
 
-|parameter | effect |
-|---|---|
-| `--localonly` | will configure server to listen on localhost 127.0.0.1 |
-| `--port <number>` | set listening-port for server (default: 9000) | 
+|parameter | effect                                                   |
+|---|----------------------------------------------------------|
+| `--localonly` | will configure server to listen on localhost 127.0.0.1   |
+| `--port <number>` | set listening-port for server (default: 9000)            | 
 | `--usestreamlink` | provide playlist with call for streamlink instead ffmpeg |
+| `--region=` | set region to one of UK, DE or US, defaults to DE        |
 
 ### available endpoints for localserver
 |endpoint | task |
 |---|---|
 |`/playlist`|path to get m3u8-file|
 |`/master3u8?id=`|path to get playlist.m3u8 for given channelid|
-|`/channel?id=`|path to get ts via ffmpeg or streamlink for given channelid|
 |`/epg`|path to get xmltv-epg-file|
+| `/channels` |for full channel list in JSON format |
+| `/search?q=query` |to search channels by name |
+| `/categories` |to get a list of channel categories |
+
 
 ## how to load xmltv-guide into tvheadend
 * Go to menu option "Configuration" > "Channel/EPG" > "EPG Grabber Modules" and enable "External: XMLTV"
