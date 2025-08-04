@@ -19,10 +19,9 @@ use URI::Escape;
 use File::Which;
 use Net::Address::IP::Local;
 use UUID::Tiny ':std';
-# Aenderung: Nicht mehr benoetigt für die URL-Erstellung
-use DateTime;
 use Getopt::Long;
-use POSIX qw(strftime); # Neue Anweisung, um Zeit zu formatieren
+use POSIX qw(strftime);
+use DateTime; # wird noch für die EPG-Zeiten benoetigt
 
 # Globale Variablen shared zwischen Threads
 my $hostip : shared = "127.0.0.1";
@@ -37,7 +36,7 @@ our $session : shared;
 our $bootTime : shared = 0;
 our $usestreamlink : shared = 0;
 
-# Caching-Variablen
+# Caching-Variablen - jetzt mit sicherer Initialisierung
 our $cached_channels : shared;
 our $cached_channels_time : shared = 0;
 our $cached_epg : shared;
@@ -98,7 +97,6 @@ sub get_channel_json {
 
     printf("Fetching fresh channel list from PlutoTV API.\n");
 
-    # Aenderung: Erstelle die URL mit POSIX::strftime, um DateTime zu vermeiden
     my $from_ts = time();
     my $to_ts = $from_ts + (2 * 24 * 60 * 60); # 2 Tage in der Zukunft
     my $from_iso = strftime('%Y-%m-%dT%H:%M:%S', gmtime($from_ts));
@@ -256,7 +254,6 @@ sub buildM3U {
     return $m3u;
 }
 
-
 sub send_m3ufile {
     my ($client) = @_;
     my @senderListe = get_channel_json();
@@ -289,7 +286,7 @@ sub send_playlistm3u8file {
         $client->send_error(RC_BAD_REQUEST, "Missing required parameters.");
         return;
     }
-    my $bootJson = get_bootJson($regions{DE}->{lat}, $regions{DE}->{lon}); # Koordinate ist hier nicht entscheidend
+    my $bootJson = get_bootJson($regions{DE}->{lat}, $regions{DE}->{lon});
     my $getparams = "terminate=false&embedPartner=&serverSideAds=false&paln=&includeExtendedEvents=false&architecture=&deviceId=unknown&deviceVersion=unknown&appVersion=unknown&deviceType=web&deviceMake=Firefox&sid=".$sessionid."&advertisingId=&deviceLat=54.1241&deviceLon=12.1247&deviceDNT=0&deviceModel=web&userId=&appName=";
     my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/".$playlistid."/playlist.m3u8?".$getparams;
     my $playlist = get_from_url($url);
@@ -312,7 +309,7 @@ sub send_masterm3u8file {
         $client->send_error(RC_BAD_REQUEST, "Missing channel ID.");
         return;
     }
-    my $bootJson = get_bootJson($regions{DE}->{lat}, $regions{DE}->{lon}); # Koordinate ist hier nicht entscheidend
+    my $bootJson = get_bootJson($regions{DE}->{lat}, $regions{DE}->{lon});
     my $baseurl = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/";
     my $url = $baseurl."master.m3u8?".$bootJson->{stitcherParams};
     my $master = get_from_url($url);
@@ -458,7 +455,7 @@ sub main {
     printf("Using %s for streaming\n", $usestreamlink ? "streamlink" : "ffmpeg");
     printf("Pluto TV content is being fetched for region '%s'\n", $args{region});
 
-    get_bootJson($lat, $lon); # Erstes Boot-Dokument beim Start abrufen
+    get_bootJson($lat, $lon);
 
     while (my $client = $daemon->accept) {
         threads->new(\&process_request, $client)->detach();
