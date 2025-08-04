@@ -19,8 +19,10 @@ use URI::Escape;
 use File::Which;
 use Net::Address::IP::Local;
 use UUID::Tiny ':std';
+# Aenderung: Nicht mehr benoetigt für die URL-Erstellung
 use DateTime;
 use Getopt::Long;
+use POSIX qw(strftime); # Neue Anweisung, um Zeit zu formatieren
 
 # Globale Variablen shared zwischen Threads
 my $hostip : shared = "127.0.0.1";
@@ -32,13 +34,11 @@ my $ffmpeg : shared;
 my $streamlink : shared;
 
 our $session : shared;
-# Aenderung: $bootTime speichert jetzt einen Unix-Timestamp (numerisch)
 our $bootTime : shared = 0;
 our $usestreamlink : shared = 0;
 
 # Caching-Variablen
 our $cached_channels : shared;
-# Aenderung: $cached_channels_time speichert jetzt einen Unix-Timestamp (numerisch)
 our $cached_channels_time : shared = 0;
 our $cached_epg : shared;
 our $cached_epg_time : shared = 0;
@@ -87,20 +87,24 @@ sub get_from_url {
 
 sub get_channel_json {
     # Caching-Logik
-    my $now = time(); # Aenderung: Aktuelle Zeit als Unix-Timestamp
+    my $now = time();
     lock($cached_channels);
     lock($cached_channels_time);
 
-    # Aenderung: Vergleich von Unix-Timestamps
     if (defined $cached_channels && $now - $cached_channels_time < 15 * 60) {
         printf("Using cached channel list.\n");
         return @$cached_channels;
     }
 
     printf("Fetching fresh channel list from PlutoTV API.\n");
-    my $from = DateTime->now();
-    my $to = $from->clone->add(days => 2);
-    my $url = "http://api.pluto.tv/v2/channels?start=" . $from->iso8601 . "Z&stop=" . $to->iso8601 . "Z";
+
+    # Aenderung: Erstelle die URL mit POSIX::strftime, um DateTime zu vermeiden
+    my $from_ts = time();
+    my $to_ts = $from_ts + (2 * 24 * 60 * 60); # 2 Tage in der Zukunft
+    my $from_iso = strftime('%Y-%m-%dT%H:%M:%S', gmtime($from_ts));
+    my $to_iso = strftime('%Y-%m-%dT%H:%M:%S', gmtime($to_ts));
+
+    my $url = "$apiurl?start=${from_iso}Z&stop=${to_iso}Z";
     my $request = HTTP::Request->new(GET => $url);
     my $response = $ua->request($request);
 
@@ -117,7 +121,7 @@ sub get_channel_json {
 
     # Cache aktualisieren
     $cached_channels = $json_data;
-    $cached_channels_time = $now; # Aenderung: Speichere den aktuellen Unix-Timestamp
+    $cached_channels_time = $now;
     return @$json_data;
 }
 
@@ -139,17 +143,16 @@ sub getBootFromPluto {
     lock($session);
     lock($bootTime);
     $session = $json_data;
-    $bootTime = time(); # Aenderung: Speichere den aktuellen Unix-Timestamp
+    $bootTime = time();
     return $session;
 }
 
 sub get_bootJson {
     my ($lat, $lon) = @_; # Übernimmt die Koordinaten vom Aufrufer
-    my $now = time(); # Aenderung: Aktuelle Zeit als Unix-Timestamp
+    my $now = time();
     lock($session);
     lock($bootTime);
 
-    # Aenderung: Vergleich von Unix-Timestamps
     my $restartThresholdSec = defined($session) ? $session->{session}->{restartThresholdMS} / 1000 : 0;
     my $maxTime = $bootTime + $restartThresholdSec;
 
@@ -245,12 +248,14 @@ sub buildM3U {
                 my $url = "https://pluto.tv/".$session->{session}->{activeRegion}."/live-tv/".$sender->{_id};
                 $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best --hls-live-restart --url \"$url\"\n";
             } else {
-                $m3u .= "pipe://$ffmpeg -loglevel fatal -threads 0 -nostdin -re -i \"http://$hostip:$port/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
+                my $m3u8_url = "http://$hostip:$port/master3u8?id=" . $sender->{_id};
+                $m3u .= "pipe://$ffmpeg -loglevel fatal -threads 0 -nostdin -re -i \"$m3u8_url\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
             }
         }
     }
     return $m3u;
 }
+
 
 sub send_m3ufile {
     my ($client) = @_;
