@@ -21,7 +21,7 @@ use Net::Address::IP::Local;
 use UUID::Tiny ':std';
 use Getopt::Long;
 use POSIX qw(strftime);
-use DateTime; # wird noch für die EPG-Zeiten benoetigt
+use DateTime;
 
 # Globale Variablen shared zwischen Threads
 my $hostip : shared = "127.0.0.1";
@@ -117,8 +117,8 @@ sub get_channel_json {
         return ();
     }
 
-    # Cache aktualisieren
-    $cached_channels = $json_data;
+    # Aenderung: Verwenden Sie share(), um die Datenstruktur vor der Zuweisung zu teilen
+    $cached_channels = share($json_data);
     $cached_channels_time = $now;
     return @$json_data;
 }
@@ -140,7 +140,8 @@ sub getBootFromPluto {
     }
     lock($session);
     lock($bootTime);
-    $session = $json_data;
+    # Aenderung: Verwenden Sie share(), um die Datenstruktur vor der Zuweisung zu teilen
+    $session = share($json_data);
     $bootTime = time();
     return $session;
 }
