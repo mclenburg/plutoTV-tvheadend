@@ -42,8 +42,13 @@ our $cached_channels_time : shared = 0;
 our $cached_epg : shared;
 our $cached_epg_time : shared = 0;
 
-# Aenderung: $ua wird nicht mehr als shared deklariert. Jede Funktion erstellt ihre eigene Instanz.
-# my $ua : shared = LWP::UserAgent->new(...);
+# Aenderung: $ua wird wieder global deklariert, aber OHNE das shared-Attribut.
+# Dies behebt den Fehler "Invalid value for shared scalar" und stellt die ursprüngliche
+# Funktionsweise wieder her, da es vor dem Start der Threads initialisiert wird.
+my $ua = LWP::UserAgent->new(
+    keep_alive => 1,
+    agent      => 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0'
+);
 
 # Kartierung von Regionen zu Breitengrad/Längengrad
 my %regions = (
@@ -74,13 +79,9 @@ sub parse_args {
     );
 }
 
-# Aenderung: LWP::UserAgent-Instanz wird hier lokal erstellt
+# Aenderung: Die Funktion verwendet jetzt das globale $ua-Objekt.
 sub get_from_url {
     my ($url) = @_;
-    my $ua = LWP::UserAgent->new(
-        keep_alive => 1,
-        agent      => 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0'
-    );
     my $request = HTTP::Request->new(GET => $url);
     my $response = $ua->request($request);
     return $response->is_success ? $response->content : undef;
@@ -105,10 +106,6 @@ sub get_channel_json {
     my $to_iso = strftime('%Y-%m-%dT%H:%M:%S', gmtime($to_ts));
 
     my $url = "$apiurl?start=${from_iso}Z&stop=${to_iso}Z";
-    my $ua = LWP::UserAgent->new(
-        keep_alive => 1,
-        agent      => 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0'
-    );
     my $request = HTTP::Request->new(GET => $url);
     my $response = $ua->request($request);
 
@@ -133,10 +130,6 @@ sub getBootFromPluto {
     my ($lat, $lon) = @_; # Breitengrad und Längengrad als Argumente
     printf("Refreshing current Session for coordinates: %s, %s\n", $lat, $lon);
     my $url = "https://boot.pluto.tv/v4/start?deviceId=$deviceid&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&clientID=$deviceid&clientModelNumber=na&deviceLat=$lat&deviceLon=$lon";
-    my $ua = LWP::UserAgent->new(
-        keep_alive => 1,
-        agent      => 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0'
-    );
     my $request = HTTP::Request->new(GET => $url);
     my $response = $ua->request($request);
     unless ($response->is_success) {
@@ -150,7 +143,6 @@ sub getBootFromPluto {
     }
     lock($session);
     lock($bootTime);
-    # Verwenden Sie share(), um die Datenstruktur vor der Zuweisung zu teilen
     $session = share($json_data);
     $bootTime = time();
     return $session;
@@ -183,6 +175,7 @@ sub send_help {
     $content .= "\t/search?q=query\t\tto search channels by name\n";
     $content .= "\t/categories\t\tto get a list of channel categories\n";
     $content .= "\t/master3u8?id=\t\tfor master.m3u8 of specific channel\n";
+    $content .= "\t/playlist3u8?id=\tfor playlist.m3u8 of specific stream\n";
     $response->content($content);
     $client->send_response($response);
 }
@@ -466,7 +459,6 @@ sub main {
     printf("Using %s for streaming\n", $usestreamlink ? "streamlink" : "ffmpeg");
     printf("Pluto TV content is being fetched for region '%s'\n", $args{region});
 
-    # getBootJson einmalig vor dem Thread-Loop aufrufen, um die Session zu initialisieren
     get_bootJson($lat, $lon);
 
     while (my $client = $daemon->accept) {
