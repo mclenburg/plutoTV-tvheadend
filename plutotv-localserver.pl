@@ -34,6 +34,7 @@ use Try::Tiny;
 use Time::HiRes qw(time);
 use File::Temp;
 use File::Path qw(make_path);
+use Encode qw(encode_utf8);
 
 # Konfiguration
 our $VERSION = '2.0.0';
@@ -397,7 +398,7 @@ Tips for tvheadend:
     - LCN (Logical Channel Numbers) are preserved from PlutoTV
 EOF
 
-    $response->content($content);
+    $response->content(encode_utf8($content));
     send_response($client_socket, $response);
 }
 
@@ -529,7 +530,7 @@ sub send_xmltvepgfile($client_socket, $request, $ua) {
     $response->header('Content-Type', 'application/xml; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend-epg.xml"');
     $response->header('Cache-Control', 'public, max-age=1800');  # 30 Minuten Cache für EPG
-    $response->content($epg);
+    $response->content(encode_utf8($epg));
     send_response($client_socket, $response);
 }
 
@@ -603,7 +604,7 @@ sub send_direct_stream($client_socket, $request, $ua) {
     $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
     $response->header('Pragma', 'no-cache');
     $response->header('Expires', '0');
-    $response->content($master);
+    $response->content(encode_utf8($master));
     send_response($client_socket, $response);
 }
 
@@ -623,7 +624,7 @@ sub send_tvheadend_m3u($client_socket, $ua) {
     $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
     $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
-    $response->content($m3u_content);
+    $response->content(encode_utf8($m3u_content));
     send_response($client_socket, $response);
 }
 
@@ -641,7 +642,7 @@ sub send_m3ufile($client_socket, $ua) {
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="plutotv.m3u8"');
-    $response->content($m3u_content);
+    $response->content(encode_utf8($m3u_content));
     send_response($client_socket, $response);
 }
 
@@ -709,7 +710,7 @@ sub send_playlistm3u8file($client_socket, $request, $ua) {
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="playlist.m3u8"');
-    $response->content($playlist);
+    $response->content(encode_utf8($playlist));
     send_response($client_socket, $response);
 }
 
@@ -745,7 +746,7 @@ sub send_masterm3u8file($client_socket, $request, $ua) {
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="master.m3u8"');
-    $response->content($master);
+    $response->content(encode_utf8($master));
     send_response($client_socket, $response);
 }
 
