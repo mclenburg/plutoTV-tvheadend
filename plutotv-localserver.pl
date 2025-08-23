@@ -74,6 +74,8 @@ my $channels_time_file = "$cache_dir/plutotv_channels_time.txt";
 # Externe Programme
 my ($ffmpeg, $streamlink);
 
+my $head = 0;
+
 # JSON-Serializer mit besseren Optionen
 my $json = JSON::XS->new->utf8->allow_blessed->convert_blessed->canonical;
 
@@ -354,7 +356,7 @@ sub send_response($client_socket, $response) {
 sub create_error_response($code, $message) {
     my $response = HTTP::Response->new($code, HTTP::Status::status_message($code));
     $response->header('Content-Type', 'text/plain; charset=utf-8');
-    $response->content($message);
+    if($head == 0) { $response->content($message); }
     return $response;
 }
 
@@ -415,7 +417,7 @@ sub send_status($client_socket) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/json; charset=utf-8');
-    $response->content($json->encode($status));
+    if($head == 0) {$response->content($json->encode($status));}
     send_response($client_socket, $response);
 }
 
@@ -530,7 +532,7 @@ sub send_xmltvepgfile($client_socket, $request, $ua) {
     $response->header('Content-Type', 'application/xml; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend-epg.xml"');
     $response->header('Cache-Control', 'public, max-age=1800');  # 30 Minuten Cache für EPG
-    $response->content(encode_utf8($epg));
+    if($head == 0) {$response->content(encode_utf8($epg));}
     send_response($client_socket, $response);
 }
 
@@ -603,7 +605,7 @@ sub send_tvheadend_m3u($client_socket, $ua) {
     # Wichtig für tvheadend: Content-Length setzen
     my $content_bytes = encode_utf8($m3u_content);
     $response->header('Content-Length', length($content_bytes));
-    $response->content($content_bytes);
+    if($head == 0) {$response->content($content_bytes);}
 
     send_response($client_socket, $response);
 }
@@ -679,7 +681,7 @@ sub send_direct_stream($client_socket, $request, $ua) {
     $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
     $response->header('Pragma', 'no-cache');
     $response->header('Expires', '0');
-    $response->content(encode_utf8($master));
+    if($head == 0) {$response->content(encode_utf8($master));}
     send_response($client_socket, $response);
 }
 
@@ -737,7 +739,7 @@ sub send_direct_stream_proxy($client_socket, $request, $ua) {
     $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
     $response->header('Pragma', 'no-cache');
     $response->header('Expires', '0');
-    $response->content(encode_utf8($master));
+    if($head == 0) {$response->content(encode_utf8($master));}
     send_response($client_socket, $response);
 }
 
@@ -773,7 +775,7 @@ sub send_m3ufile($client_socket, $ua) {
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="plutotv.m3u8"');
-    $response->content(encode_utf8($m3u_content));
+    if($head == 0) {$response->content(encode_utf8($m3u_content));}
     send_response($client_socket, $response);
 }
 
@@ -857,7 +859,7 @@ sub send_playlistm3u8file($client_socket, $request, $ua) {
     $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
     $response->header('Pragma', 'no-cache');
     $response->header('Expires', '0');
-    $response->content(encode_utf8($playlist));
+    if($head == 0) {$response->content(encode_utf8($playlist));}
     send_response($client_socket, $response);
 }
 
@@ -891,7 +893,7 @@ sub send_raw_stream($client_socket, $request, $ua) {
     # Gib die rohe Master-Playlist zurück für Debugging
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'text/plain; charset=utf-8');
-    $response->content("Base URL: $base_url\nFull URL: $url\n\n" . encode_utf8($master));
+    if($head == 0) {$response->content("Base URL: $base_url\nFull URL: $url\n\n" . encode_utf8($master));}
     send_response($client_socket, $response);
 }
 
@@ -944,7 +946,7 @@ sub send_direct_stream_v2($client_socket, $request, $ua) {
     $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
     $response->header('Pragma', 'no-cache');
     $response->header('Expires', '0');
-    $response->content(encode_utf8($master));
+    if($head == 0) {$response->content(encode_utf8($master));}
     send_response($client_socket, $response);
 }
 
@@ -980,7 +982,7 @@ sub send_masterm3u8file($client_socket, $request, $ua) {
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="master.m3u8"');
-    $response->content(encode_utf8($master));
+    if($head == 0) {$response->content(encode_utf8($master));}
     send_response($client_socket, $response);
 }
 
@@ -1022,7 +1024,7 @@ sub send_channels_json($client_socket, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/json; charset=utf-8');
-    $response->content($json->encode(\@filtered_channels));
+    if($head == 0) {$response->content($json->encode(\@filtered_channels));}
     send_response($client_socket, $response);
 }
 
@@ -1052,7 +1054,7 @@ sub search_channels($client_socket, $request, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/json; charset=utf-8');
-    $response->content($json->encode(\@results));
+    if($head == 0) {$response->content($json->encode(\@results));}
     send_response($client_socket, $response);
 }
 
@@ -1070,7 +1072,7 @@ sub get_categories($client_socket, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/json; charset=utf-8');
-    $response->content($json->encode(\@category_list));
+    if($head == 0) {$response->content($json->encode(\@category_list));}
     send_response($client_socket, $response);
 }
 
@@ -1096,10 +1098,16 @@ sub process_request($client_socket) {
     my ($method, $uri_path, $protocol) = split(/\s+/, $request_line, 3);
 
     # Nur GET-Requests unterstützen
-    unless ($method && $method eq 'GET') {
+    unless ($method && ($method eq 'GET' || $method eq 'HEAD')) {
         send_response($client_socket,
             create_error_response(RC_METHOD_NOT_ALLOWED, 'Method Not Allowed'));
         return;
+    }
+
+    if($mwthod eq 'HEAD') {
+        $head = 1;
+    } else {
+        head = 0;
     }
 
     # URI parsen
@@ -1299,7 +1307,7 @@ sub send_debug_info($client_socket, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/json; charset=utf-8');
-    $response->content($json->encode($debug_info));
+    if($head == 0) { $response->content($json->encode($debug_info)); }
     send_response($client_socket, $response);
 }
 
