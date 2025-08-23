@@ -1098,11 +1098,11 @@ sub process_request($client_socket) {
     my ($method, $uri_path, $protocol) = split(/\s+/, $request_line, 3);
 
     # Nur GET-Requests unterstützen
-    unless ($method && ($method eq 'GET' || $method eq 'HEAD')) {
-        send_response($client_socket,
-            create_error_response(RC_METHOD_NOT_ALLOWED, 'Method Not Allowed'));
-        return;
-    }
+    #unless ($method && ($method eq 'GET' || $method eq 'HEAD')) {
+    #    send_response($client_socket,
+    #        create_error_response(RC_METHOD_NOT_ALLOWED, 'Method Not Allowed'));
+    #    return;
+    #}
 
     #if($method eq 'HEAD') {
     #    $head = 1;
