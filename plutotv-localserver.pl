@@ -568,8 +568,67 @@ sub buildM3U($ua, @channels) {
     return $m3u;
 }
 
-# Neue Funktion: Direkter HLS-Stream für tvheadend
 sub send_direct_stream($client_socket, $request, $ua) {
+    my $path = $request->uri->path;
+    my ($channel_id) = $path =~ m{/stream/([^/]+)\.m3u8$};
+
+    unless ($channel_id) {
+        send_response($client_socket,
+            create_error_response(RC_BAD_REQUEST, "Invalid stream path"));
+        return;
+    }
+
+    my $boot_json = get_bootJson($ua, $config->{active_region});
+    unless ($boot_json && $boot_json->{servers}) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to get session data"));
+        return;
+    }
+
+    my $base_url = "$boot_json->{servers}->{stitcher}/stitch/hls/channel/$channel_id/";
+    my $url = "${base_url}master.m3u8?$boot_json->{stitcherParams}";
+
+    log_message('DEBUG', "Fetching master playlist from: $url");
+
+    my $master = get_from_url($ua, $url);
+    unless ($master) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream"));
+        return;
+    }
+
+    # Konvertiere relative URLs zu absoluten URLs
+    $master = fix_relative_urls_in_master($master, $base_url);
+
+    my $response = HTTP::Response->new(RC_OK, 'OK');
+    $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+    $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    $response->header('Pragma', 'no-cache');
+    $response->header('Expires', '0');
+    $response->content(encode_utf8($master));
+    send_response($client_socket, $response);
+}
+
+# Neue Funktion: Konvertiert relative URLs in Master-Playlist zu absoluten URLs
+sub fix_relative_urls_in_master($master, $base_url) {
+    log_message('DEBUG', "Converting relative URLs to absolute URLs");
+
+    # Stelle sicher, dass base_url mit / endet
+    $base_url =~ s/\/$//;
+    $base_url .= '/';
+
+    # Konvertiere relative Playlist-URLs zu absoluten URLs
+    $master =~ s{^([^#\n][^\n]*\.m3u8[^\n]*)$}{$base_url$1}gm;
+
+    # Konvertiere relative Subtitle-URLs zu absoluten URLs
+    $master =~ s{URI="([^"]*\.m3u8[^"]*)"}{URI="$base_url$1"}g;
+
+    log_message('DEBUG', "URL conversion completed");
+
+    return $master;
+}
+
+sub send_direct_stream_proxy($client_socket, $request, $ua) {
     my $path = $request->uri->path;
     my ($channel_id) = $path =~ m{/stream/([^/]+)\.m3u8$};
 
@@ -596,8 +655,8 @@ sub send_direct_stream($client_socket, $request, $ua) {
         return;
     }
 
-    # Für tvheadend: URLs in Master-Playlist anpassen
-    $master = fixPlaylistUrlsInMaster($master, $channel_id, $boot_json->{session}->{sessionID});
+    # Ersetze relative URLs durch unsere Proxy-URLs
+    $master = fix_playlist_urls_with_proxy($master, $channel_id, $boot_json->{session}->{sessionID});
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
@@ -606,6 +665,24 @@ sub send_direct_stream($client_socket, $request, $ua) {
     $response->header('Expires', '0');
     $response->content(encode_utf8($master));
     send_response($client_socket, $response);
+}
+
+sub fix_playlist_urls_with_proxy($master, $channelid, $sessionid) {
+    my $host_port = "$config->{hostip}:$config->{port}";
+
+    log_message('DEBUG', "Converting relative URLs to proxy URLs");
+
+    # Behandle relative Playlist-URLs (z.B. "1042180/playlist.m3u8?...")
+    $master =~ s{#EXT-X-STREAM-INF:([^\n]+)\n([^/\n][^\n]*\.m3u8[^\n]*)}
+        {#EXT-X-STREAM-INF:$1\nhttp://$host_port/playlist3u8?id=$2&channelid=$channelid&session=$sessionid}gm;
+
+    # Behandle relative Subtitle-URLs
+    $master =~ s{URI="([^"/][^"]*\.m3u8[^"]*)"}{URI="http://$host_port/playlist3u8?id=$1&channelid=$channelid&session=$sessionid"}g;
+
+    # Stelle sicher, dass terminate auf false gesetzt ist
+    $master =~ s{terminate=true}{terminate=false}g;
+
+    return $master;
 }
 
 # tvheadend-spezifische M3U-Variante
@@ -681,78 +758,41 @@ sub send_playlistm3u8file($client_socket, $request, $ua) {
         return;
     }
 
-    # Verwende den aktuellen Session-Token aus boot_json, nicht den aus der URL
-    my $current_session = $boot_json->{session}->{sessionID};
+    # Baue die URL für die spezifische Playlist
+    my $base_url = "$boot_json->{servers}->{stitcher}/stitch/hls/channel/$channelid/";
 
-    my $region_data = $regions{$config->{active_region}};
-
-    # Verbesserte Parameter für bessere Kompatibilität
-    my $get_params = join('&',
-        "terminate=false",
-        "embedPartner=",
-        "serverSideAds=true",  # Geändert auf true für bessere Kompatibilität
-        "paln=",
-        "includeExtendedEvents=false",
-        "architecture=",
-        "deviceId=$config->{deviceid}",  # Verwende die konfigurierte Device-ID
-        "deviceVersion=109.0",
-        "appVersion=5.17.0-38a5bd7",
-        "deviceType=web",
-        "deviceMake=Firefox",
-        "sid=$current_session",  # Verwende aktuelle Session
-        "advertisingId=",
-        "deviceLat=$region_data->{lat}",
-        "deviceLon=$region_data->{lon}",
-        "deviceDNT=0",
-        "deviceModel=web",
-        "userId=",
-        "appName=web",
-        "clientID=$config->{deviceid}",
-        "clientModelNumber=na"
-    );
-
-    # Verwende stitcher v1 statt v2 für bessere Kompatibilität
-    my $base_url = $boot_json->{servers}->{stitcher};
-    # Stelle sicher, dass wir v1 verwenden
-    $base_url =~ s/\/v2\//\/v1\//g;
-
-    my $url = "$base_url/stitch/hls/channel/$channelid/$playlistid/playlist.m3u8?$get_params";
+    # Falls playlistid bereits Parameter enthält, direkt verwenden
+    my $url;
+    if ($playlistid =~ /\?/) {
+        $url = "$base_url$playlistid";
+    } else {
+        # Fallback: füge Parameter hinzu falls nicht vorhanden
+        my $region_data = $regions{$config->{active_region}};
+        my $get_params = join('&',
+            "terminate=false",
+            "sid=$sessionid",
+            "deviceLat=$region_data->{lat}",
+            "deviceLon=$region_data->{lon}",
+            "deviceId=$config->{deviceid}",
+            "deviceType=web",
+            "deviceMake=Firefox"
+        );
+        $url = "$base_url$playlistid?$get_params";
+    }
 
     log_message('DEBUG', "Fetching playlist from: $url");
 
-    # Erweiterte Header für bessere Authentifizierung
-    my $headers = {
-        'User-Agent' => USER_AGENT,
-        'Accept' => 'application/vnd.apple.mpegurl',
-        'Accept-Language' => 'de-DE,de;q=0.9,en;q=0.8',
-        'Origin' => 'https://pluto.tv',
-        'Referer' => 'https://pluto.tv/',
-        'DNT' => '0',
-        'Connection' => 'keep-alive',
-        'Sec-Fetch-Dest' => 'empty',
-        'Sec-Fetch-Mode' => 'cors',
-        'Sec-Fetch-Site' => 'cross-site',
-    };
-
-    my $playlist = get_from_url($ua, $url, $headers);
+    my $playlist = get_from_url($ua, $url);
     unless ($playlist) {
-        # Fallback: Versuche alternative URL-Struktur
-        log_message('DEBUG', "First attempt failed, trying fallback URL structure");
-
-        # Alternative URL ohne zusätzliche Parameter
-        my $fallback_url = "$base_url/stitch/hls/channel/$channelid/master.m3u8?$boot_json->{stitcherParams}";
-        $playlist = get_from_url($ua, $fallback_url, $headers);
-
-        unless ($playlist) {
-            send_response($client_socket,
-                create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist from PlutoTV"));
-            return;
-        }
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist"));
+        return;
     }
 
-    # Validiere dass die Playlist tatsächlich Segmente enthält
+    # Validiere dass die Playlist Segmente enthält
     unless ($playlist =~ /#EXTINF:|#EXT-X-STREAM-INF:/) {
         log_message('ERROR', "Received playlist has no segments or streams");
+        log_message('DEBUG', "Playlist content (first 500 chars): " . substr($playlist, 0, 500));
         send_response($client_socket,
             create_error_response(RC_INTERNAL_SERVER_ERROR, "Playlist has no segments"));
         return;
@@ -764,6 +804,40 @@ sub send_playlistm3u8file($client_socket, $request, $ua) {
     $response->header('Pragma', 'no-cache');
     $response->header('Expires', '0');
     $response->content(encode_utf8($playlist));
+    send_response($client_socket, $response);
+}
+
+sub send_raw_stream($client_socket, $request, $ua) {
+    my $path = $request->uri->path;
+    my ($channel_id) = $path =~ m{/raw/([^/]+)\.m3u8$};
+
+    unless ($channel_id) {
+        send_response($client_socket,
+            create_error_response(RC_BAD_REQUEST, "Invalid raw stream path"));
+        return;
+    }
+
+    my $boot_json = get_bootJson($ua, $config->{active_region});
+    unless ($boot_json && $boot_json->{servers}) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to get session data"));
+        return;
+    }
+
+    my $base_url = "$boot_json->{servers}->{stitcher}/stitch/hls/channel/$channel_id/";
+    my $url = "${base_url}master.m3u8?$boot_json->{stitcherParams}";
+
+    my $master = get_from_url($ua, $url);
+    unless ($master) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream"));
+        return;
+    }
+
+    # Gib die rohe Master-Playlist zurück für Debugging
+    my $response = HTTP::Response->new(RC_OK, 'OK');
+    $response->header('Content-Type', 'text/plain; charset=utf-8');
+    $response->content("Base URL: $base_url\nFull URL: $url\n\n" . encode_utf8($master));
     send_response($client_socket, $response);
 }
 
@@ -1006,6 +1080,10 @@ sub process_request($client_socket) {
             }
             when (m{^/stream/}) {
                 send_direct_stream($client_socket, $request, $ua);
+            }
+            when (m{^/raw/}) {
+                # Debug-Endpunkt für rohe Master-Playlists
+                send_raw_stream($client_socket, $request, $ua);
             }
             when ('/master3u8') {
                 send_masterm3u8file($client_socket, $request, $ua);
