@@ -1104,11 +1104,11 @@ sub process_request($client_socket) {
         return;
     }
 
-    //if($method eq 'HEAD') {
-    //    $head = 1;
-    //} else {
-    //    $head = 0;
-    //}
+    #if($method eq 'HEAD') {
+    #    $head = 1;
+    #} else {
+    #    $head = 0;
+    #}
 
     # URI parsen
     my $uri = try { URI->new($uri_path) };
