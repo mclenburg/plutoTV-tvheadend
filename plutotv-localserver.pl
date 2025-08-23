@@ -1104,7 +1104,7 @@ sub process_request($client_socket) {
         return;
     }
 
-    if($mwthod eq 'HEAD') {
+    if($method eq 'HEAD') {
         $head = 1;
     } else {
         head = 0;
