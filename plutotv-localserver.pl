@@ -534,6 +534,80 @@ sub send_xmltvepgfile($client_socket, $request, $ua) {
     send_response($client_socket, $response);
 }
 
+sub buildM3U_tvheadend($ua, @channels) {
+    my $m3u = "#EXTM3U\n";
+
+    for my $channel (@channels) {
+        # Striktere Filterung für tvheadend
+        next unless $channel->{number} && $channel->{number} > 0;
+        next if $channel->{number} == 2000;  # Skip placeholder channels
+        next unless $channel->{name} && $channel->{_id};
+        next unless $channel->{stitched} && ref $channel->{stitched} eq 'HASH';
+
+        my $name = $channel->{name};
+        my $category = $channel->{category} || 'General';
+        my $logo = '';
+
+        # Logo-URL bereinigen
+        if ($channel->{logo} && $channel->{logo}->{path}) {
+            $logo = $channel->{logo}->{path};
+            $logo =~ s/\?.*$//;  # Remove query parameters
+            # Stelle sicher, dass Logo-URL vollständig ist
+            $logo = "https://images.pluto.tv$logo" unless $logo =~ /^https?:/;
+        }
+
+        # tvheadend-spezifische M3U-Formatierung mit korrekten Attributen
+        my $extinf_line = sprintf(
+            "#EXTINF:-1 tvg-id=\"%s\" tvg-chno=\"%d\" tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"%s\",%s\n",
+            $channel->{_id},     # Wichtig: Verwende Channel-ID für EPG-Mapping
+            $channel->{number},  # LCN für tvheadend
+            $name,              # Name für EPG
+            $logo,              # Logo-URL
+            $category,          # Kategorie
+            $name               # Display-Name
+        );
+
+        $m3u .= $extinf_line;
+
+        # Stream-URL: Verwende immer unseren direkten Stream-Endpunkt
+        my $stream_url = "http://$config->{hostip}:$config->{port}/stream/$channel->{_id}.m3u8";
+        $m3u .= "$stream_url\n";
+    }
+
+    return $m3u;
+}
+
+# Spezielle tvheadend M3U-Funktion
+sub send_tvheadend_m3u($client_socket, $ua) {
+    my @channels = get_channel_json($ua);
+    unless (@channels) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR,
+                "Unable to fetch channel list from Pluto TV API"));
+        return;
+    }
+
+    # Sortiere Kanäle nach Nummer für konsistente Reihenfolge
+    @channels = sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels;
+
+    my $m3u_content = buildM3U_tvheadend($ua, @channels);
+
+    # Zähle gültige Kanäle für Debug
+    my $channel_count = () = $m3u_content =~ /#EXTINF/g;
+    log_message('INFO', "Generated M3U with $channel_count channels for tvheadend");
+
+    my $response = HTTP::Response->new(RC_OK, 'OK');
+    $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
+    $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
+    $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
+    # Wichtig für tvheadend: Content-Length setzen
+    my $content_bytes = encode_utf8($m3u_content);
+    $response->header('Content-Length', length($content_bytes));
+    $response->content($content_bytes);
+
+    send_response($client_socket, $response);
+}
+
 sub buildM3U($ua, @channels) {
     my $m3u = "#EXTM3U\n";
 
@@ -683,26 +757,6 @@ sub fix_playlist_urls_with_proxy($master, $channelid, $sessionid) {
     $master =~ s{terminate=true}{terminate=false}g;
 
     return $master;
-}
-
-# tvheadend-spezifische M3U-Variante
-sub send_tvheadend_m3u($client_socket, $ua) {
-    my @channels = get_channel_json($ua);
-    unless (@channels) {
-        send_response($client_socket,
-            create_error_response(RC_INTERNAL_SERVER_ERROR,
-                "Unable to fetch channel list from Pluto TV API"));
-        return;
-    }
-
-    my $m3u_content = buildM3U($ua, @channels);
-
-    my $response = HTTP::Response->new(RC_OK, 'OK');
-    $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
-    $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
-    $response->content(encode_utf8($m3u_content));
-    send_response($client_socket, $response);
 }
 
 sub send_m3ufile($client_socket, $ua) {
