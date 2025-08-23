@@ -1107,7 +1107,7 @@ sub process_request($client_socket) {
     if($method eq 'HEAD') {
         $head = 1;
     } else {
-        head = 0;
+        $head = 0;
     }
 
     # URI parsen
