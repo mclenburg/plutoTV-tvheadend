@@ -215,6 +215,29 @@ sub create_user_agent {
     );
 }
 
+sub get_from_url($ua, $url, $headers = {}) {
+    try {
+        log_message('DEBUG', "Fetching URL: $url");
+
+        my $request = HTTP::Request->new(GET => $url);
+        for my $header_name (keys %$headers) {
+            $request->header($header_name => $headers->{$header_name});
+        }
+
+        my $response = $ua->request($request);
+
+        unless ($response->is_success) {
+            log_message('ERROR', "HTTP request failed: " . $response->status_line);
+            return;
+        }
+
+        return $response->decoded_content;
+    } catch {
+        log_message('ERROR', "Failed to fetch URL $url: $_");
+        return;
+    };
+}
+
 sub get_channel_json($ua) {
     my $now = time();
 
@@ -253,6 +276,40 @@ sub get_channel_json($ua) {
     write_cache_file($channels_time_file, $now);
 
     return @{$json_data};
+}
+
+sub getBootFromPluto($ua, $region) {
+    my $region_data = $regions{$region} or return;
+    my ($lat, $lon) = ($region_data->{lat}, $region_data->{lon});
+
+    log_message('INFO', "Refreshing session for region '$region' with coordinates: $lat, $lon");
+
+    my $url = "https://boot.pluto.tv/v4/start?" . join('&',
+        "deviceId=$config->{deviceid}",
+        "deviceMake=Firefox",
+        "deviceType=web",
+        "deviceVersion=109.0",
+        "deviceModel=web",
+        "DNT=0",
+        "appName=web",
+        "appVersion=5.17.0-38a5bd7",
+        "clientID=$config->{deviceid}",
+        "clientModelNumber=na",
+        "deviceLat=$lat",
+        "deviceLon=$lon"
+    );
+
+    my $content = get_from_url($ua, $url);
+    return unless $content;
+
+    my $json_data = try { $json->decode($content) };
+    return unless $json_data;
+
+    # Cache speichern
+    write_cache_file($session_file, $content);
+    write_cache_file($bootTime_file, time());
+
+    return $json_data;
 }
 
 sub get_bootJson($ua, $region) {
@@ -604,121 +661,6 @@ sub fixPlaylistUrlsInMaster($master, $channelid, $sessionid) {
     $master =~ s{terminate=true}{terminate=false}g;
 
     return $master;
-}
-
-# Verbesserte Session-Initialisierung
-sub getBootFromPluto($ua, $region) {
-    my $region_data = $regions{$region} or return;
-    my ($lat, $lon) = ($region_data->{lat}, $region_data->{lon});
-
-    log_message('INFO', "Refreshing session for region '$region' with coordinates: $lat, $lon");
-
-    # Verwende v4 API für boot (das ist noch aktuell)
-    my $url = "https://boot.pluto.tv/v4/start?" . join('&',
-        "deviceId=$config->{deviceid}",
-        "deviceMake=Firefox",
-        "deviceType=web",
-        "deviceVersion=109.0",
-        "deviceModel=web",
-        "DNT=0",
-        "appName=web",
-        "appVersion=5.17.0-38a5bd7",
-        "clientID=$config->{deviceid}",
-        "clientModelNumber=na",
-        "deviceLat=$lat",
-        "deviceLon=$lon",
-        "deviceDNT=0",
-        "userId=",
-        "advertisingId=",
-        "freeWheelHash="
-    );
-
-    # Erweiterte Header für Boot-Request
-    my $headers = {
-        'User-Agent' => USER_AGENT,
-        'Accept' => 'application/json',
-        'Accept-Language' => 'de-DE,de;q=0.9,en;q=0.8',
-        'Origin' => 'https://pluto.tv',
-        'Referer' => 'https://pluto.tv/',
-        'DNT' => '0',
-    };
-
-    my $content = get_from_url($ua, $url, $headers);
-    return unless $content;
-
-    my $json_data = try { $json->decode($content) };
-    return unless $json_data;
-
-    # Validiere Session-Daten
-    unless ($json_data->{session} && $json_data->{session}->{sessionID}) {
-        log_message('ERROR', "Boot response missing session data");
-        return;
-    }
-
-    # Cache speichern
-    write_cache_file($session_file, $content);
-    write_cache_file($bootTime_file, time());
-
-    log_message('DEBUG', "Session initialized: $json_data->{session}->{sessionID}");
-
-    return $json_data;
-}
-
-# Verbesserte get_from_url Funktion mit Retry-Logik
-sub get_from_url($ua, $url, $headers = {}) {
-    my $max_retries = 3;
-    my $retry_delay = 2;
-
-    for my $attempt (1..$max_retries) {
-        try {
-            log_message('DEBUG', "Fetching URL (attempt $attempt): $url");
-
-            my $request = HTTP::Request->new(GET => $url);
-            for my $header_name (keys %$headers) {
-                $request->header($header_name => $headers->{$header_name});
-            }
-
-            my $response = $ua->request($request);
-
-            if ($response->is_success) {
-                my $content = $response->decoded_content;
-
-                # Zusätzliche Validierung für M3U8-Inhalte
-                if ($url =~ /\.m3u8/ && $content !~ /#EXTM3U|#EXT-X-/) {
-                    log_message('WARN', "Response doesn't look like valid M3U8 content");
-                    return unless $attempt == $max_retries;  # Letzter Versuch
-                }
-
-                return $content;
-            } else {
-                log_message('WARN', "HTTP request failed (attempt $attempt): " . $response->status_line);
-
-                # Bei 4xx Fehlern (Client-Fehler) nicht wiederholen
-                if ($response->code >= 400 && $response->code < 500) {
-                    log_message('ERROR', "Client error, not retrying: " . $response->status_line);
-                    return;
-                }
-
-                # Bei letztem Versuch Fehler ausgeben
-                if ($attempt == $max_retries) {
-                    log_message('ERROR', "HTTP request failed after $max_retries attempts: " . $response->status_line);
-                    return;
-                }
-
-                # Warte vor erneutem Versuch
-                sleep($retry_delay);
-                $retry_delay *= 2;  # Exponential backoff
-            }
-        } catch {
-            log_message('ERROR', "Exception during HTTP request (attempt $attempt): $_");
-            if ($attempt == $max_retries) {
-                return;
-            }
-            sleep($retry_delay);
-        };
-    }
-
-    return;
 }
 
 sub send_playlistm3u8file($client_socket, $request, $ua) {
