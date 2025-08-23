@@ -215,29 +215,6 @@ sub create_user_agent {
     );
 }
 
-sub get_from_url($ua, $url, $headers = {}) {
-    try {
-        log_message('DEBUG', "Fetching URL: $url");
-
-        my $request = HTTP::Request->new(GET => $url);
-        for my $header_name (keys %$headers) {
-            $request->header($header_name => $headers->{$header_name});
-        }
-
-        my $response = $ua->request($request);
-
-        unless ($response->is_success) {
-            log_message('ERROR', "HTTP request failed: " . $response->status_line);
-            return;
-        }
-
-        return $response->decoded_content;
-    } catch {
-        log_message('ERROR', "Failed to fetch URL $url: $_");
-        return;
-    };
-}
-
 sub get_channel_json($ua) {
     my $now = time();
 
@@ -276,40 +253,6 @@ sub get_channel_json($ua) {
     write_cache_file($channels_time_file, $now);
 
     return @{$json_data};
-}
-
-sub getBootFromPluto($ua, $region) {
-    my $region_data = $regions{$region} or return;
-    my ($lat, $lon) = ($region_data->{lat}, $region_data->{lon});
-
-    log_message('INFO', "Refreshing session for region '$region' with coordinates: $lat, $lon");
-
-    my $url = "https://boot.pluto.tv/v4/start?" . join('&',
-        "deviceId=$config->{deviceid}",
-        "deviceMake=Firefox",
-        "deviceType=web",
-        "deviceVersion=109.0",
-        "deviceModel=web",
-        "DNT=0",
-        "appName=web",
-        "appVersion=5.17.0-38a5bd7",
-        "clientID=$config->{deviceid}",
-        "clientModelNumber=na",
-        "deviceLat=$lat",
-        "deviceLon=$lon"
-    );
-
-    my $content = get_from_url($ua, $url);
-    return unless $content;
-
-    my $json_data = try { $json->decode($content) };
-    return unless $json_data;
-
-    # Cache speichern
-    write_cache_file($session_file, $content);
-    write_cache_file($bootTime_file, time());
-
-    return $json_data;
 }
 
 sub get_bootJson($ua, $region) {
@@ -649,12 +592,133 @@ sub send_m3ufile($client_socket, $ua) {
 sub fixPlaylistUrlsInMaster($master, $channelid, $sessionid) {
     my $host_port = "$config->{hostip}:$config->{port}";
 
-    $master =~ s{#EXT-X-STREAM-INF:PROGRAM-ID=([^,]+).*?\n(.*\.m3u8)}
-        {#EXT-X-STREAM-INF:PROGRAM-ID=$1\nhttp://$host_port/playlist3u8?id=$2&channelid=$channelid&session=$sessionid}g;
+    # Behandle sowohl relative als auch absolute URLs
+    $master =~ s{#EXT-X-STREAM-INF:([^\n]+)\n([^/\n]+\.m3u8)}
+        {#EXT-X-STREAM-INF:$1\nhttp://$host_port/playlist3u8?id=$2&channelid=$channelid&session=$sessionid}g;
 
+    # Für absolute URLs (falls vorhanden)
+    $master =~ s{#EXT-X-STREAM-INF:([^\n]+)\n(https?://[^\n]+\.m3u8[^\n]*)}
+        {#EXT-X-STREAM-INF:$1\n$2}g;
+
+    # Stelle sicher, dass terminate auf false gesetzt ist
     $master =~ s{terminate=true}{terminate=false}g;
 
     return $master;
+}
+
+# Verbesserte Session-Initialisierung
+sub getBootFromPluto($ua, $region) {
+    my $region_data = $regions{$region} or return;
+    my ($lat, $lon) = ($region_data->{lat}, $region_data->{lon});
+
+    log_message('INFO', "Refreshing session for region '$region' with coordinates: $lat, $lon");
+
+    # Verwende v4 API für boot (das ist noch aktuell)
+    my $url = "https://boot.pluto.tv/v4/start?" . join('&',
+        "deviceId=$config->{deviceid}",
+        "deviceMake=Firefox",
+        "deviceType=web",
+        "deviceVersion=109.0",
+        "deviceModel=web",
+        "DNT=0",
+        "appName=web",
+        "appVersion=5.17.0-38a5bd7",
+        "clientID=$config->{deviceid}",
+        "clientModelNumber=na",
+        "deviceLat=$lat",
+        "deviceLon=$lon",
+        "deviceDNT=0",
+        "userId=",
+        "advertisingId=",
+        "freeWheelHash="
+    );
+
+    # Erweiterte Header für Boot-Request
+    my $headers = {
+        'User-Agent' => USER_AGENT,
+        'Accept' => 'application/json',
+        'Accept-Language' => 'de-DE,de;q=0.9,en;q=0.8',
+        'Origin' => 'https://pluto.tv',
+        'Referer' => 'https://pluto.tv/',
+        'DNT' => '0',
+    };
+
+    my $content = get_from_url($ua, $url, $headers);
+    return unless $content;
+
+    my $json_data = try { $json->decode($content) };
+    return unless $json_data;
+
+    # Validiere Session-Daten
+    unless ($json_data->{session} && $json_data->{session}->{sessionID}) {
+        log_message('ERROR', "Boot response missing session data");
+        return;
+    }
+
+    # Cache speichern
+    write_cache_file($session_file, $content);
+    write_cache_file($bootTime_file, time());
+
+    log_message('DEBUG', "Session initialized: $json_data->{session}->{sessionID}");
+
+    return $json_data;
+}
+
+# Verbesserte get_from_url Funktion mit Retry-Logik
+sub get_from_url($ua, $url, $headers = {}) {
+    my $max_retries = 3;
+    my $retry_delay = 2;
+
+    for my $attempt (1..$max_retries) {
+        try {
+            log_message('DEBUG', "Fetching URL (attempt $attempt): $url");
+
+            my $request = HTTP::Request->new(GET => $url);
+            for my $header_name (keys %$headers) {
+                $request->header($header_name => $headers->{$header_name});
+            }
+
+            my $response = $ua->request($request);
+
+            if ($response->is_success) {
+                my $content = $response->decoded_content;
+
+                # Zusätzliche Validierung für M3U8-Inhalte
+                if ($url =~ /\.m3u8/ && $content !~ /#EXTM3U|#EXT-X-/) {
+                    log_message('WARN', "Response doesn't look like valid M3U8 content");
+                    return unless $attempt == $max_retries;  # Letzter Versuch
+                }
+
+                return $content;
+            } else {
+                log_message('WARN', "HTTP request failed (attempt $attempt): " . $response->status_line);
+
+                # Bei 4xx Fehlern (Client-Fehler) nicht wiederholen
+                if ($response->code >= 400 && $response->code < 500) {
+                    log_message('ERROR', "Client error, not retrying: " . $response->status_line);
+                    return;
+                }
+
+                # Bei letztem Versuch Fehler ausgeben
+                if ($attempt == $max_retries) {
+                    log_message('ERROR', "HTTP request failed after $max_retries attempts: " . $response->status_line);
+                    return;
+                }
+
+                # Warte vor erneutem Versuch
+                sleep($retry_delay);
+                $retry_delay *= 2;  # Exponential backoff
+            }
+        } catch {
+            log_message('ERROR', "Exception during HTTP request (attempt $attempt): $_");
+            if ($attempt == $max_retries) {
+                return;
+            }
+            sleep($retry_delay);
+        };
+    }
+
+    return;
 }
 
 sub send_playlistm3u8file($client_socket, $request, $ua) {
@@ -675,42 +739,142 @@ sub send_playlistm3u8file($client_socket, $request, $ua) {
         return;
     }
 
+    # Verwende den aktuellen Session-Token aus boot_json, nicht den aus der URL
+    my $current_session = $boot_json->{session}->{sessionID};
+
     my $region_data = $regions{$config->{active_region}};
+
+    # Verbesserte Parameter für bessere Kompatibilität
     my $get_params = join('&',
         "terminate=false",
         "embedPartner=",
-        "serverSideAds=false",
+        "serverSideAds=true",  # Geändert auf true für bessere Kompatibilität
         "paln=",
         "includeExtendedEvents=false",
         "architecture=",
-        "deviceId=unknown",
-        "deviceVersion=unknown",
-        "appVersion=unknown",
+        "deviceId=$config->{deviceid}",  # Verwende die konfigurierte Device-ID
+        "deviceVersion=109.0",
+        "appVersion=5.17.0-38a5bd7",
         "deviceType=web",
         "deviceMake=Firefox",
-        "sid=$sessionid",
+        "sid=$current_session",  # Verwende aktuelle Session
         "advertisingId=",
         "deviceLat=$region_data->{lat}",
         "deviceLon=$region_data->{lon}",
         "deviceDNT=0",
         "deviceModel=web",
         "userId=",
-        "appName="
+        "appName=web",
+        "clientID=$config->{deviceid}",
+        "clientModelNumber=na"
     );
 
-    my $url = "$boot_json->{servers}->{stitcher}/stitch/hls/channel/$channelid/$playlistid/playlist.m3u8?$get_params";
+    # Verwende stitcher v1 statt v2 für bessere Kompatibilität
+    my $base_url = $boot_json->{servers}->{stitcher};
+    # Stelle sicher, dass wir v1 verwenden
+    $base_url =~ s/\/v2\//\/v1\//g;
 
-    my $playlist = get_from_url($ua, $url);
+    my $url = "$base_url/stitch/hls/channel/$channelid/$playlistid/playlist.m3u8?$get_params";
+
+    log_message('DEBUG', "Fetching playlist from: $url");
+
+    # Erweiterte Header für bessere Authentifizierung
+    my $headers = {
+        'User-Agent' => USER_AGENT,
+        'Accept' => 'application/vnd.apple.mpegurl',
+        'Accept-Language' => 'de-DE,de;q=0.9,en;q=0.8',
+        'Origin' => 'https://pluto.tv',
+        'Referer' => 'https://pluto.tv/',
+        'DNT' => '0',
+        'Connection' => 'keep-alive',
+        'Sec-Fetch-Dest' => 'empty',
+        'Sec-Fetch-Mode' => 'cors',
+        'Sec-Fetch-Site' => 'cross-site',
+    };
+
+    my $playlist = get_from_url($ua, $url, $headers);
     unless ($playlist) {
+        # Fallback: Versuche alternative URL-Struktur
+        log_message('DEBUG', "First attempt failed, trying fallback URL structure");
+
+        # Alternative URL ohne zusätzliche Parameter
+        my $fallback_url = "$base_url/stitch/hls/channel/$channelid/master.m3u8?$boot_json->{stitcherParams}";
+        $playlist = get_from_url($ua, $fallback_url, $headers);
+
+        unless ($playlist) {
+            send_response($client_socket,
+                create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist from PlutoTV"));
+            return;
+        }
+    }
+
+    # Validiere dass die Playlist tatsächlich Segmente enthält
+    unless ($playlist =~ /#EXTINF:|#EXT-X-STREAM-INF:/) {
+        log_message('ERROR', "Received playlist has no segments or streams");
         send_response($client_socket,
-            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist"));
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Playlist has no segments"));
         return;
     }
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="playlist.m3u8"');
+    $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    $response->header('Pragma', 'no-cache');
+    $response->header('Expires', '0');
     $response->content(encode_utf8($playlist));
+    send_response($client_socket, $response);
+}
+
+# Erweiterte Funktion für direkten Stream (Alternative Implementierung)
+sub send_direct_stream_v2($client_socket, $request, $ua) {
+    my $path = $request->uri->path;
+    my ($channel_id) = $path =~ m{/stream/([^/]+)\.m3u8$};
+
+    unless ($channel_id) {
+        send_response($client_socket,
+            create_error_response(RC_BAD_REQUEST, "Invalid stream path"));
+        return;
+    }
+
+    my $boot_json = get_bootJson($ua, $config->{active_region});
+    unless ($boot_json && $boot_json->{servers}) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to get session data"));
+        return;
+    }
+
+    # Verwende direkt den stitcher mit v1 API
+    my $base_url = $boot_json->{servers}->{stitcher};
+    $base_url =~ s/\/v2\//\/v1\//g;
+
+    # Verwende den einfacheren master.m3u8 Endpunkt
+    my $url = "$base_url/stitch/hls/channel/$channel_id/master.m3u8?$boot_json->{stitcherParams}";
+
+    log_message('DEBUG', "Fetching direct stream from: $url");
+
+    my $headers = {
+        'User-Agent' => USER_AGENT,
+        'Accept' => 'application/vnd.apple.mpegurl',
+        'Origin' => 'https://pluto.tv',
+        'Referer' => 'https://pluto.tv/',
+    };
+
+    my $master = get_from_url($ua, $url, $headers);
+    unless ($master) {
+        send_response($client_socket,
+            create_error_response(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream"));
+        return;
+    }
+
+    # Für tvheadend: Gib die Master-Playlist direkt zurück ohne URL-Umschreibung
+    # da tvheadend die relativen URLs selbst auflösen kann
+
+    my $response = HTTP::Response->new(RC_OK, 'OK');
+    $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+    $response->header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    $response->header('Pragma', 'no-cache');
+    $response->header('Expires', '0');
+    $response->content(encode_utf8($master));
     send_response($client_socket, $response);
 }
 
@@ -926,6 +1090,9 @@ sub process_request($client_socket) {
                 my $response = HTTP::Response->new(RC_NO_CONTENT, 'No Content');
                 send_response($client_socket, $response);
             }
+            when ('/debug') {
+                send_debug_info($client_socket, $ua);
+            }
             default {
                 send_response($client_socket,
                     create_error_response(RC_NOT_FOUND, "Path not found: $path"));
@@ -997,6 +1164,69 @@ sub create_server_socket {
     }
 
     return $socket;
+}
+
+sub send_debug_info($client_socket, $ua) {
+    my $debug_info = {
+        version => $VERSION,
+        region => $config->{active_region},
+        device_id => $config->{deviceid},
+    };
+
+    # Teste Boot-JSON
+    my $boot_json = get_bootJson($ua, $config->{active_region});
+    if ($boot_json) {
+        $debug_info->{session_valid} = 1;
+        $debug_info->{session_id} = $boot_json->{session}->{sessionID} || 'missing';
+        $debug_info->{stitcher_url} = $boot_json->{servers}->{stitcher} || 'missing';
+        $debug_info->{stitcher_params} = $boot_json->{stitcherParams} || 'missing';
+    } else {
+        $debug_info->{session_valid} = 0;
+        $debug_info->{error} = "Failed to get boot session";
+    }
+
+    # Teste Channel-Liste
+    my @channels = get_channel_json($ua);
+    $debug_info->{channels_count} = scalar @channels;
+
+    if (@channels > 0) {
+        my $first_channel = $channels[0];
+        $debug_info->{sample_channel} = {
+            id => $first_channel->{_id},
+            name => $first_channel->{name},
+            number => $first_channel->{number},
+        };
+
+        # Teste eine Master-URL
+        if ($boot_json && $boot_json->{servers}) {
+            my $base_url = $boot_json->{servers}->{stitcher};
+            $base_url =~ s/\/v2\//\/v1\//g;
+
+            my $test_url = "$base_url/stitch/hls/channel/$first_channel->{_id}/master.m3u8?$boot_json->{stitcherParams}";
+            $debug_info->{sample_master_url} = $test_url;
+
+            # Teste den Aufruf
+            my $master_content = get_from_url($ua, $test_url, {
+                'User-Agent' => USER_AGENT,
+                'Accept' => 'application/vnd.apple.mpegurl',
+                'Origin' => 'https://pluto.tv',
+                'Referer' => 'https://pluto.tv/',
+            });
+
+            if ($master_content) {
+                $debug_info->{master_test_success} = 1;
+                $debug_info->{master_content_length} = length($master_content);
+                $debug_info->{master_has_streams} = $master_content =~ /#EXT-X-STREAM-INF/ ? 1 : 0;
+            } else {
+                $debug_info->{master_test_success} = 0;
+            }
+        }
+    }
+
+    my $response = HTTP::Response->new(RC_OK, 'OK');
+    $response->header('Content-Type', 'application/json; charset=utf-8');
+    $response->content($json->encode($debug_info));
+    send_response($client_socket, $response);
 }
 
 sub initialize_session {
