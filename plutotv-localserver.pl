@@ -530,7 +530,7 @@ sub send_xmltvepgfile($client_socket, $request, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/xml; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend-epg.xml"');
+    #$response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend-epg.xml"');
     $response->header('Cache-Control', 'public, max-age=1800');  # 30 Minuten Cache für EPG
     if($head == 0) {$response->content(encode_utf8($epg));}
     send_response($client_socket, $response);
@@ -600,7 +600,7 @@ sub send_tvheadend_m3u($client_socket, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/x-mpegurl; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
+    #$response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
     $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
     # Wichtig für tvheadend: Content-Length setzen
     my $content_bytes = encode_utf8($m3u_content);
@@ -774,7 +774,7 @@ sub send_m3ufile($client_socket, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/x-mpegurl; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="plutotv.m3u8"');
+    #$response->header('Content-Disposition', 'attachment; filename="plutotv.m3u8"');
     if($head == 0) {$response->content(encode_utf8($m3u_content));}
     send_response($client_socket, $response);
 }
@@ -981,7 +981,7 @@ sub send_masterm3u8file($client_socket, $request, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="master.m3u8"');
+    #$response->header('Content-Disposition', 'attachment; filename="master.m3u8"');
     if($head == 0) {$response->content(encode_utf8($master));}
     send_response($client_socket, $response);
 }
