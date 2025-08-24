@@ -603,7 +603,8 @@ sub send_tvheadend_m3u($client_socket, $ua) {
     #$response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
     $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
     # Wichtig für tvheadend: Content-Length setzen
-    my $content_bytes = encode_utf8($m3u_content);
+    #my $content_bytes = encode_utf8($m3u_content);
+    my $content_bytes = $m3u_content;
     $response->header('Content-Length', length($content_bytes));
     if($head == 0) {$response->content($content_bytes);}
 
