@@ -599,8 +599,8 @@ sub send_tvheadend_m3u($client_socket, $ua) {
     log_message('INFO', "Generated M3U with $channel_count channels for tvheadend");
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
-    $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
-    #$response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
+    $response->header('Content-Type', 'application/x-mpegurl; charset=utf-8');
+    $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
     $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
     # Wichtig für tvheadend: Content-Length setzen
     my $content_bytes = encode_utf8($m3u_content);
@@ -773,7 +773,7 @@ sub send_m3ufile($client_socket, $ua) {
     my $m3u_content = buildM3U($ua, @channels);
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
-    $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
+    $response->header('Content-Type', 'application/x-mpegurl; charset=utf-8');
     $response->header('Content-Disposition', 'attachment; filename="plutotv.m3u8"');
     if($head == 0) {$response->content(encode_utf8($m3u_content));}
     send_response($client_socket, $response);
