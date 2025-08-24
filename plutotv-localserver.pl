@@ -39,6 +39,15 @@ my $streamlink = which 'streamlink';
 our $session;
 our $bootTime;
 
+# Region-Konfiguration
+my %regions = (
+    'DE' => { lat => '52.5200', lon => '13.4050', name => 'Deutschland' },
+    'US' => { lat => '40.7128', lon => '-74.0060', name => 'United States' },
+    'UK' => { lat => '51.5074', lon => '-0.1278', name => 'United Kingdom' },
+    'FR' => { lat => '48.8566', lon => '2.3522', name => 'France' },
+    'IT' => { lat => '41.9028', lon => '12.4964', name => 'Italy' },
+);
+
 # Command line arguments
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
