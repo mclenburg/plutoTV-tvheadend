@@ -82,6 +82,9 @@ sub get_from_url {
 }
 
 sub get_channel_json {
+    my ($region) = @_;
+    $region ||= 'DE';  # Default region
+
     my $from = DateTime->now();
     my $to = DateTime->now()->add(days => 2);
     my $url = "$apiurl?start=${from}Z&stop=${to}Z";
@@ -94,18 +97,31 @@ sub get_channel_json {
 }
 
 sub get_boot_from_pluto {
-    printf("Refresh of current Session\n");
+    my ($region) = @_;
+    $region ||= 'DE';
+
+    my $region_data = $regions{$region};
+    unless ($region_data) {
+        warn "Unknown region: $region, using DE as fallback\n";
+        $region_data = $regions{'DE'};
+    }
+
+    printf("Refresh of current Session for region $region\n");
     my $url = "https://boot.pluto.tv/v4/start?" . join('&',
         "deviceId=$deviceid",
         "deviceMake=Firefox",
         "deviceType=web",
         "deviceVersion=109.0",
         "deviceModel=web",
-        "DNT=0",
+        "DNT=1",
         "appName=web",
         "appVersion=5.17.0",
         "clientID=$deviceid",
-        "clientModelNumber=na"
+        "clientModelNumber=na",
+        "serverSideAds=false",
+        "includeExtendedEvents=false",
+        "deviceLat=$region_data->{lat}",
+        "deviceLon=$region_data->{lon}"
     );
 
     my $content = get_from_url($url);
@@ -117,7 +133,9 @@ sub get_boot_from_pluto {
 }
 
 sub get_boot_json {
-    my ($channel_id) = @_;
+    my ($channel_id, $region) = @_;
+    $region ||= 'DE';
+
     my $now = DateTime->now();
     my $max_time;
 
@@ -129,7 +147,7 @@ sub get_boot_json {
     }
 
     if (!defined $session || $now > $max_time) {
-        $session = get_boot_from_pluto();
+        $session = get_boot_from_pluto($region);
     }
     return $session;
 }
@@ -192,11 +210,13 @@ sub send_help {
     $response->code(200);
     $response->message("OK");
     $response->content("Following endpoints are available:\n" .
-        "\t/playlist\tfor full m3u8-file (legacy pipes)\n" .
-        "\t/tvheadend\tfor direct streams (tvheadend optimized)\n" .
+        "\t/playlist?region=REGION\tfor full m3u8-file (legacy pipes)\n" .
+        "\t/tvheadend?region=REGION\tfor direct streams (tvheadend optimized)\n" .
         "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
         "\t/master3u8?id=\tfor master.m3u8 of specific channel\n" .
-        "\t/epg\t\tfor xmltv-epg-file\n");
+        "\t/epg\t\tfor xmltv-epg-file\n\n" .
+        "Available regions: " . join(", ", sort keys %regions) . "\n" .
+        "Example: /tvheadend?region=US\n");
     $client->send_response($response);
 }
 
@@ -267,8 +287,16 @@ sub send_xmltv_epg_file {
 }
 
 sub send_m3u_file {
-    my ($client, $use_direct_streams) = @_;
-    my @channels = get_channel_json();
+    my ($client, $use_direct_streams, $request) = @_;
+
+    # Extract region parameter if provided
+    my $region = 'DE';  # Default
+    if ($request) {
+        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    }
+
+    my @channels = get_channel_json($region);
 
     unless (@channels) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
@@ -387,19 +415,19 @@ sub send_playlist_m3u8_file {
         "paln=",
         "includeExtendedEvents=false",
         "architecture=",
-        "deviceId=unknown",
-        "deviceVersion=unknown",
-        "appVersion=unknown",
+        "deviceId=$deviceid",
+        "deviceVersion=109.0",
+        "appVersion=5.17.0",
         "deviceType=web",
         "deviceMake=Firefox",
         "sid=$session_id",
         "advertisingId=",
         "deviceLat=54.1241",
         "deviceLon=12.1247",
-        "deviceDNT=0",
+        "deviceDNT=1",
         "deviceModel=web",
         "userId=",
-        "appName="
+        "appName=web"
     );
 
     my $url = $boot_json->{servers}->{stitcher} .
@@ -464,9 +492,9 @@ sub process_request {
     printf(" Request received for path $path\n");
 
     if ($path eq "/playlist") {
-        send_m3u_file($client, 0);  # Legacy pipes
+        send_m3u_file($client, 0, $request);  # Legacy pipes
     } elsif ($path eq "/tvheadend") {
-        send_m3u_file($client, 1);  # Direct streams
+        send_m3u_file($client, 1, $request);  # Direct streams
     } elsif ($path =~ m{^/stream/}) {
         send_direct_stream($client, $request);
     } elsif ($path eq "/master3u8") {
