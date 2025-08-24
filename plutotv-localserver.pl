@@ -600,7 +600,7 @@ sub send_tvheadend_m3u($client_socket, $ua) {
 
     my $response = HTTP::Response->new(RC_OK, 'OK');
     $response->header('Content-Type', 'audio/x-mpegurl; charset=utf-8');
-    $response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
+    #$response->header('Content-Disposition', 'attachment; filename="plutotv-tvheadend.m3u8"');
     $response->header('Cache-Control', 'public, max-age=900');  # 15 Minuten Cache
     # Wichtig für tvheadend: Content-Length setzen
     my $content_bytes = encode_utf8($m3u_content);
@@ -1096,7 +1096,7 @@ sub process_request($client_socket) {
 
     chomp $request_line;
     my ($method, $uri_path, $protocol) = split(/\s+/, $request_line, 3);
-    log_message('DEBUG', "Received Request with $method: $request_line");
+
     # Nur GET-Requests unterstützen
     #unless ($method && ($method eq 'GET' || $method eq 'HEAD')) {
     #    send_response($client_socket,
