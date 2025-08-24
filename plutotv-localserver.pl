@@ -1143,7 +1143,7 @@ sub process_request($client_socket) {
                 send_tvheadend_m3u($client_socket, $ua);
             }
             when (m{^/stream/}) {
-                send_direct_stream($client_socket, $request, $ua);
+                send_direct_stream_proxy($client_socket, $request, $ua);
             }
             when (m{^/raw/}) {
                 # Debug-Endpunkt für rohe Master-Playlists
