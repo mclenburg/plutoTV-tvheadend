@@ -1096,7 +1096,7 @@ sub process_request($client_socket) {
 
     chomp $request_line;
     my ($method, $uri_path, $protocol) = split(/\s+/, $request_line, 3);
-
+    log_message('DEBUG', "Received Request with $method: $request_line");
     # Nur GET-Requests unterstützen
     #unless ($method && ($method eq 'GET' || $method eq 'HEAD')) {
     #    send_response($client_socket,
