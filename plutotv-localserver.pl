@@ -572,7 +572,8 @@ sub buildM3U_tvheadend($ua, @channels) {
         $m3u .= $extinf_line;
 
         # Stream-URL: Verwende immer unseren direkten Stream-Endpunkt
-        my $stream_url = "http://$config->{hostip}:$config->{port}/stream/$channel->{_id}.m3u8";
+        #my $stream_url = "http://$config->{hostip}:$config->{port}/stream/$channel->{_id}.m3u8";
+        my $stream_url = "pipe://$ffmpeg -loglevel fatal -threads 0 -nostdin -re -i \"http://$config->{hostip}:$config->{port}/master3u8?id=$channel->{_id}\" -c copy -f mpegts pipe:1";
         $m3u .= "$stream_url\n";
     }
 
