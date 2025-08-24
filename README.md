@@ -1,195 +1,150 @@
 # plutoTV-tvheadend
-Perl-Script to generate m3u and xmltv-epg from PlutoTV-API for seamless tvheadend integration.   
-Provides direct HLS streams without external dependencies for optimal tvheadend compatibility.
+Perl-Script to generate m3u and xmltv-epg from PlutoTV-API.   
+Now with enhanced tvheadend support and direct HLS streaming capabilities.
 
 There are two ways to use these scripts:
 * you can generate a static m3u8 by using the `plutotv-generate.pl`-script with params
 * you can start `plutotv-localserver.pl` as local HTTP-Server and call it via URLs
 
-**For tvheadend integration, use `plutotv-localserver.pl` to ensure that the channel list (m3u8) and EPG data are always up-to-date.**
+I recommend using `plutotv-localserver.pl` to ensure that the channel list (m3u8) is always up-to-date.
 
-## Prerequisites
-
-### Required Perl modules
+## install used modules
 ```bash
-sudo cpan install DateTime JSON::XS LWP::UserAgent UUID::Tiny File::Which Try::Tiny Time::HiRes
-sudo cpan install HTTP::Request::Params HTTP::Status URI URI::Escape Net::Address::IP::Local 
-sudo cpan install Getopt::Long POSIX Fcntl MIME::Base64 IO::Socket::INET IO::Select
+sudo cpan install DateTime DateTime::Format::Strptime JSON JSON:Parse HTTP::Request URI::Escape LWP::UserAgent UUID::Tiny File::Which
 ```
 
-### Optional external tools
-- **ffmpeg** (only needed if using legacy pipe mode with `--usestreamlink=0`)
-- **streamlink** (only needed if using `--usestreamlink` option)
+when using `plutotv-localserver.pl` also:
+```bash
+sudo cpan install HTTP::Request::Params HTTP::Daemon HTTP::Status HTTP::Request::Common HTTP::Cookies Net::Address::IP::Local Getopt::Long Try::Tiny Encode
+```
 
-**Note**: For tvheadend integration, external tools are **not required** as direct HLS streams are used.
-
-## Usage
-
-### Static generation
+## usage
 `perl plutotv-generate.pl [--createm3u] [--usebash] [--useffmpeg | --usestreamlink]`
 
-### Local server (recommended for tvheadend)
-`perl plutotv-localserver.pl [OPTIONS]`
+### or
+`perl plutotv-localserver.pl [--localonly] [--port <portnumber>] [--usestreamlink]` (or start as systemd-daemon)
 
-### Command line options for plutotv-localserver.pl
+### meaning of params
 
-| Parameter | Effect |  
+#### plutotv-generate.pl
+
+| parameter | effect |  
 |---|---|  
-| `-l, --localonly` | Bind server to localhost (127.0.0.1) only |
-| `-p, --port <number>` | Set listening port (default: 9000) | 
-| `-r, --region <REGION>` | Set region: DE, US, UK, FR, IT (default: DE) |
-| `-s, --usestreamlink` | Use streamlink for legacy pipe mode (not recommended for tvheadend) |
-| `-d, --debug` | Enable debug logging |
-| `-h, --help` | Show help message with all available regions |
+| `--createm3u` | create playlist-file plutotv.m3u8 and xmltv-file plutotv-epg.xml |
+| `--usebash` | create bash-file for each pluto-tv-channel for starting service |
+| `--useffmpeg` | will use ffmpeg-pipe instead of using original URL to channel |
+| `--usestreamlink` | same as `--useffmpeg`, but using `streamlink` instead of ffmpeg |
 
-### Available endpoints
+#### plutotv-localserver.pl
 
-| Endpoint | Purpose | tvheadend Usage |
+|parameter | effect                                                   |
+|---|----------------------------------------------------------|
+| `--localonly` | will configure server to listen on localhost 127.0.0.1   |
+| `--port <number>` | set listening-port for server (default: 9000)            | 
+| `--usestreamlink` | provide playlist with call for streamlink instead ffmpeg |
+
+### available endpoints for localserver
+|endpoint | task |
+|---|---|
+|`/playlist` or `/playlist?region=REGION`|path to get m3u8-file with ffmpeg/streamlink pipes|
+|`/tvheadend` or `/tvheadend?region=REGION`|**NEW:** optimized m3u8 for tvheadend with direct HLS streams|
+|`/stream/{id}.m3u8`|**NEW:** direct HLS stream for individual channel|
+|`/master3u8?id=`|path to get master playlist for given channelid|
+|`/playlist3u8?id=`|path to get specific playlist for stream variant|
+|`/epg`|path to get xmltv-epg-file|
+|`/channels`|for full channel list in JSON format|
+
+### supported regions
+Both `/playlist` and `/tvheadend` endpoints support region selection via URL parameter:
+
+|Region Code | Location | Coordinates |
 |---|---|---|
-| `/` | Help and setup instructions | - |
-| `/tvheadend` | **M3U8 playlist optimized for tvheadend** | **Use this for M3U URL** |
-| `/epg` | **XMLTV EPG file (tvheadend compatible)** | **Use this for EPG URL** |
-| `/stream/{id}.m3u8` | Direct HLS stream for channel ID | Auto-generated in tvheadend playlist |
-| `/status` | Server status and configuration | Monitoring |
-| `/channels` | Channel list in JSON format | API access |
-| `/search?q=query` | Search channels by name | API access |
-| `/categories` | List of channel categories | API access |
-| `/playlist` | Legacy M3U8 with pipe commands | Legacy support |
-| `/master3u8?id=` | Master playlist for channel ID | Internal use |
-| `/epg?channel_id=ID` | EPG for specific channel | Selective EPG |
+|`DE` (default) | Berlin, Deutschland | 52.5200, 13.4050 |
+|`US` | New York, United States | 40.7128, -74.0060 |
+|`UK` | London, United Kingdom | 51.5074, -0.1278 |
+|`FR` | Paris, France | 48.8566, 2.3522 |
+|`IT` | Rome, Italy | 41.9028, 12.4964 |
 
-## tvheadend Integration Guide
+**Examples:**
+- `http://localhost:9000/tvheadend?region=US` - US channels with direct streams
+- `http://localhost:9000/playlist?region=UK` - UK channels with pipes
+- `http://localhost:9000/tvheadend` - German channels (default)
 
-### Step-by-Step Setup
+## tvheadend integration
 
-1. **Start the PlutoTV proxy server:**
-   ```bash
-   perl plutotv-localserver.pl --region DE --port 9000
-   ```
+### recommended setup for tvheadend
+1. **Add Network:** IPTV Automatic Network
+2. **Set M3U URL:** `http://YOUR_SERVER_IP:9000/tvheadend` (or with `?region=REGION`)
+3. **Set EPG URL:** `http://YOUR_SERVER_IP:9000/epg`
+4. **Enable:** "Scan after creation" and "Channel name in stream"
+5. **Set EPG update interval:** 30-60 minutes
 
-2. **Add IPTV Network in tvheadend:**
-    - Go to: **Configuration → DVB Inputs → Networks**
-    - Click **Add** → **IPTV Automatic Network**
-    - Configure as follows:
+### advantages of /tvheadend endpoint
+- **Direct HLS streams** - no ffmpeg pipes needed
+- **Optimized for tvheadend** - better compatibility and performance
+- **Ad-blocking parameters** - reduced stream interruptions from ads
+- **Absolute URLs** - prevents parsing issues with relative paths
+- **Regional content** - access different PlutoTV regions
 
-   | Setting | Value |
-      |---|---|
-   | **Network name** | PlutoTV DE |
-   | **M3U URL** | `http://your-server-ip:9000/tvheadend` |
-   | **EPG URL** | `http://your-server-ip:9000/epg` |
-   | **Channel name in stream** | ✅ Enabled |
-   | **Scan after creation** | ✅ Enabled |
-   | **Channel number from stream** | ✅ Enabled |
-   | **Update interval (minutes)** | 60 |
+### legacy support
+The original `/playlist` endpoint remains available for backward compatibility and still uses ffmpeg/streamlink pipes as before.
 
-3. **Configure EPG:**
-    - Go to: **Configuration → Channel/EPG → EPG Grabber**
-    - Enable **External: XMLTV**
-    - Set update interval: **30-60 minutes**
+## stream quality & ad-blocking
 
-4. **Map services:**
-    - Go to: **Configuration → Channel/EPG → Channels → Map Services**
-    - Click **Map all services** to automatically map channels
+The server now includes several anti-advertisement parameters:
+- `serverSideAds=false` - disables server-side ad insertion
+- `deviceDNT=1` - enables "Do Not Track"
+- `includeExtendedEvents=false` - disables extended ad events
 
-### Advanced tvheadend Configuration
+These parameters help reduce stream interruptions and discontinuities caused by advertisement insertion.
 
-#### Multiple Regions
-You can run multiple instances for different regions:
+## how to load xmltv-guide into tvheadend
+* Go to menu option "Configuration" > "Channel/EPG" > "EPG Grabber Modules" and enable "External: XMLTV"
+* Go to menu option "Configuration" > "Channel/EPG" > "Channel" > "Map services" > "Map all services" and map the services
+* Run the following command twice:
 
 ```bash
-# Germany
-perl plutotv-localserver.pl --region DE --port 9000 &
-
-# US
-perl plutotv-localserver.pl --region US --port 9001 &
-
-# UK  
-perl plutotv-localserver.pl --region UK --port 9002 &
+cat plutotv-epg.xml | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock
 ```
 
-Then add separate IPTV networks for each region.
+## automated updates
+PlutoTV only delivers timelines 6h in future. So epg has to be fetched at least every 6 hours:
 
-#### Systemd Service
-Create `/etc/systemd/system/plutotv-proxy.service`:
+**crontab for static files:**
+```cron
+15 */6 * * * perl plutotv-generate.pl
+```
 
+**crontab for server mode:**
+```cron
+15 */6 * * * wget http://localhost:9000/epg -O plutotv-epg.xml
+```
+
+## troubleshooting
+
+### streams stop during advertisements
+- The server includes anti-ad parameters by default
+- Some streams may still have discontinuities during heavy ad periods
+- Try different regions which may have different ad policies
+
+### no channels visible
+- Check if the region parameter matches available content
+- Verify internet connectivity to PlutoTV API
+- Some regions may have limited channel availability
+
+## systemd service example
 ```ini
 [Unit]
-Description=PlutoTV Proxy Server
+Description=PlutoTV Local Server
 After=network.target
 
 [Service]
 Type=simple
-User=tvheadend
-WorkingDirectory=/opt/plutotv-proxy
-ExecStart=/usr/bin/perl plutotv-localserver.pl --region DE --port 9000
+User=plutotv
+ExecStart=/usr/bin/perl /opt/plutotv/plutotv-localserver.pl --port 9000
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-Enable and start:
-```bash
-sudo systemctl enable plutotv-proxy
-sudo systemctl start plutotv-proxy
-```
-
-## Automatic EPG Updates
-
-PlutoTV provides EPG data up to 48 hours in advance. The proxy automatically caches EPG data for 30 minutes to reduce API load.
-
-### Manual EPG refresh (if needed)
-```bash
-# Download current EPG
-wget http://localhost:9000/epg -O plutotv-epg.xml
-
-# Import to tvheadend (if using external import)
-cat plutotv-epg.xml | socat - UNIX-CONNECT:/var/lib/hts/.hts/tvheadend/epggrab/xmltv.sock
-```
-
-## Supported Regions
-
-| Region | Code | Country |
-|---|---|---|
-| Germany | DE | Deutschland |
-| United States | US | United States |
-| United Kingdom | UK | United Kingdom |
-| France | FR | France |
-| Italy | IT | Italy |
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Channels not loading in tvheadend:**
-    - Check if proxy server is running: `http://your-server:9000/status`
-    - Verify M3U URL returns channel list: `http://your-server:9000/tvheadend`
-    - Check tvheadend logs for network errors
-
-2. **EPG not updating:**
-    - Verify EPG URL returns data: `http://your-server:9000/epg`
-    - Check EPG grabber configuration in tvheadend
-    - Ensure channel IDs match between M3U and EPG
-
-3. **Streams not playing:**
-    - Verify direct stream access: `http://your-server:9000/stream/CHANNEL_ID.m3u8`
-    - Check network connectivity to PlutoTV CDN
-    - Review proxy server logs with `--debug` option
-
-### Debug Mode
-Run with debug logging for troubleshooting:
-```bash
-perl plutotv-localserver.pl --debug --region DE
-```
-
-## Performance Notes
-
-- **Direct HLS**: No transcoding overhead, minimal CPU usage
-- **Automatic caching**: Channel lists cached for 15 minutes, EPG for 30 minutes
-- **Connection pooling**: Efficient HTTP client with keep-alive
-- **Concurrent handling**: Fork-based request processing
-
-## License & Disclaimer
-
-This tool is for educational and personal use only. Respect PlutoTV's terms of service and applicable laws in your jurisdiction.
