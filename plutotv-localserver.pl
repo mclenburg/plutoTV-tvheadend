@@ -605,7 +605,8 @@ sub send_tvheadend_m3u($client_socket, $ua) {
     # Wichtig für tvheadend: Content-Length setzen
     my $content_bytes = encode_utf8($m3u_content);
     #my $content_bytes = $m3u_content;
-    #$response->header('Content-Length', length($content_bytes));
+    $response->header('Content-Length', length($content_bytes));
+    $response->header('Connection', 'close');
     if($head == 0) {$response->content($content_bytes);}
 
     send_response($client_socket, $response);
