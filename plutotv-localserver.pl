@@ -12,7 +12,7 @@ use HTTP::Request::Params;
 use HTTP::Response;
 use LWP::UserAgent;
 use JSON::XS;
-use URI::Escape;
+use URI::Escape qw(uri_escape_utf8);
 use UUID::Tiny ':std';
 use File::Which;
 use Net::Address::IP::Local;
@@ -244,7 +244,7 @@ sub send_xmltvepgfile {
     for my $channel (@channels) {
         next unless $channel->{number} && $channel->{number} > 0;
         my $channel_name = $channel->{name} || 'Unknown';
-        my $channel_id = uri_escape($channel_name);
+        my $channel_id = uri_escape_utf8($channel_name);
 
         $epg .= qq{<channel id="$channel_id">\n};
         $epg .= qq{<display-name lang="de"><![CDATA[$channel_name]]></display-name>\n};
@@ -260,7 +260,7 @@ sub send_xmltvepgfile {
     # Programme data
     for my $channel (@channels) {
         next unless $channel->{number} && $channel->{number} > 0;
-        my $channel_id = uri_escape($channel->{name});
+        my $channel_id = uri_escape_utf8($channel->{name});
 
         for my $programme (@{$channel->{timelines} || []}) {
             my ($start, $stop) = ($programme->{start}, $programme->{stop});
@@ -312,7 +312,7 @@ sub buildM3U {
         $m3u .= sprintf(
             "#EXTINF:-1 tvg-chno=\"%d\" tvg-id=\"%s\" tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"PlutoTV\",%s\n",
             $channel->{number},
-            uri_escape($name),
+            uri_escape_utf8($name),
             $name,
             $logo,
             $name
@@ -537,6 +537,8 @@ sub process_request {
     if ($path eq "/") {
         send_help($client);
     } elsif ($path eq "/playlist") {
+        send_m3ufile($client);
+    } elsif ($path eq "/tvheadend") {
         send_m3ufile($client);
     } elsif ($path =~ m{^/stream/}) {
         send_direct_stream($client, $request);
