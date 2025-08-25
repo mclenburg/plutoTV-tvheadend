@@ -26,6 +26,7 @@ use Net::Address::IP::Local;
 use Data::Dumper;
 use Try::Tiny;
 use Getopt::Long qw(:config no_ignore_case);
+use Time::HiRes qw(sleep);
 
 # Configuration
 my $hostip = "127.0.0.1";
@@ -34,6 +35,11 @@ my $apiurl = "http://api.pluto.tv/v2/channels";
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
+
+# M3U8 Validation Configuration
+my $MAX_RETRIES = 3;
+my $RETRY_DELAY = 2.0;  # Sekunden zwischen Retries
+my $MIN_SEGMENTS = 2;   # Minimum Anzahl Segmente für valide M3U8
 
 # Global session variables
 our $session;
@@ -88,6 +94,79 @@ sub get_from_url {
     my $response = $ua->request($request);
 
     return $response->is_success ? $response->decoded_content : undef;
+}
+
+# M3U8 Validation Functions
+sub validate_m3u8 {
+    my ($m3u8_content) = @_;
+
+    # Grundlegende M3U8-Struktur prüfen
+    return 0 unless defined $m3u8_content && length($m3u8_content) > 0;
+
+    # M3U8-Header prüfen
+    return 0 unless $m3u8_content =~ /^#EXTM3U/m;
+
+    # Prüfen ob mindestens ein gültiges Segment vorhanden ist
+    my @segments = $m3u8_content =~ /^(?!#)(.+)$/gm;
+    return 0 unless @segments >= $MIN_SEGMENTS;
+
+    # Prüfen auf typische Werbe-/Übergangs-Indikatoren
+    # Leere Segmente oder nur Logo-Dateien ausschließen
+    my $valid_segments = 0;
+    foreach my $segment (@segments) {
+        $segment =~ s/^\s+|\s+$//g;  # Whitespace entfernen
+        next if $segment eq '';
+        next if $segment =~ /logo|placeholder|empty/i;
+        $valid_segments++;
+    }
+
+    return $valid_segments >= $MIN_SEGMENTS;
+}
+
+sub generate_fallback_m3u8 {
+    my $fallback = <<'EOF';
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAA==
+#EXTINF:10.0,
+data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAA==
+#EXT-X-ENDLIST
+EOF
+
+    printf STDERR "Fallback M3U8 wird verwendet\n";
+    return $fallback;
+}
+
+sub get_from_url_validated {
+    my ($url) = @_;
+    my $local_retry_delay = $RETRY_DELAY;
+
+    for my $attempt (1..$MAX_RETRIES) {
+        printf STDERR "M3U8 Abruf Versuch $attempt/$MAX_RETRIES für: $url\n";
+
+        # Original get_from_url Funktion verwenden
+        my $m3u8_content = get_from_url($url);
+
+        if ($m3u8_content && validate_m3u8($m3u8_content)) {
+            printf STDERR "Valide M3U8 erhalten nach Versuch $attempt\n";
+            return $m3u8_content;
+        }
+
+        printf STDERR "Invalide M3U8 in Versuch $attempt - ";
+        if ($attempt < $MAX_RETRIES) {
+            printf STDERR "Retry in ${local_retry_delay}s...\n";
+            sleep($local_retry_delay);
+            # Exponentieller Backoff
+            $local_retry_delay *= 1.5;
+        } else {
+            printf STDERR "Alle Versuche fehlgeschlagen\n";
+        }
+    }
+
+    # Fallback: Leere aber valide M3U8 zurückgeben
+    return generate_fallback_m3u8();
 }
 
 sub get_channel_json {
@@ -381,7 +460,8 @@ sub send_direct_stream {
     my $base_url = $boot_json->{servers}->{stitcher};
     my $url = "$base_url/stitch/hls/channel/$channel_id/master.m3u8?" . $boot_json->{stitcherParams};
 
-    my $master = get_from_url($url);
+    # HIER: get_from_url durch get_from_url_validated ersetzen
+    my $master = get_from_url_validated($url);
     unless ($master) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
         return;
@@ -442,7 +522,8 @@ sub send_playlist_m3u8_file {
     my $url = $boot_json->{servers}->{stitcher} .
         "/stitch/hls/channel/$channel_id/$playlist_id/playlist.m3u8?$get_params";
 
-    my $playlist = get_from_url($url);
+    # HIER: get_from_url durch get_from_url_validated ersetzen
+    my $playlist = get_from_url_validated($url);
     unless ($playlist) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist");
         return;
@@ -475,7 +556,8 @@ sub send_master_m3u8_file {
     my $base_url = $boot_json->{servers}->{stitcher} . "/stitch/hls/channel/$channel_id/";
     my $url = "${base_url}master.m3u8?" . $boot_json->{stitcherParams};
 
-    my $master = get_from_url($url);
+    # HIER: get_from_url durch get_from_url_validated ersetzen
+    my $master = get_from_url_validated($url);
     unless ($master) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch master playlist");
         return;
