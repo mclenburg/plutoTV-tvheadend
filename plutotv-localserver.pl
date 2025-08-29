@@ -25,7 +25,6 @@ use IPC::Run qw(run);
 
 use open qw(:std :utf8);
 
-# Configuration
 my $hostip = "127.0.0.1";
 my $port = "9000";
 my $apiurl = "http://api.pluto.tv/v2/channels";
@@ -33,27 +32,23 @@ my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
 
-# Global session variables
 our $session;
 our $bootTime;
 
-# Stream tracking variables
 our %active_streams = ();
 our %stream_counters = ();
 our %processed_segments = ();
 our %last_sequence_numbers = ();
 our $runningNumber = 1;
 
-# Region configuration
 my %regions = (
-    'DE' => { lat => '52.5200', lon => '13.4050', name => 'Deutschland' },
+    'DE' => { lat => '52.5200', lon => '13.4050', name => 'Germany' },
     'US' => { lat => '40.7128', lon => '-74.0060', name => 'United States' },
     'UK' => { lat => '51.5074', lon => '-0.1278', name => 'United Kingdom' },
     'FR' => { lat => '48.8566', lon => '2.3522', name => 'France' },
     'IT' => { lat => '41.9028', lon => '12.4964', name => 'Italy' },
 );
 
-# Command line arguments
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
@@ -70,7 +65,7 @@ sub fork_process {
     if ($pid) {
         waitpid $pid, 0;
     } else {
-        my $pid2 = fork;  # no zombies, make orphans instead
+        my $pid2 = fork;
         if ($pid2) {
             exit(0);
         } else {
@@ -251,10 +246,9 @@ sub send_xmltv_epg_file {
         return;
     }
 
-    my $langcode = "de";
+    my $langcode = "en";
     my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
 
-    # Channel definitions
     for my $channel (@channels) {
         next unless $channel->{number} > 0;
 
@@ -272,7 +266,6 @@ sub send_xmltv_epg_file {
         $epg .= "</channel>\n";
     }
 
-    # Programme data
     for my $channel (@channels) {
         next unless $channel->{number} > 0;
 
@@ -376,7 +369,6 @@ sub send_direct_stream {
 sub create_dynamic_playlist {
     my ($master_playlist, $channel_id, $base_url) = @_;
 
-    # Parse Master-Playlist für beste Qualität
     my @lines = split /\r?\n/, $master_playlist;
     my $best_stream_url;
     my $best_bandwidth = 0;
@@ -399,12 +391,10 @@ sub create_dynamic_playlist {
         return $master_playlist;
     }
 
-    # Erstelle absolute URL falls nötig
     unless ($best_stream_url =~ /^https?:\/\//) {
         $best_stream_url = "$base_url/stitch/hls/channel/$channel_id/$best_stream_url";
     }
 
-    # Increment Stream-Counter für neue Session
     $stream_counters{$channel_id} = ($stream_counters{$channel_id} || 0) + 1;
 
     my $stream_id = $stream_counters{$channel_id};
@@ -430,7 +420,6 @@ sub send_dynamic_stream {
         return;
     }
 
-    # Prüfe ob dies ein neuer Stream-Request ist
     if (!exists $active_streams{$channel_id} || $active_streams{$channel_id} != $stream_id) {
         printf("Starting new stream session for channel $channel_id (stream $stream_id)\n");
         $active_streams{$channel_id} = $stream_id;
@@ -494,7 +483,6 @@ sub stream_with_discontinuity_restart {
 
     $client->timeout(5);
 
-    # Setze Response-Header für Streaming
     eval {
         $client->write("HTTP/1.1 200 OK\r\n");
         $client->write("Content-Type: video/mp2t\r\n");
@@ -510,15 +498,12 @@ sub stream_with_discontinuity_restart {
 
     my $ua = create_user_agent();
 
-    # Initialisiere Tracking für diesen Stream
     $processed_segments{$channel_id} = {} unless exists $processed_segments{$channel_id};
     $last_sequence_numbers{$channel_id} = -1;
 
     printf("Starting stream for channel $channel_id with stream_id $stream_id\n");
 
     while (1) {
-        #last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
-
         my $playlist_content = get_from_url($playlist_url);
         unless ($playlist_content) {
             printf("Failed to fetch playlist for %s, restarting stream\n", $channel_id);
@@ -535,7 +520,7 @@ sub stream_with_discontinuity_restart {
             next;
         }
 
-        printf("Verarbeite %d neue Segmente für Kanal %s\n", scalar(@new_segments), $channel_id);
+        printf("Processing %d new segments for channel %s\n", scalar(@new_segments), $channel_id);
 
         for my $segment (@new_segments) {
             last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
@@ -547,7 +532,6 @@ sub stream_with_discontinuity_restart {
             $processed_segments{$channel_id}->{$segment->{url}} = time();
         }
 
-        # Regelmäßiges Aufräumen des Caches
         cleanup_old_segments($channel_id);
         sleep(2);
     }
@@ -630,10 +614,8 @@ sub filter_new_segments {
     my @new_segments;
 
     for my $segment (@$segments) {
-        # Prüfe, ob die Segment-URL schon einmal gesehen wurde
         next if exists $processed_segments{$channel_id}->{$segment->{url}};
 
-        # Wenn es eine neue URL ist, füge es zur Liste der neuen Segmente hinzu
         push @new_segments, $segment;
     }
 
@@ -643,7 +625,6 @@ sub filter_new_segments {
 sub stream_segment {
     my ($client, $ua, $segment, $channel_id) = @_;
 
-    # Hole verschlüsseltes Segment
     my $req = HTTP::Request->new(GET => $segment->{url});
     my $res = $ua->request($req);
 
@@ -652,7 +633,6 @@ sub stream_segment {
         return 0;
     }
 
-    # Hole Entschlüsselungsschlüssel
     my $key_res = $ua->get($segment->{key_uri});
     unless ($key_res->is_success) {
         printf("Failed to fetch key %s: %s\n", $segment->{key_uri}, $key_res->status_line);
@@ -669,10 +649,7 @@ sub stream_segment {
     my $chunk = $res->content;
     my $decrypted_data;
 
-    # Entschlüsselung mit OpenSSL (bevorzugt) oder Crypt::CBC
     if (which('openssl')) {
-        #printf("Using openssl\n");
-
         my $openssl_stderr = '';
         run(
             [
@@ -699,7 +676,6 @@ sub stream_segment {
         $decrypted_data = $cipher->decrypt($chunk);
     }
 
-    # Validierung: Prüfe auf MPEG-TS Sync-Byte (0x47)
     if (length($decrypted_data) > 0) {
         my $first_byte = unpack('C', substr($decrypted_data, 0, 1));
         unless ($first_byte == 0x47) {
@@ -708,28 +684,7 @@ sub stream_segment {
     }
 
     eval {
-        # Prüfe Client-Status vor dem Senden
-        #unless ($client->connected()) {
-        #    printf("Client disconnected before sending segment\n");
-        #    return 0;
-        #}
-
         my $outputData;
-        #run(
-        #    [
-        #        "ffmpeg", "-loglevel",  "error", "-i", "-",
-        #        "-c:v", "h264_v4l2m2m",
-        #        "-vf", "scale=1280:720",
-        #        "-r", 25, "-b:v", "2M",
-        #        "-c:a", "aac",
-        #        "-ac", 2,
-        #        "-b:a", "128k",
-        #        "-f", "mpegts",
-        #        "-"
-        #    ],
-        #    "<", \$decrypted_data,
-        #    ">", \$outputData
-        #);
 
         run(
             [
@@ -743,28 +698,6 @@ sub stream_segment {
         );
 
         print $client $outputData;
-
-        # Sende in kleineren Chunks und prüfe Erfolg
-#        my $chunk_size = 8192;
-#        my $total_sent = 0;
-#        my $data_length = length($decrypted_data);
-#
-#        while ($total_sent < $data_length) {
-#            my $chunk = substr($decrypted_data, $total_sent, $chunk_size);
-#            my $sent = $client->syswrite($chunk, length($chunk));
-#
-#            unless (defined $sent) {
-#                printf("Failed to send data to client: $!\n");
-#                return 0;
-#            }
-#
-#            if ($sent == 0) {
-#                printf("Client closed connection during send\n");
-#                return 0;
-#            }
-#
-#            $total_sent += $sent;
-#        }
 
         $client->flush();
     };
@@ -783,7 +716,7 @@ sub cleanup_old_segments {
     return unless exists $processed_segments{$channel_id};
 
     my $now = time();
-    my $cutoff_time = $now - (15 * 60); # 15 Minuten in Sekunden
+    my $cutoff_time = $now - (15 * 60);
 
     my $removed_count = 0;
     for my $url (keys %{$processed_segments{$channel_id}}) {
@@ -806,10 +739,10 @@ sub process_request {
     printf("Request received for path $path\n");
 
     if ($path eq "/playlist") {
-        send_m3u_file($client, 0, $request); # Legacy pipes
+        send_m3u_file($client, 0, $request);
     }
     elsif ($path eq "/tvheadend") {
-        send_m3u_file($client, 1, $request); # Direct streams
+        send_m3u_file($client, 1, $request);
     }
     elsif ($path =~ m{^/stream/}) {
         send_direct_stream($client, $request);
@@ -828,7 +761,6 @@ sub process_request {
     }
 }
 
-# Initialize configuration
 if (!$localhost) {
     $hostip = Net::Address::IP::Local->public_ipv4;
 }
@@ -837,7 +769,6 @@ if (defined(get_args_value("--port"))) {
     $port = get_args_value("--port");
 }
 
-# Start daemon
 my $daemon = HTTP::Daemon->new(
     LocalAddr => $hostip,
     LocalPort => $port,
