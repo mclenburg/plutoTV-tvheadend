@@ -42,6 +42,7 @@ our %active_streams = ();
 our %stream_counters = ();
 our %processed_segments = ();
 our %last_sequence_numbers = ();
+our $runningNumber = 1;
 
 # Region configuration
 my %regions = (
@@ -77,6 +78,12 @@ sub fork_process {
         }
     }
     return 0;
+}
+
+sub sort_by_running_number {
+    my @array = @_;
+    my @sorted_array = sort { $a->{running} <=> $b->{running} } @array;
+    return @sorted_array;
 }
 
 sub create_user_agent {
@@ -502,8 +509,6 @@ sub stream_with_discontinuity_restart {
     }
 
     my $ua = create_user_agent();
-    my $segment_count = 0;
-    my $last_sequence = -1;
 
     # Initialisiere Tracking für diesen Stream
     $processed_segments{$channel_id} = {} unless exists $processed_segments{$channel_id};
@@ -512,68 +517,40 @@ sub stream_with_discontinuity_restart {
     printf("Starting stream for channel $channel_id with stream_id $stream_id\n");
 
     while (1) {
-        # Prüfe ob Stream noch aktiv ist
-        last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
+        #last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
 
-        # Hole aktuelle Playlist
         my $playlist_content = get_from_url($playlist_url);
         unless ($playlist_content) {
-            printf("Failed to fetch playlist for $channel_id, restarting stream\n");
+            printf("Failed to fetch playlist for %s, restarting stream\n", $channel_id);
             last;
         }
 
-        # Extrahiere Playlist-Informationen
         my $playlist_info = parse_playlist_info($playlist_content);
 
-        # Prüfe auf Discontinuity in der Playlist
-        if ($playlist_info->{has_discontinuity}) {
-            printf("Discontinuity detected in channel $channel_id, resetting state for player\n");
-            $processed_segments{$channel_id} = {};
-            $last_sequence_numbers{$channel_id} = -1;
-        }
-
-        # Parse neue Segmente
-        my @segments = extract_segments_from_playlist($playlist_content, $playlist_url, $playlist_info);
-
-        # Filtere bereits verarbeitete Segmente
-        my @new_segments = filter_new_segments(\@segments, $channel_id);
+        my @all_segments = extract_segments_from_playlist($playlist_content, $playlist_url, $playlist_info);
+        my @new_segments = filter_new_segments(\@all_segments, $channel_id);
 
         if (@new_segments == 0) {
-            # Keine neuen Segmente, kurz warten
             sleep(1);
             next;
         }
 
-        printf("Processing %d new segments for channel $channel_id\n", scalar(@new_segments));
+        printf("Verarbeite %d neue Segmente für Kanal %s\n", scalar(@new_segments), $channel_id);
 
-        # Stream neue Segmente
         for my $segment (@new_segments) {
             last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
-
             my $success = stream_segment($client, $ua, $segment, $channel_id);
             unless ($success) {
-                printf("Failed to stream segment, ending stream for $channel_id\n");
+                printf("Failed to stream segment, ending stream for %s\n", $channel_id);
                 last;
             }
-
-            $segment_count++;
-
-            # Markiere Segment als verarbeitet
-            $processed_segments{$channel_id}->{$segment->{url}} = 1;
+            $processed_segments{$channel_id}->{$segment->{url}} = time();
         }
 
-        # Cleanup alte Segment-Referenzen (behalte nur die letzten 50)
-        cleanup_old_segments($channel_id, 50);
-
-        sleep(2); # Kurze Pause zwischen Playlist-Updates
+        # Regelmäßiges Aufräumen des Caches
+        cleanup_old_segments($channel_id);
+        sleep(2);
     }
-
-    # Cleanup
-    delete $active_streams{$channel_id} if exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
-    delete $processed_segments{$channel_id};
-    delete $last_sequence_numbers{$channel_id};
-    printf("Stream ended for channel $channel_id (streamed $segment_count segments)\n");
-    exit(0);
 }
 
 sub parse_playlist_info {
@@ -608,18 +585,26 @@ sub extract_segments_from_playlist {
     my $sequence_number = $playlist_info->{media_sequence} || 0;
     my ($playlist_base) = $base_url =~ m{^(.+)/[^/]+$};
 
+    my $in_discontinuity_block = 0;
+
     for my $line (@lines) {
         if ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
             $current_segment{key_uri} = $1;
             $current_segment{iv} = $2;
             $current_segment{iv} =~ s/^0x//;
+            $in_discontinuity_block = 0;
+        }
+        elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            $in_discontinuity_block = 1;
         }
         elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
             $current_segment{duration} = $1;
         }
-        elsif ($line =~ /^(https?:.+?\.ts)$/) {
+        elsif ($line =~ /^(https?:\/\/.+?\.ts)$/) {
             $current_segment{url} = $1;
             $current_segment{sequence} = $sequence_number;
+            $current_segment{running} = $runningNumber;
+            $current_segment{is_discontinuity} = $in_discontinuity_block;
 
             unless ($current_segment{url} =~ /^https?:\/\//) {
                 $current_segment{url} = "$playlist_base/$current_segment{url}";
@@ -628,12 +613,15 @@ sub extract_segments_from_playlist {
             if (exists $current_segment{key_uri} && exists $current_segment{iv}) {
                 push @segments, { %current_segment };
             }
-
             %current_segment = ();
             $sequence_number++;
+            $runningNumber++;
+            if($runningNumber > 1000000) {
+                $runningNumber = 1;
+            }
         }
     }
-
+    @segments = sort_by_running_number(@segments);
     return @segments;
 }
 
@@ -642,19 +630,14 @@ sub filter_new_segments {
     my @new_segments;
 
     for my $segment (@$segments) {
-        # Prüfe ob Segment bereits verarbeitet wurde
+        # Prüfe, ob die Segment-URL schon einmal gesehen wurde
         next if exists $processed_segments{$channel_id}->{$segment->{url}};
 
-        # Prüfe Sequenznummer (falls verfügbar)
-        if (exists $segment->{sequence}) {
-            next if $segment->{sequence} <= $last_sequence_numbers{$channel_id};
-            $last_sequence_numbers{$channel_id} = $segment->{sequence};
-        }
-
+        # Wenn es eine neue URL ist, füge es zur Liste der neuen Segmente hinzu
         push @new_segments, $segment;
     }
 
-    return @new_segments;
+    return sort_by_running_number(@new_segments);
 }
 
 sub stream_segment {
@@ -726,32 +709,62 @@ sub stream_segment {
 
     eval {
         # Prüfe Client-Status vor dem Senden
-        unless ($client->connected()) {
-            printf("Client disconnected before sending segment\n");
-            return 0;
-        }
+        #unless ($client->connected()) {
+        #    printf("Client disconnected before sending segment\n");
+        #    return 0;
+        #}
+
+        my $outputData;
+        #run(
+        #    [
+        #        "ffmpeg", "-loglevel",  "error", "-i", "-",
+        #        "-c:v", "h264_v4l2m2m",
+        #        "-vf", "scale=1280:720",
+        #        "-r", 25, "-b:v", "2M",
+        #        "-c:a", "aac",
+        #        "-ac", 2,
+        #        "-b:a", "128k",
+        #        "-f", "mpegts",
+        #        "-"
+        #    ],
+        #    "<", \$decrypted_data,
+        #    ">", \$outputData
+        #);
+
+        run(
+            [
+                "ffmpeg", "-loglevel",  "error", "-i", "-",
+                "-c", "copy",
+                "-f", "mpegts",
+                "-"
+            ],
+            "<", \$decrypted_data,
+            ">", \$outputData
+        );
+
+        print $client $outputData;
 
         # Sende in kleineren Chunks und prüfe Erfolg
-        my $chunk_size = 8192;
-        my $total_sent = 0;
-        my $data_length = length($decrypted_data);
-
-        while ($total_sent < $data_length) {
-            my $chunk = substr($decrypted_data, $total_sent, $chunk_size);
-            my $sent = $client->syswrite($chunk, length($chunk));
-
-            unless (defined $sent) {
-                printf("Failed to send data to client: $!\n");
-                return 0;
-            }
-
-            if ($sent == 0) {
-                printf("Client closed connection during send\n");
-                return 0;
-            }
-
-            $total_sent += $sent;
-        }
+#        my $chunk_size = 8192;
+#        my $total_sent = 0;
+#        my $data_length = length($decrypted_data);
+#
+#        while ($total_sent < $data_length) {
+#            my $chunk = substr($decrypted_data, $total_sent, $chunk_size);
+#            my $sent = $client->syswrite($chunk, length($chunk));
+#
+#            unless (defined $sent) {
+#                printf("Failed to send data to client: $!\n");
+#                return 0;
+#            }
+#
+#            if ($sent == 0) {
+#                printf("Client closed connection during send\n");
+#                return 0;
+#            }
+#
+#            $total_sent += $sent;
+#        }
 
         $client->flush();
     };
@@ -765,18 +778,23 @@ sub stream_segment {
 }
 
 sub cleanup_old_segments {
-    my ($channel_id, $max_segments) = @_;
+    my ($channel_id) = @_;
 
     return unless exists $processed_segments{$channel_id};
 
-    my @segment_urls = keys %{$processed_segments{$channel_id}};
-    return if @segment_urls <= $max_segments;
+    my $now = time();
+    my $cutoff_time = $now - (15 * 60); # 15 Minuten in Sekunden
 
-    # Entferne älteste Einträge (einfache FIFO-Strategie)
-    my $to_remove = @segment_urls - $max_segments;
-    for my $i (0 .. $to_remove - 1) {
-        delete $processed_segments{$channel_id}->{$segment_urls[$i]};
+    my $removed_count = 0;
+    for my $url (keys %{$processed_segments{$channel_id}}) {
+        my $segment_time = $processed_segments{$channel_id}->{$url};
+        if ($segment_time < $cutoff_time) {
+            delete $processed_segments{$channel_id}->{$url};
+            $removed_count++;
+        }
     }
+
+    printf("Removed %d old segments for channel %s\n", $removed_count, $channel_id) if $removed_count > 0;
 }
 
 sub process_request {
