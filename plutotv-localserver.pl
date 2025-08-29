@@ -485,17 +485,27 @@ sub extract_best_playlist_url {
 sub stream_with_discontinuity_restart {
     my ($client, $playlist_url, $channel_id, $stream_id) = @_;
 
+    $client->timeout(5);
+
     # Setze Response-Header für Streaming
-    $client->write("HTTP/1.1 200 OK\r\n");
-    $client->write("Content-Type: video/mp2t\r\n");
-    $client->write("Cache-Control: no-cache, no-store, must-revalidate\r\n");
-    $client->write("Connection: close\r\n");
-    $client->write("\r\n");
+    eval {
+        $client->write("HTTP/1.1 200 OK\r\n");
+        $client->write("Content-Type: video/mp2t\r\n");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate\r\n");
+        $client->write("Connection: close\r\n");
+        $client->write("\r\n");
+    };
+
+    if ($@) {
+        printf("Failed to send headers - client disconnected: %s\n", $@);
+        return;
+    }
 
     my $ua = create_user_agent();
     my $segment_count = 0;
+    my $last_sequence = -1;
 
-    # Initialisiere Segment-Tracking für diesen Stream
+    # Initialisiere Tracking für diesen Stream
     $processed_segments{$channel_id} = {} unless exists $processed_segments{$channel_id};
     $last_sequence_numbers{$channel_id} = -1;
 
@@ -508,17 +518,28 @@ sub stream_with_discontinuity_restart {
         # Hole aktuelle Playlist
         my $playlist_content = get_from_url($playlist_url);
         unless ($playlist_content) {
-            printf("Failed to fetch playlist for $channel_id, ending stream\n");
+            printf("Failed to fetch playlist for $channel_id, restarting stream\n");
             last;
         }
 
-        # Parse neue Segmente (ohne Discontinuity-Segmente)
-        my @segments = extract_segments_from_playlist($playlist_content, $playlist_url);
+        # Extrahiere Playlist-Informationen
+        my $playlist_info = parse_playlist_info($playlist_content);
+
+        # Prüfe auf Discontinuity in der Playlist
+        if ($playlist_info->{has_discontinuity}) {
+            printf("Discontinuity detected in channel $channel_id, clearing segment cache\n");
+            $processed_segments{$channel_id} = {};
+            $last_sequence_numbers{$channel_id} = $playlist_info->{media_sequence} - 1;
+        }
+
+        # Parse neue Segmente
+        my @segments = extract_segments_from_playlist($playlist_content, $playlist_url, $playlist_info);
 
         # Filtere bereits verarbeitete Segmente
         my @new_segments = filter_new_segments(\@segments, $channel_id);
 
         if (@new_segments == 0) {
+            # Keine neuen Segmente, kurz warten
             sleep(1);
             next;
         }
@@ -541,10 +562,10 @@ sub stream_with_discontinuity_restart {
             $processed_segments{$channel_id}->{$segment->{url}} = 1;
         }
 
-        # Cleanup alte Segment-Referenzen
+        # Cleanup alte Segment-Referenzen (behalte nur die letzten 50)
         cleanup_old_segments($channel_id, 50);
 
-        sleep(2);
+        sleep(2); # Kurze Pause zwischen Playlist-Updates
     }
 
     # Cleanup
@@ -552,51 +573,75 @@ sub stream_with_discontinuity_restart {
     delete $processed_segments{$channel_id};
     delete $last_sequence_numbers{$channel_id};
     printf("Stream ended for channel $channel_id (streamed $segment_count segments)\n");
+    exit(0);
+}
+
+sub parse_playlist_info {
+    my ($playlist_content) = @_;
+    my @lines = split /\r?\n/, $playlist_content;
+    my %info = (
+        media_sequence => 0,
+        has_discontinuity => 0,
+        target_duration => 10,
+    );
+
+    for my $line (@lines) {
+        if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
+            $info{media_sequence} = $1;
+        }
+        elsif ($line =~ /^#EXT-X-TARGETDURATION:(\d+)/) {
+            $info{target_duration} = $1;
+        }
+        elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            $info{has_discontinuity} = 1;
+        }
+    }
+
+    return \%info;
 }
 
 sub extract_segments_from_playlist {
-    my ($playlist_content, $base_url) = @_;
+    my ($playlist_content, $base_url, $playlist_info) = @_;
     my @lines = split /\r?\n/, $playlist_content;
     my @segments = ();
     my %current_segment;
-    my $sequence_number = 0;
+    my $sequence_number = $playlist_info->{media_sequence} || 0;
 
     # Bestimme Base-URL für relative Segmente
     my ($playlist_base) = $base_url =~ m{^(.+)/[^/]+$};
 
-    my $skip_next_segment = 0;
+    my $skip_until_key = 0;
+    my $in_discontinuity_block = 0;
 
     for my $i (0 .. $#lines) {
         my $line = $lines[$i];
 
-        if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
-            $sequence_number = $1;
-        }
-        elsif ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
+        if ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
+            # Neuer Verschlüsselungsschlüssel
             $current_segment{key_uri} = $1;
             $current_segment{iv} = $2;
             $current_segment{iv} =~ s/^0x//;
+            $skip_until_key = 0; # Reset skip flag when we get a new key
         }
         elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-            # Setze Flag um nächstes Segment zu überspringen
-            $skip_next_segment = 1;
-            printf("Discontinuity detected, skipping next segment\n");
-        }
-        elsif ($line =~ /^#EXT-X-DISCONTINUITY-SEQUENCE:/) {
-            # Ignoriere Discontinuity-Sequence Tags, sie machen keine Probleme
-            next;
+            # Discontinuity gefunden
+            $in_discontinuity_block = 1;
+            $skip_until_key = 1; # Skip segments until we get a new key after discontinuity
         }
         elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
+            # Segment-Duration
             $current_segment{duration} = $1;
         }
         elsif ($line =~ /^(https?:.+?\.ts)$/) {
-            # Überspringe Segment wenn Discontinuity-Flag gesetzt ist
-            if ($skip_next_segment) {
-                printf("Skipping segment after discontinuity: $1\n");
-                $skip_next_segment = 0;
-                %current_segment = ();
-                $sequence_number++;
-                next;
+            # Segment URL gefunden
+            if ($skip_until_key || $in_discontinuity_block) {
+                # Überspringe dieses Segment wenn wir nach Discontinuity sind aber noch keinen Key haben
+                if (!exists $current_segment{key_uri}) {
+                    printf("Skipping segment after discontinuity (no key): $1\n");
+                    %current_segment = ();
+                    $sequence_number++;
+                    next;
+                }
             }
 
             $current_segment{url} = $1;
@@ -616,6 +661,7 @@ sub extract_segments_from_playlist {
 
             %current_segment = ();
             $sequence_number++;
+            $in_discontinuity_block = 0;
         }
     }
 
@@ -672,9 +718,11 @@ sub stream_segment {
     my $decrypted_data;
 
     # Entschlüsselung mit OpenSSL (bevorzugt) oder Crypt::CBC
-    if (system("which openssl >/dev/null 2>&1") == 0) {
+    if (which('openssl')) {
+        printf("Using openssl\n");
+
         my $openssl_stderr = '';
-        my $ok = run(
+        run(
             [
                 "openssl", "aes-128-cbc", "-d",
                 "-in", "-",
@@ -684,14 +732,10 @@ sub stream_segment {
             ],
             "<", \$chunk,
             ">", \$decrypted_data,
-            "2>", \$openssl_stderr,
+            "2>", \$openssl_stderr
         );
-
-        unless ($ok) {
-            printf("OpenSSL decryption failed: %s\n", $openssl_stderr);
-            return 0;
-        }
     } else {
+        printf("Using Crypt::CBC\n");
         my $iv_bin = pack 'H*', $segment->{iv};
         my $cipher = Crypt::CBC->new(
             -key     => $encryption_key,
@@ -711,9 +755,35 @@ sub stream_segment {
         }
     }
 
-    # Sende entschlüsselte Daten an Client
     eval {
-        print $client $decrypted_data;
+        # Prüfe Client-Status vor dem Senden
+        unless ($client->connected()) {
+            printf("Client disconnected before sending segment\n");
+            return 0;
+        }
+
+        # Sende in kleineren Chunks und prüfe Erfolg
+        my $chunk_size = 8192;
+        my $total_sent = 0;
+        my $data_length = length($decrypted_data);
+
+        while ($total_sent < $data_length) {
+            my $chunk = substr($decrypted_data, $total_sent, $chunk_size);
+            my $sent = $client->syswrite($chunk, length($chunk));
+
+            unless (defined $sent) {
+                printf("Failed to send data to client: $!\n");
+                return 0;
+            }
+
+            if ($sent == 0) {
+                printf("Client closed connection during send\n");
+                return 0;
+            }
+
+            $total_sent += $sent;
+        }
+
         $client->flush();
     };
 
@@ -790,6 +860,12 @@ my $daemon = HTTP::Daemon->new(
 ) or die "Server could not be started.\n\n";
 
 $session = get_boot_json();
+
+$SIG{PIPE} = sub {
+    printf("SIGPIPE received - client disconnected\n");
+    exit(0);
+};
+$SIG{CHLD} = 'IGNORE';
 
 printf("Server started listening on $hostip using port $port\n");
 
