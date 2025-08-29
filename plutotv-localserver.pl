@@ -527,9 +527,9 @@ sub stream_with_discontinuity_restart {
 
         # Prüfe auf Discontinuity in der Playlist
         if ($playlist_info->{has_discontinuity}) {
-            printf("Discontinuity detected in channel $channel_id, clearing segment cache\n");
+            printf("Discontinuity detected in channel $channel_id, resetting state for player\n");
             $processed_segments{$channel_id} = {};
-            $last_sequence_numbers{$channel_id} = $playlist_info->{media_sequence} - 1;
+            $last_sequence_numbers{$channel_id} = -1;
         }
 
         # Parse neue Segmente
@@ -606,62 +606,31 @@ sub extract_segments_from_playlist {
     my @segments = ();
     my %current_segment;
     my $sequence_number = $playlist_info->{media_sequence} || 0;
-
-    # Bestimme Base-URL für relative Segmente
     my ($playlist_base) = $base_url =~ m{^(.+)/[^/]+$};
 
-    my $skip_until_key = 0;
-    my $in_discontinuity_block = 0;
-
-    for my $i (0 .. $#lines) {
-        my $line = $lines[$i];
-
+    for my $line (@lines) {
         if ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
-            # Neuer Verschlüsselungsschlüssel
             $current_segment{key_uri} = $1;
             $current_segment{iv} = $2;
             $current_segment{iv} =~ s/^0x//;
-            $skip_until_key = 0; # Reset skip flag when we get a new key
-        }
-        elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-            # Discontinuity gefunden
-            $in_discontinuity_block = 1;
-            $skip_until_key = 1; # Skip segments until we get a new key after discontinuity
         }
         elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
-            # Segment-Duration
             $current_segment{duration} = $1;
         }
         elsif ($line =~ /^(https?:.+?\.ts)$/) {
-            # Segment URL gefunden
-            if ($skip_until_key || $in_discontinuity_block) {
-                # Überspringe dieses Segment wenn wir nach Discontinuity sind aber noch keinen Key haben
-                if (!exists $current_segment{key_uri}) {
-                    printf("Skipping segment after discontinuity (no key): $1\n");
-                    %current_segment = ();
-                    $sequence_number++;
-                    next;
-                }
-            }
-
             $current_segment{url} = $1;
             $current_segment{sequence} = $sequence_number;
 
-            # Erstelle absoluten Pfad falls nötig
             unless ($current_segment{url} =~ /^https?:\/\//) {
                 $current_segment{url} = "$playlist_base/$current_segment{url}";
             }
 
-            # Füge Segment nur hinzu wenn alle notwendigen Informationen vorhanden sind
             if (exists $current_segment{key_uri} && exists $current_segment{iv}) {
                 push @segments, { %current_segment };
-            } else {
-                printf("Skipping incomplete segment (missing key/iv): $current_segment{url}\n");
             }
 
             %current_segment = ();
             $sequence_number++;
-            $in_discontinuity_block = 0;
         }
     }
 
@@ -719,7 +688,7 @@ sub stream_segment {
 
     # Entschlüsselung mit OpenSSL (bevorzugt) oder Crypt::CBC
     if (which('openssl')) {
-        printf("Using openssl\n");
+        #printf("Using openssl\n");
 
         my $openssl_stderr = '';
         run(
@@ -735,7 +704,7 @@ sub stream_segment {
             "2>", \$openssl_stderr
         );
     } else {
-        printf("Using Crypt::CBC\n");
+        printf("!!! Using Crypt::CBC\n");
         my $iv_bin = pack 'H*', $segment->{iv};
         my $cipher = Crypt::CBC->new(
             -key     => $encryption_key,
