@@ -1,87 +1,223 @@
 #!/usr/bin/perl
 
-package server;
-
-$| = 1;
+package PlutoTVServer;
 
 use strict;
 use warnings;
-use threads;
+use utf8;
+use Encode qw(encode_utf8);
 
 use HTTP::Daemon;
 use HTTP::Status;
 use HTTP::Request::Params;
-use HTTP::Request::Common;
-use HTTP::Cookies;
 use DateTime;
-use DateTime::Format::Strptime qw(strptime);
-use JSON;
 use JSON::Parse ':all';
 use HTTP::Request ();
 use LWP::UserAgent;
-use URI::Escape;
+use URI::Escape qw(uri_escape_utf8);
 use UUID::Tiny ':std';
 use File::Which;
 use Net::Address::IP::Local;
-use Data::Dumper;
+use Try::Tiny;
+use Getopt::Long qw(:config no_ignore_case);
+use Crypt::CBC;
+use IPC::Run qw(run);
 
+use open qw(:std :utf8);
+
+# Configuration
 my $hostip = "127.0.0.1";
-my $port   = "9000";
+my $port = "9000";
 my $apiurl = "http://api.pluto.tv/v2/channels";
-#channel-id: 5ddbf866b1862a0009a0648e
-
 my $deviceid = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
+
+# Global session variables
 our $session;
 our $bootTime;
 
-#check param
+# Stream tracking variables
+our %active_streams = ();
+our %stream_counters = ();
+our %processed_segments = ();
+our %last_sequence_numbers = ();
+
+# Region configuration
+my %regions = (
+    'DE' => { lat => '52.5200', lon => '13.4050', name => 'Deutschland' },
+    'US' => { lat => '40.7128', lon => '-74.0060', name => 'United States' },
+    'UK' => { lat => '51.5074', lon => '-0.1278', name => 'United Kingdom' },
+    'FR' => { lat => '48.8566', lon => '2.3522', name => 'France' },
+    'IT' => { lat => '41.9028', lon => '12.4964', name => 'Italy' },
+);
+
+# Command line arguments
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $usestreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
-sub getArgsValue {
+sub get_args_value {
     my ($param) = @_;
-    foreach my $argnum (0 .. $#ARGV) {
-        if($ARGV[$argnum] eq "--port") {
-            return $ARGV[$argnum+1];
-        }
+    for my $argnum (0 .. $#ARGV) {
+        return $ARGV[$argnum+1] if $ARGV[$argnum] eq $param;
     }
     return undef;
 }
 
-sub forkProcess {
-  my $pid = fork;
-  if($pid) {
-      waitpid $pid, 0;
-  }
-  else {
-      my $pid2 = fork;  #no zombies, make orphans instead
-      if($pid2) {
-          exit(0);
-      }
-      else {
-          return 1;
-      }
-  }
-  return 0;
+sub fork_process {
+    my $pid = fork;
+    if ($pid) {
+        waitpid $pid, 0;
+    } else {
+        my $pid2 = fork;  # no zombies, make orphans instead
+        if ($pid2) {
+            exit(0);
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+sub create_user_agent {
+    my $ua = LWP::UserAgent->new(keep_alive => 1);
+    $ua->agent('Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/109.0');
+    my $headers = HTTP::Headers->new;
+    $headers->header('Cache-Control' => 'no-cache');
+    $headers->header('Pragma'        => 'no-cache');
+    $ua->default_headers($headers);
+    return $ua;
+}
+
+sub get_from_url {
+    my ($url) = @_;
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = create_user_agent();
+    my $response = $ua->request($request);
+    return $response->is_success ? $response->decoded_content : undef;
 }
 
 sub get_channel_json {
+    my ($region) = @_;
+    $region ||= 'DE';
+
     my $from = DateTime->now();
-    my $to = DateTime->now();
-    $to=$to->add(days => 2);
-    my $url = $apiurl."?start=".$from."Z&stop=".$to."Z";
-    my $request = HTTP::Request->new(GET => $url);
-    my $useragent = LWP::UserAgent->new(keep_alive => 1);
-    $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
-    my $response = $useragent->request($request);
-    if ($response->is_success) {
-        return @{parse_json($response->decoded_content)};
+    my $to = DateTime->now()->add(days => 2);
+    my $url = "$apiurl?start=${from}Z&stop=${to}Z";
+
+    my $content = get_from_url($url);
+    return () unless $content;
+
+    my $channels = try { parse_json($content) };
+    return $channels ? @{$channels} : ();
+}
+
+sub get_boot_from_pluto {
+    my ($region) = @_;
+    $region ||= 'DE';
+
+    my $region_data = $regions{$region};
+    unless ($region_data) {
+        warn "Unknown region: $region, using DE as fallback\n";
+        $region_data = $regions{'DE'};
     }
-    else{
-        return ();
+
+    printf("Refresh of current Session for region $region\n");
+    my $url = "https://boot.pluto.tv/v4/start?" . join('&',
+        "deviceId=$deviceid",
+        "deviceMake=Firefox",
+        "deviceType=web",
+        "deviceVersion=109.0",
+        "deviceModel=web",
+        "DNT=1",
+        "appName=web",
+        "appVersion=5.17.0",
+        "clientID=$deviceid",
+        "clientModelNumber=na",
+        "serverSideAds=false",
+        "includeExtendedEvents=false",
+        "deviceLat=$region_data->{lat}",
+        "deviceLon=$region_data->{lon}"
+    );
+
+    my $content = get_from_url($url);
+    return unless $content;
+
+    $session = try { parse_json($content) };
+    $bootTime = DateTime->now() if $session;
+    return $session;
+}
+
+sub get_boot_json {
+    my ($channel_id, $region) = @_;
+    $region ||= 'DE';
+
+    my $now = DateTime->now();
+    my $max_time;
+
+    if (defined $session && defined $bootTime) {
+        my $threshold = $session->{session}->{restartThresholdMS} || 3600000;
+        $max_time = $bootTime->clone->add(seconds => $threshold / 1000);
+    } else {
+        $max_time = $now->subtract(hours => 2);
     }
+
+    if (!defined $session || $now > $max_time) {
+        $session = get_boot_from_pluto($region);
+    }
+    return $session;
+}
+
+sub build_m3u_legacy {
+    my (@channels) = @_;
+    my $m3u = "#EXTM3U\n";
+
+    for my $channel (@channels) {
+        next unless $channel->{number} > 0 && $channel->{number} != 2000;
+        next unless defined $channel->{logo}->{path};
+
+        my $logo = $channel->{logo}->{path};
+        my $name = $channel->{name};
+        my $number = $channel->{number};
+        my $id = $channel->{_id};
+
+        $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . uri_escape_utf8($name) .
+            "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
+
+        if ($usestreamlink) {
+            my $url = "https://pluto.tv/" . $session->{session}->{activeRegion} .
+                "/live-tv/" . $channel->{slug};
+            $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best " .
+                "--hls-live-restart --url \"$url\"\n";
+        } else {
+            $m3u .= "pipe://$ffmpeg -loglevel fatal -threads 0 -nostdin -re " .
+                "-i \"http://$hostip:$port/master3u8?id=$id\" " .
+                "-c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts " .
+                "-tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv " .
+                "-metadata service_name=\"$name\" pipe:1\n";
+        }
+    }
+    return $m3u;
+}
+
+sub build_m3u_direct {
+    my (@channels) = @_;
+    my $m3u = "#EXTM3U\n";
+
+    for my $channel (@channels) {
+        next unless $channel->{number} > 0 && $channel->{number} != 2000;
+        next unless defined $channel->{logo}->{path};
+
+        my $logo = $channel->{logo}->{path};
+        my $name = $channel->{name};
+        my $number = $channel->{number};
+        my $id = $channel->{_id};
+
+        $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . uri_escape_utf8($name) .
+            "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
+        $m3u .= "http://$hostip:$port/stream/$id.m3u8\n";
+    }
+    return $m3u;
 }
 
 sub send_help {
@@ -89,319 +225,562 @@ sub send_help {
     my $response = HTTP::Response->new();
     $response->code(200);
     $response->message("OK");
-    $response->content("Following endpoints are available:\n\t/playlist\tfor full m3u8-file\n\t/channel?id=\tfor master.m3u8 of specific channel\n\t/epg\t\tfor xmltv-epg-file\n");
-
+    $response->content("Following endpoints are available:\n" .
+        "\t/playlist?region=REGION\tfor full m3u8-file (legacy pipes)\n" .
+        "\t/tvheadend?region=REGION\tfor direct streams (tvheadend optimized)\n" .
+        "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
+        "\t/epg\t\tfor xmltv-epg-file\n\n" .
+        "Available regions: " . join(", ", sort keys %regions) . "\n" .
+        "Example: /tvheadend?region=US\n");
     $client->send_response($response);
 }
 
-sub send_xmltvepgfile {
+sub send_xmltv_epg_file {
     my ($client, $request) = @_;
+    my @channels = get_channel_json();
 
-    my @senderListe = get_channel_json;
-    if(scalar @senderListe <= 0) {
+    unless (@channels) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
         return;
     }
 
-    my $langcode ="de";
-    my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
-    $epg .= "<tv>\n";
+    my $langcode = "de";
+    my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
 
-    for my $sender( @senderListe ) {
-        if ($sender->{number} > 0) {
-            my $sendername = $sender->{name};
-            $epg .= "<channel id=\"".uri_escape($sendername)."\">\n";
-            $epg .= "<display-name lang=\"$langcode\"><![CDATA[".$sender->{name}."]]></display-name>\n";
-            my $logo = $sender->{logo};
-            if(defined($logo)) {
-                $logo->{path} = substr($logo->{path}, 0, index($logo->{path}, "?"));
-                $epg .= "<icon src=\"".$logo->{path}."\" />\n";
-            }
-            $epg .= "</channel>\n";
+    # Channel definitions
+    for my $channel (@channels) {
+        next unless $channel->{number} > 0;
+
+        my $channel_name = $channel->{name};
+        my $channel_id = uri_escape_utf8($channel_name);
+
+        $epg .= "<channel id=\"$channel_id\">\n";
+        $epg .= "<display-name lang=\"$langcode\"><![CDATA[$channel_name]]></display-name>\n";
+
+        if (my $logo = $channel->{logo}) {
+            my $logo_path = $logo->{path};
+            $logo_path = substr($logo_path, 0, index($logo_path, "?")) if index($logo_path, "?") >= 0;
+            $epg .= "<icon src=\"$logo_path\" />\n";
+        }
+        $epg .= "</channel>\n";
+    }
+
+    # Programme data
+    for my $channel (@channels) {
+        next unless $channel->{number} > 0;
+
+        my $channel_id = uri_escape_utf8($channel->{name});
+
+        for my $programme (@{$channel->{timelines} || []}) {
+            my ($start, $stop) = ($programme->{start}, $programme->{stop});
+            next unless $start && $stop;
+
+            $start =~ s/[-:Z\.T]//g;
+            $stop =~ s/[-:Z\.T]//g;
+            $stop = substr($stop, 0, 14);
+
+            $epg .= "<programme start=\"$start +0000\" stop=\"$stop +0000\" channel=\"$channel_id\">\n";
+
+            my $episode = $programme->{episode} || {};
+            my $title = $programme->{title};
+            my $rating = $episode->{rating} || '';
+
+            $epg .= "<title lang=\"$langcode\"><![CDATA[$title - $rating]]></title>\n";
+            $epg .= "<desc lang=\"$langcode\"><![CDATA[" . ($episode->{description} || '') . "]]></desc>\n";
+            $epg .= "</programme>\n";
         }
     }
-    for my $sender( @senderListe ) {
-        if($sender->{number} > 0) {
-            my $sendername = $sender->{name};
 
-            for my $sendung ( @{$sender->{timelines}} ) {
-                my $start = $sendung->{start};
-                $start =~ s/[-:Z\.T]//ig;
-                my $stop = $sendung->{stop};
-                $stop =~ s/[-:Z\.T]//ig;
-                $stop = substr($stop, 0, 14);
-                $epg .= "<programme start=\"".$start." +0000\" stop=\"".$stop." +0000\" channel=\"".uri_escape($sendername)."\">\n";
-                my $episode = $sendung->{episode};
-                $epg .= "<title lang=\"$langcode\"><![CDATA[".$sendung->{title}." - ".$episode->{rating}."]]></title>\n";
-
-                $epg .= "<desc lang=\"$langcode\"><![CDATA[".$episode->{description}."]]></desc>\n";
-                $epg .= "</programme>\n";
-            }
-        }
-    }
     $epg .= "\n</tv>\n\n\n";
 
     my $response = HTTP::Response->new();
     $response->header("content-disposition", "filename=\"plutotv-epg.xml\"");
     $response->code(200);
     $response->message("OK");
-    $response->content($epg);
-
+    $response->content(encode_utf8($epg));
     $client->send_response($response);
 }
 
-sub get_from_url {
-    my $request = HTTP::Request->new(GET => @_);
-    my $useragent = LWP::UserAgent->new(keep_alive => 1);
-    $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
-    my $response = $useragent->request($request);
-    if ($response->is_success) {
-        return $response->content;
-    }
-    else{
-        return ();
-    }
-}
+sub send_m3u_file {
+    my ($client, $use_direct_streams, $request) = @_;
 
-sub buildM3U {
-    my @senderliste = @_;
-    my $m3u = "#EXTM3U\n";
-    my $i = 0;
-    for my $sender( @senderliste ) {
-        if($sender->{number} > 0 && $sender->{number} != 2000) {
-            my $logo = $sender->{logo}->{path};
-            if(defined $logo) {
-                $m3u = $m3u . "#EXTINF:-1 tvg-chno=\"" . $sender->{number} . "\" tvg-id=\"" . uri_escape($sender->{name}) . "\" tvg-name=\"" . $sender->{name} . "\" tvg-logo=\"" . $logo . "\" group-title=\"PlutoTV\"," . $sender->{name} . "\n";
-                if($usestreamlink) {
-                    #my $url = $sender->{stitched}->{urls}[0]->{url};
-                    #$url =~ s/&deviceMake=/&deviceMake=Firefox/ig;
-                    #$url =~ s/&deviceType=/&deviceType=web/ig;
-                    #$url =~ s/&deviceId=unknown/&deviceId=$deviceid/ig;
-                    #$url =~ s/&deviceModel=/&deviceModel=web/ig;
-                    #$url =~ s/&deviceVersion=unknown/&deviceVersion=82\.0/ig;
-                    #$url =~ s/&appName=&/&appName=web&/ig;
-                    #$url =~ s/&appVersion=&/&appVersion=5.9.1-e0b37ef76504d23c6bdc8157813d13333dfa33a3/ig;
-                    #my $sessionid = $session->{session}->{sessionID};
-                    #$url =~ s/&sid=/&sid=$sessionid&sessionID=$sessionid/ig;
-                    #$url =~ s/&deviceDNT=0/&deviceDNT=false/ig;
-                    #$url = $url."&serverSideAds=false&terminate=false&clientDeviceType=0&clientModelNumber=na&clientID=".$deviceid;
-                    #print Dumper($session);
-                    my $url = "https://pluto.tv/".$session->{session}->{activeRegion}."/live-tv/".$sender->{slug};
-                    $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best --hls-live-restart --url \"$url\"\n";
-                } else {
-                    $m3u .= "pipe://" . $ffmpeg . " -loglevel fatal -threads 0 -nostdin -re -i \"http://" . $hostip . ":" . $port . "/master3u8?id=" . $sender->{_id} . "\" -c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts -tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv -metadata service_name=\"" . $sender->{name} . "\" pipe:1\n";
-                }
-            }
-        }
-    }
-    return $m3u;
-}
-sub getBootFromPluto {
-    printf("Refresh of current Session\n");
-    my $url = "https://boot.pluto.tv/v4/start?deviceId=".$deviceid."&deviceMake=Firefox&deviceType=web&deviceVersion=86.0&deviceModel=web&DNT=0&appName=web&appVersion=5.15.0-cb3de003a5ed7a595e0e5a8e1a8f8f30ad8ed23a&clientID=".$deviceid."&clientModelNumber=na";
-    my $request = HTTP::Request->new(GET => $url);
-    my $useragent = LWP::UserAgent->new(keep_alive => 1);
-    $useragent->agent('Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:86.0) Gecko/20100101 Firefox/86.0');
-    my $response = $useragent->request($request);
-    if ($response->is_success) {
-        $session = parse_json($response->decoded_content);
-        $bootTime = DateTime->now();
-        return $session;
-    }
-    else {
-        return ();
-    }
-}
-
-sub get_bootJson {
-    my $now = DateTime->now();
-    my $maxTime;
-
-    if(defined $session) {
-        $maxTime = $bootTime->add(seconds=>$session->{session}->{restartThresholdMS}/1000);
-    }
-    else {
-        $maxTime = $now->subtract(hours=>2);
+    my $region = 'DE';
+    if ($request) {
+        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
     }
 
-    if(!defined $session) {
-      $session = getBootFromPluto;
-    }
-    elsif($now > $maxTime) {
-      $session = getBootFromPluto;
-    }
-    return $session;
-}
+    my @channels = get_channel_json($region);
 
-sub send_m3ufile {
-    my $client = $_[0];
-    my @senderListe = get_channel_json;
-    if(scalar @senderListe <= 0) {
+    unless (@channels) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel-list from pluto.tv-api.");
         return;
     }
-    my $m3uContent = buildM3U(@senderListe);
+
+    my $m3u_content = $use_direct_streams ? build_m3u_direct(@channels) : build_m3u_legacy(@channels);
+
     my $response = HTTP::Response->new();
     $response->header("content-type", "audio/x-mpegurl");
     $response->header("content-disposition", "filename=\"plutotv.m3u8\"");
     $response->code(200);
     $response->message("OK");
-    $response->content($m3uContent);
-
+    $response->content(encode_utf8($m3u_content));
     $client->send_response($response);
 }
 
-sub getPlaylistsFromMaster {
-    my ($master, $baseurl) = @_;
-    my $lines = () = $master =~ m/\n/g;
+sub send_direct_stream {
+    my ($client, $request) = @_;
+    my $path = $request->uri->path;
+    my ($channel_id) = $path =~ m{/stream/([^/]+)\.m3u8$};
 
-    my $linebreakpos = 0;
-    my $readnextline = 0;
-    my $m3u8 = "";
-    for (my $linenum=0; $linenum<$lines; $linenum++) {
-        my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
-        if($readnextline == 1) {
-            $m3u8 .= $baseurl.$line;
-        }
-        if(index($line, "#EXT-X-STREAM-INF:PROGRAM-ID=") >=0) {
-            $readnextline = 1;
-        }
-        else {
-            $readnextline = 0;
-        }
-        $linebreakpos = index($master, "\n", $linebreakpos+1);
+    unless ($channel_id) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid stream path");
+        return;
     }
-    return $m3u8;
+
+    my $boot_json = get_boot_json($channel_id);
+    unless ($boot_json && $boot_json->{servers}) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to get session data");
+        return;
+    }
+
+    my $base_url = $boot_json->{servers}->{stitcher};
+    my $url = "$base_url/stitch/hls/channel/$channel_id/master.m3u8?" . $boot_json->{stitcherParams};
+
+    my $master = get_from_url($url);
+    unless ($master) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
+        return;
+    }
+
+    my $dynamic_m3u = create_dynamic_playlist($master, $channel_id, $base_url);
+
+    my $response = HTTP::Response->new();
+    $response->code(200);
+    $response->message("OK");
+    $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+    $response->header("cache-control", "no-cache, no-store, must-revalidate");
+    $response->header("pragma", "no-cache");
+    $response->header("expires", "0");
+    $response->content(encode_utf8($dynamic_m3u));
+    $client->send_response($response);
 }
 
-sub fixPlaylistUrlsInMaster {
-    my ($master, $channelid, $sessionid) = @_;
-    my $lines = () = $master =~ m/\n/g;
+sub create_dynamic_playlist {
+    my ($master_playlist, $channel_id, $base_url) = @_;
 
-    my $linebreakpos = -1;
-    my $readnextline = 0;
-    my $m3u8 = "";
-    for (my $linenum=0; $linenum<$lines; $linenum++) {
-        my $line = substr($master, $linebreakpos+1, index($master, "\n", $linebreakpos+1)-$linebreakpos);
-        if($readnextline == 1) {
-            #$m3u8 .= $baseurl.$line;
-            my $url = "http://".$hostip.":".$port."/playlist3u8?id=".substr($line,0,index($line, "/"))."&channelid=".$channelid."&session=".$sessionid."\n";
-            $m3u8 .= $url;
-            $readnextline = 0;
-            $linebreakpos = index($master, "\n", $linebreakpos+1);
+    # Parse Master-Playlist für beste Qualität
+    my @lines = split /\r?\n/, $master_playlist;
+    my $best_stream_url;
+    my $best_bandwidth = 0;
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/i) {
+            my $bandwidth = $1;
+            if ($bandwidth > $best_bandwidth && $i + 1 <= $#lines) {
+                my $url_line = $lines[$i + 1];
+                if ($url_line && $url_line !~ /^#/) {
+                    $best_bandwidth = $bandwidth;
+                    $best_stream_url = $url_line;
+                }
+            }
+        }
+    }
+
+    unless ($best_stream_url) {
+        return $master_playlist;
+    }
+
+    # Erstelle absolute URL falls nötig
+    unless ($best_stream_url =~ /^https?:\/\//) {
+        $best_stream_url = "$base_url/stitch/hls/channel/$channel_id/$best_stream_url";
+    }
+
+    # Increment Stream-Counter für neue Session
+    $stream_counters{$channel_id} = ($stream_counters{$channel_id} || 0) + 1;
+
+    my $stream_id = $stream_counters{$channel_id};
+    my $dynamic_playlist = "#EXTM3U\n";
+    $dynamic_playlist .= "#EXT-X-VERSION:3\n";
+    $dynamic_playlist .= "#EXT-X-TARGETDURATION:10\n";
+    $dynamic_playlist .= "#EXT-X-MEDIA-SEQUENCE:0\n";
+    $dynamic_playlist .= "#EXT-X-PLAYLIST-TYPE:EVENT\n";
+    $dynamic_playlist .= "#EXTINF:86400.0,\n";
+    $dynamic_playlist .= "http://$hostip:$port/dynamic_stream/$channel_id/$stream_id.ts\n";
+    $dynamic_playlist .= "#EXT-X-ENDLIST\n";
+
+    return $dynamic_playlist;
+}
+
+sub send_dynamic_stream {
+    my ($client, $request) = @_;
+    my $path = $request->uri->path;
+    my ($channel_id, $stream_id) = $path =~ m{/dynamic_stream/([^/]+)/(\d+)\.ts$};
+
+    unless ($channel_id && defined $stream_id) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
+        return;
+    }
+
+    # Prüfe ob dies ein neuer Stream-Request ist
+    if (!exists $active_streams{$channel_id} || $active_streams{$channel_id} != $stream_id) {
+        printf("Starting new stream session for channel $channel_id (stream $stream_id)\n");
+        $active_streams{$channel_id} = $stream_id;
+    }
+
+    my $boot_json = get_boot_json($channel_id);
+    unless ($boot_json && $boot_json->{servers}) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to get session data");
+        return;
+    }
+
+    my $base_url = $boot_json->{servers}->{stitcher};
+    my $master_url = "$base_url/stitch/hls/channel/$channel_id/master.m3u8?" . $boot_json->{stitcherParams};
+
+    my $master = get_from_url($master_url);
+    unless ($master) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch master playlist");
+        return;
+    }
+
+    my $playlist_url = extract_best_playlist_url($master, $base_url, $channel_id);
+    unless ($playlist_url) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to find playlist URL");
+        return;
+    }
+
+    stream_with_discontinuity_restart($client, $playlist_url, $channel_id, $stream_id);
+}
+
+sub extract_best_playlist_url {
+    my ($master_playlist, $base_url, $channel_id) = @_;
+    my @lines = split /\r?\n/, $master_playlist;
+    my $best_stream_url;
+    my $best_bandwidth = 0;
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/i) {
+            my $bandwidth = $1;
+            if ($bandwidth > $best_bandwidth && $i + 1 <= $#lines) {
+                my $url_line = $lines[$i + 1];
+                if ($url_line && $url_line !~ /^#/) {
+                    $best_bandwidth = $bandwidth;
+                    $best_stream_url = $url_line;
+                }
+            }
+        }
+    }
+
+    return unless $best_stream_url;
+
+    unless ($best_stream_url =~ /^https?:\/\//) {
+        $best_stream_url = "$base_url/stitch/hls/channel/$channel_id/$best_stream_url";
+    }
+
+    return $best_stream_url;
+}
+
+sub stream_with_discontinuity_restart {
+    my ($client, $playlist_url, $channel_id, $stream_id) = @_;
+
+    # Setze Response-Header für Streaming
+    $client->write("HTTP/1.1 200 OK\r\n");
+    $client->write("Content-Type: video/mp2t\r\n");
+    $client->write("Cache-Control: no-cache, no-store, must-revalidate\r\n");
+    $client->write("Connection: close\r\n");
+    $client->write("\r\n");
+
+    my $ua = create_user_agent();
+    my $segment_count = 0;
+
+    # Initialisiere Segment-Tracking für diesen Stream
+    $processed_segments{$channel_id} = {} unless exists $processed_segments{$channel_id};
+    $last_sequence_numbers{$channel_id} = -1;
+
+    printf("Starting stream for channel $channel_id with stream_id $stream_id\n");
+
+    while (1) {
+        # Prüfe ob Stream noch aktiv ist
+        last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
+
+        # Hole aktuelle Playlist
+        my $playlist_content = get_from_url($playlist_url);
+        unless ($playlist_content) {
+            printf("Failed to fetch playlist for $channel_id, ending stream\n");
+            last;
+        }
+
+        # Parse neue Segmente (ohne Discontinuity-Segmente)
+        my @segments = extract_segments_from_playlist($playlist_content, $playlist_url);
+
+        # Filtere bereits verarbeitete Segmente
+        my @new_segments = filter_new_segments(\@segments, $channel_id);
+
+        if (@new_segments == 0) {
+            sleep(1);
             next;
         }
-        if(index($line, "#EXT-X-STREAM-INF:PROGRAM-ID=") >=0) {
-            $m3u8 .= $line;
-            $readnextline = 1;
+
+        printf("Processing %d new segments for channel $channel_id\n", scalar(@new_segments));
+
+        # Stream neue Segmente
+        for my $segment (@new_segments) {
+            last unless exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
+
+            my $success = stream_segment($client, $ua, $segment, $channel_id);
+            unless ($success) {
+                printf("Failed to stream segment, ending stream for $channel_id\n");
+                last;
+            }
+
+            $segment_count++;
+
+            # Markiere Segment als verarbeitet
+            $processed_segments{$channel_id}->{$segment->{url}} = 1;
         }
-        else {
-          $m3u8 .= $line;
-        }
-        $linebreakpos = index($master, "\n", $linebreakpos+1);
+
+        # Cleanup alte Segment-Referenzen
+        cleanup_old_segments($channel_id, 50);
+
+        sleep(2);
     }
-    return $m3u8;
+
+    # Cleanup
+    delete $active_streams{$channel_id} if exists $active_streams{$channel_id} && $active_streams{$channel_id} == $stream_id;
+    delete $processed_segments{$channel_id};
+    delete $last_sequence_numbers{$channel_id};
+    printf("Stream ended for channel $channel_id (streamed $segment_count segments)\n");
 }
 
-sub send_playlistm3u8file {
-    my ($client, $request) = @_;
-    my $parse_params = HTTP::Request::Params->new({
-        req => $request,
-    });
-    my $params = $parse_params->params;
-    my $playlistid = $params->{'id'};
-    my $channelid = $params->{'channelid'};
-    my $sessionid = $params->{'session'};
+sub extract_segments_from_playlist {
+    my ($playlist_content, $base_url) = @_;
+    my @lines = split /\r?\n/, $playlist_content;
+    my @segments = ();
+    my %current_segment;
+    my $sequence_number = 0;
 
-    my $bootJson = get_bootJson($channelid);
+    # Bestimme Base-URL für relative Segmente
+    my ($playlist_base) = $base_url =~ m{^(.+)/[^/]+$};
 
-    my $getparams = "terminate=false&embedPartner=&serverSideAds=false&paln=&includeExtendedEvents=false&architecture=&deviceId=unknown&deviceVersion=unknown&appVersion=unknown&deviceType=web&deviceMake=Firefox&sid=".$sessionid."&advertisingId=&deviceLat=54.1241&deviceLon=12.1247&deviceDNT=0&deviceModel=web&userId=&appName=";
-    my $url = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/".$playlistid."/playlist.m3u8?".$getparams;
+    my $skip_next_segment = 0;
 
-    my $playlist = get_from_url($url);
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
 
-    my $response = HTTP::Response->new();
-    $response->header("content-disposition", "filename=\"playlist.m3u8\"");
-    $response->code(200);
-    $response->message("OK");
-    $response->content($playlist);
+        if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
+            $sequence_number = $1;
+        }
+        elsif ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
+            $current_segment{key_uri} = $1;
+            $current_segment{iv} = $2;
+            $current_segment{iv} =~ s/^0x//;
+        }
+        elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            # Setze Flag um nächstes Segment zu überspringen
+            $skip_next_segment = 1;
+            printf("Discontinuity detected, skipping next segment\n");
+        }
+        elsif ($line =~ /^#EXT-X-DISCONTINUITY-SEQUENCE:/) {
+            # Ignoriere Discontinuity-Sequence Tags, sie machen keine Probleme
+            next;
+        }
+        elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
+            $current_segment{duration} = $1;
+        }
+        elsif ($line =~ /^(https?:.+?\.ts)$/) {
+            # Überspringe Segment wenn Discontinuity-Flag gesetzt ist
+            if ($skip_next_segment) {
+                printf("Skipping segment after discontinuity: $1\n");
+                $skip_next_segment = 0;
+                %current_segment = ();
+                $sequence_number++;
+                next;
+            }
 
-    $client->send_response($response);
+            $current_segment{url} = $1;
+            $current_segment{sequence} = $sequence_number;
+
+            # Erstelle absoluten Pfad falls nötig
+            unless ($current_segment{url} =~ /^https?:\/\//) {
+                $current_segment{url} = "$playlist_base/$current_segment{url}";
+            }
+
+            # Füge Segment nur hinzu wenn alle notwendigen Informationen vorhanden sind
+            if (exists $current_segment{key_uri} && exists $current_segment{iv}) {
+                push @segments, { %current_segment };
+            } else {
+                printf("Skipping incomplete segment (missing key/iv): $current_segment{url}\n");
+            }
+
+            %current_segment = ();
+            $sequence_number++;
+        }
+    }
+
+    return @segments;
 }
 
-sub send_masterm3u8file {
-    my ($client, $request) = @_;
-    my $parse_params = HTTP::Request::Params->new({
-        req => $request,
-    });
-    my $params = $parse_params->params;
-    my $channelid = $params->{'id'};
+sub filter_new_segments {
+    my ($segments, $channel_id) = @_;
+    my @new_segments;
 
-    my $bootJson = get_bootJson($channelid);
+    for my $segment (@$segments) {
+        # Prüfe ob Segment bereits verarbeitet wurde
+        next if exists $processed_segments{$channel_id}->{$segment->{url}};
 
-    my $baseurl = $bootJson->{servers}->{stitcher}."/stitch/hls/channel/".$channelid."/";
-    my $url = $baseurl."master.m3u8";
-    $url.="?".$bootJson->{stitcherParams};
-    my $master = get_from_url($url);
+        # Prüfe Sequenznummer (falls verfügbar)
+        if (exists $segment->{sequence}) {
+            next if $segment->{sequence} <= $last_sequence_numbers{$channel_id};
+            $last_sequence_numbers{$channel_id} = $segment->{sequence};
+        }
 
-    $master =~ s/terminate=true/terminate=false/ig;
-    $master = fixPlaylistUrlsInMaster($master, $channelid, $bootJson->{session}->{sessionID});
+        push @new_segments, $segment;
+    }
 
-    my $response = HTTP::Response->new();
-    $response->header("content-disposition", "filename=\"master.m3u8\"");
-    $response->code(200);
-    $response->message("OK");
-    $response->content($master);
+    return @new_segments;
+}
 
-    $client->send_response($response);
+sub stream_segment {
+    my ($client, $ua, $segment, $channel_id) = @_;
+
+    # Hole verschlüsseltes Segment
+    my $req = HTTP::Request->new(GET => $segment->{url});
+    my $res = $ua->request($req);
+
+    unless ($res->is_success) {
+        printf("Failed to fetch segment %s: %s\n", $segment->{url}, $res->status_line);
+        return 0;
+    }
+
+    # Hole Entschlüsselungsschlüssel
+    my $key_res = $ua->get($segment->{key_uri});
+    unless ($key_res->is_success) {
+        printf("Failed to fetch key %s: %s\n", $segment->{key_uri}, $key_res->status_line);
+        return 0;
+    }
+
+    my $encryption_key = $key_res->content;
+    if (length($encryption_key) != 16) {
+        printf("Invalid key length: %d bytes (expected 16)\n", length($encryption_key));
+        return 0;
+    }
+
+    my $hex_key = unpack('H*', $encryption_key);
+    my $chunk = $res->content;
+    my $decrypted_data;
+
+    # Entschlüsselung mit OpenSSL (bevorzugt) oder Crypt::CBC
+    if (system("which openssl >/dev/null 2>&1") == 0) {
+        my $openssl_stderr = '';
+        my $ok = run(
+            [
+                "openssl", "aes-128-cbc", "-d",
+                "-in", "-",
+                "-out", "-",
+                "-K", $hex_key,
+                "-iv", $segment->{iv}
+            ],
+            "<", \$chunk,
+            ">", \$decrypted_data,
+            "2>", \$openssl_stderr,
+        );
+
+        unless ($ok) {
+            printf("OpenSSL decryption failed: %s\n", $openssl_stderr);
+            return 0;
+        }
+    } else {
+        my $iv_bin = pack 'H*', $segment->{iv};
+        my $cipher = Crypt::CBC->new(
+            -key     => $encryption_key,
+            -cipher  => 'Rijndael',
+            -iv      => $iv_bin,
+            -header  => 'none',
+            -padding => 'standard',
+        );
+        $decrypted_data = $cipher->decrypt($chunk);
+    }
+
+    # Validierung: Prüfe auf MPEG-TS Sync-Byte (0x47)
+    if (length($decrypted_data) > 0) {
+        my $first_byte = unpack('C', substr($decrypted_data, 0, 1));
+        unless ($first_byte == 0x47) {
+            printf("Warning: Segment doesn't start with MPEG-TS sync byte (0x%02X)\n", $first_byte);
+        }
+    }
+
+    # Sende entschlüsselte Daten an Client
+    eval {
+        print $client $decrypted_data;
+        $client->flush();
+    };
+
+    if ($@) {
+        printf("Failed to send data to client: %s\n", $@);
+        return 0;
+    }
+
+    return 1;
+}
+
+sub cleanup_old_segments {
+    my ($channel_id, $max_segments) = @_;
+
+    return unless exists $processed_segments{$channel_id};
+
+    my @segment_urls = keys %{$processed_segments{$channel_id}};
+    return if @segment_urls <= $max_segments;
+
+    # Entferne älteste Einträge (einfache FIFO-Strategie)
+    my $to_remove = @segment_urls - $max_segments;
+    for my $i (0 .. $to_remove - 1) {
+        delete $processed_segments{$channel_id}->{$segment_urls[$i]};
+    }
 }
 
 sub process_request {
-    my $from = DateTime->now();
-    my $to = $from->add(hours => 6);
-
-    $apiurl =~ s/{from}/$from/ig;
-    $apiurl =~ s/{to}/$to/ig;
-
-    my $loop = 0;
-    my $client = $_[0];
-    my $request;
-
-    $request = $client->get_request() or die("could not get Client-Request.\n");
+    my ($client) = @_;
+    my $request = $client->get_request() or die("could not get Client-Request.\n");
     $client->autoflush(1);
 
-    printf(" Request received for path ".$request->uri->path."\n");
-    if($request->uri->path eq "/playlist") {
-        send_m3ufile($client);
+    my $path = $request->uri->path;
+    printf("Request received for path $path\n");
+
+    if ($path eq "/playlist") {
+        send_m3u_file($client, 0, $request); # Legacy pipes
     }
-    elsif($request->uri->path eq "/master3u8") {
-        send_masterm3u8file($client, $request);
+    elsif ($path eq "/tvheadend") {
+        send_m3u_file($client, 1, $request); # Direct streams
     }
-    elsif($request->uri->path eq "/playlist3u8") {
-        send_playlistm3u8file($client, $request);
+    elsif ($path =~ m{^/stream/}) {
+        send_direct_stream($client, $request);
     }
-    elsif($request->uri->path eq "/epg") {
-        send_xmltvepgfile($client, $request)
+    elsif ($path eq "/epg") {
+        send_xmltv_epg_file($client, $request);
     }
-    elsif($request->uri->path eq "/") {
+    elsif ($path =~ m{^/dynamic_stream/}) {
+        send_dynamic_stream($client, $request);
+    }
+    elsif ($path eq "/") {
         send_help($client, $request);
     }
     else {
-        $client->send_error(RC_NOT_FOUND, "No such path available: ".$request->uri->path);
+        $client->send_error(RC_NOT_FOUND, "No such path available: $path");
     }
 }
 
-#####  ---- starting the server
-
-if(!$localhost) {
+# Initialize configuration
+if (!$localhost) {
     $hostip = Net::Address::IP::Local->public_ipv4;
 }
 
-if(defined(getArgsValue("--port"))) {
-    $port = getArgsValue("--port");
+if (defined(get_args_value("--port"))) {
+    $port = get_args_value("--port");
 }
 
-# START DAEMON
+# Start daemon
 my $daemon = HTTP::Daemon->new(
     LocalAddr => $hostip,
     LocalPort => $port,
@@ -410,12 +789,17 @@ my $daemon = HTTP::Daemon->new(
     ReusePort => $port,
 ) or die "Server could not be started.\n\n";
 
-$session = get_bootJson;
+$session = get_boot_json();
 
-printf("Server started listening on $hostip using port ".$port."\n");
+printf("Server started listening on $hostip using port $port\n");
+
 while (my $client = $daemon->accept) {
-    if(forkProcess == 1) {
-        process_request($client);
+    if (fork_process() == 1) {
+        try {
+            process_request($client);
+        } catch {
+            warn "Error processing request: $_\n";
+        };
         exit(0);
     }
 }
