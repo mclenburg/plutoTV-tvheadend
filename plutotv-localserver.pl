@@ -41,6 +41,8 @@ my %regions = (
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 
+our %channel_timestamps = ();
+
 sub getArgsValue {
     my ($param) = @_;
     for my $argnum (0 .. $#ARGV) {
@@ -457,6 +459,9 @@ sub extractSegmentsFromPlaylist {
     my $sequenceNumber = $playlistInfo->{mediaSequence} || 0;
     my ($playlistBase) = $baseUrl =~ m{^(.+)/[^/]+$};
     my $inDiscontinuityBlock = 0;
+
+    $$runningNumberRef = 1;
+
     for my $line (@lines) {
         if ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
             $currentSegment{keyUri} = $1;
@@ -505,25 +510,36 @@ sub filterNewSegments {
 
 sub streamSegment {
     my ($client, $ua, $segment, $channelId) = @_;
+
+    # Prüfen ob Discontinuity-Flag gesetzt ist
+    my $is_discontinuity = $segment->{isDiscontinuity} || 0;
+
+    # Segment herunterladen
     my $req = HTTP::Request->new(GET => $segment->{url});
     my $res = $ua->request($req);
     unless ($res->is_success) {
         printf("Failed to fetch segment %s: %s\n", $segment->{url}, $res->status_line);
         return 0;
     }
+
+    # Encryption Key herunterladen
     my $keyRes = $ua->get($segment->{keyUri});
     unless ($keyRes->is_success) {
         printf("Failed to fetch key %s: %s\n", $segment->{keyUri}, $keyRes->status_line);
         return 0;
     }
+
     my $encryptionKey = $keyRes->content;
     if (length($encryptionKey) != 16) {
         printf("Invalid key length: %d bytes (expected 16)\n", length($encryptionKey));
         return 0;
     }
+
+    # Segment entschlüsseln
     my $hexKey = unpack('H*', $encryptionKey);
     my $chunk = $res->content;
     my $decryptedData;
+
     if (which('openssl')) {
         my $opensslStderr = '';
         run(
@@ -550,32 +566,362 @@ sub streamSegment {
         );
         $decryptedData = $cipher->decrypt($chunk);
     }
+
+    # Prüfen ob MPEG-TS Format vorliegt
     if (length($decryptedData) > 0) {
         my $firstByte = unpack('C', substr($decryptedData, 0, 1));
         unless ($firstByte == 0x47) {
             printf("Warning: Segment doesn't start with MPEG-TS sync byte (0x%02X)\n", $firstByte);
         }
     }
+
+    # MPEG-TS Timestamps korrigieren ohne externe Module
     eval {
-        my $outputData;
-        run(
-            [
-                "ffmpeg", "-loglevel",  "error", "-i", "-",
-                "-c", "copy",
-                "-f", "mpegts",
-                "-"
-            ],
-            "<", \$decryptedData,
-            ">", \$outputData
-        );
-        print $client $outputData;
+        my $correctedData = correctMpegTsTimestamps($decryptedData, $channelId, $segment->{segmentNumber}, $is_discontinuity);
+        print $client $correctedData;
         $client->flush();
     };
+
     if ($@) {
         printf("Failed to send data to client: %s\n", $@);
         return 0;
     }
+
     return 1;
+}
+
+sub correctMpegTsTimestamps {
+    my ($data, $channelId, $segmentNumber, $is_discontinuity) = @_;
+
+    # Initialisiere Channel-spezifische Timestamp-Tracking falls nicht vorhanden
+    unless (exists $channel_timestamps{$channelId}) {
+        $channel_timestamps{$channelId} = {
+            last_pcr => 0,
+            last_pts => 0,
+            last_dts => 0,
+            pcr_offset => 0,
+            pts_offset => 0,
+            dts_offset => 0,
+            first_segment => 1,
+            segment_counter => 0,
+            # Neue Felder für Discontinuity-Behandlung
+            virtual_pcr => 0,
+            virtual_pts => 0,
+            virtual_dts => 0,
+            segment_duration => 90000 * 10  # Standard: 10 Sekunden in 90kHz Ticks
+        };
+    }
+
+    my $ts_info = $channel_timestamps{$channelId};
+    $ts_info->{segment_counter}++;
+
+    # Bei Discontinuity: Berechne erwartete virtuelle Timestamps aber setze Offsets NICHT zurück
+    if ($is_discontinuity) {
+        printf("DISCONTINUITY detected for channel %s at segment %d\n", $channelId, $segmentNumber);
+
+        # Berechne die erwarteten virtuellen Timestamps basierend auf der bisherigen Timeline
+        if (!$ts_info->{first_segment}) {
+            $ts_info->{virtual_pcr} = $ts_info->{last_pcr} + $ts_info->{segment_duration};
+            $ts_info->{virtual_pts} = $ts_info->{last_pts} + $ts_info->{segment_duration};
+            $ts_info->{virtual_dts} = $ts_info->{last_dts} + $ts_info->{segment_duration};
+        }
+
+        # Flag setzen um zu signalisieren, dass die nächsten Timestamps als Basis für neue Offsets dienen
+        $ts_info->{discontinuity_reset} = 1;
+    }
+
+    my $output = '';
+    my $packet_size = 188;
+    my $data_length = length($data);
+
+    # Durchlaufe alle MPEG-TS Pakete
+    for (my $pos = 0; $pos < $data_length; $pos += $packet_size) {
+        my $packet_data = substr($data, $pos, $packet_size);
+
+        # Prüfen ob vollständiges Paket vorhanden
+        last if length($packet_data) < $packet_size;
+
+        # Sync Byte prüfen (0x47)
+        my $sync_byte = unpack('C', substr($packet_data, 0, 1));
+        if ($sync_byte != 0x47) {
+            # Versuche Resync
+            my $found_sync = 0;
+            for (my $i = 1; $i < $packet_size && ($pos + $i) < $data_length; $i++) {
+                my $test_byte = unpack('C', substr($data, $pos + $i, 1));
+                if ($test_byte == 0x47) {
+                    $pos += $i - $packet_size;  # Korrigiere Position
+                    $found_sync = 1;
+                    last;
+                }
+            }
+            next unless $found_sync;
+        }
+
+        # Paket verarbeiten
+        $packet_data = processTimestampsInPacket($packet_data, $ts_info);
+        $output .= $packet_data;
+    }
+
+    return $output;
+}
+
+sub processTimestampsInPacket {
+    my ($packet_data, $ts_info) = @_;
+
+    # MPEG-TS Header parsen (erste 4 Bytes)
+    my @header = unpack('C4', substr($packet_data, 0, 4));
+    my $transport_error = ($header[1] & 0x80) >> 7;
+    my $payload_start = ($header[1] & 0x40) >> 6;
+    my $transport_priority = ($header[1] & 0x20) >> 5;
+    my $pid = (($header[1] & 0x1F) << 8) | $header[2];
+    my $scrambling = ($header[3] & 0xC0) >> 6;
+    my $adaptation_field = ($header[3] & 0x30) >> 4;
+    my $continuity_counter = $header[3] & 0x0F;
+
+    my $offset = 4;
+
+    # Adaptation Field verarbeiten
+    if ($adaptation_field == 2 || $adaptation_field == 3) {
+        my $adaptation_length = unpack('C', substr($packet_data, $offset, 1));
+        $offset++;
+
+        if ($adaptation_length > 0) {
+            # PCR verarbeiten falls vorhanden
+            $packet_data = processPcr($packet_data, $offset, $adaptation_length, $ts_info);
+        }
+
+        $offset += $adaptation_length;
+    }
+
+    # Payload verarbeiten falls vorhanden
+    if (($adaptation_field == 1 || $adaptation_field == 3) && $payload_start && $offset < 188) {
+        $packet_data = processPesTimestamps($packet_data, $offset, $ts_info);
+    }
+
+    return $packet_data;
+}
+
+sub processPcr {
+    my ($packet_data, $offset, $adaptation_length, $ts_info) = @_;
+
+    return $packet_data if $adaptation_length < 1;
+
+    my $flags = unpack('C', substr($packet_data, $offset, 1));
+    my $pcr_flag = ($flags & 0x10) >> 4;
+
+    if ($pcr_flag && $adaptation_length >= 6) {
+        # PCR extrahieren (6 Bytes ab offset+1)
+        my @pcr_bytes = unpack('C6', substr($packet_data, $offset + 1, 6));
+
+        # PCR Base (33 Bits) extrahieren
+        my $pcr_base = ($pcr_bytes[0] << 25) | ($pcr_bytes[1] << 17) |
+            ($pcr_bytes[2] << 9) | ($pcr_bytes[3] << 1) |
+            (($pcr_bytes[4] & 0x80) >> 7);
+
+        my $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
+
+        # PCR korrigieren mit Discontinuity-Behandlung
+        my $corrected_pcr_base;
+
+        if ($ts_info->{first_segment}) {
+            # Erstes Segment: PCR als Basis verwenden
+            $ts_info->{pcr_offset} = 0;
+            $corrected_pcr_base = $pcr_base;
+        } elsif ($ts_info->{discontinuity_reset}) {
+            # Nach Discontinuity: Neuen Offset basierend auf virtueller Timeline berechnen
+            $ts_info->{pcr_offset} = $ts_info->{virtual_pcr} - $pcr_base;
+            $corrected_pcr_base = $pcr_base + $ts_info->{pcr_offset};
+            printf("PCR discontinuity reset: original=%d, virtual=%d, offset=%d, corrected=%d\n",
+                $pcr_base, $ts_info->{virtual_pcr}, $ts_info->{pcr_offset}, $corrected_pcr_base);
+        } else {
+            # Normale Fortsetzung: Bestehenden Offset anwenden
+            $corrected_pcr_base = $pcr_base + $ts_info->{pcr_offset};
+
+            # Prüfe auf unerwartete Sprünge (nicht durch Discontinuity verursacht)
+            my $expected_pcr = $ts_info->{last_pcr} + $ts_info->{segment_duration};
+            my $pcr_diff = abs($corrected_pcr_base - $expected_pcr);
+
+            if ($pcr_diff > $ts_info->{segment_duration} * 2) {
+                # Großer Sprung erkannt - möglicherweise 33-bit Wrap-around
+                if ($corrected_pcr_base < $expected_pcr) {
+                    $ts_info->{pcr_offset} += 2**33;  # 33-bit wrap
+                    $corrected_pcr_base += 2**33;
+                    printf("PCR wrap-around detected and corrected\n");
+                }
+            }
+        }
+
+        $ts_info->{last_pcr} = $corrected_pcr_base;
+
+        # Korrigierte PCR zurück ins Paket schreiben (33-bit wrap)
+        $corrected_pcr_base = $corrected_pcr_base & (2**33 - 1);
+
+        $pcr_bytes[0] = ($corrected_pcr_base >> 25) & 0xFF;
+        $pcr_bytes[1] = ($corrected_pcr_base >> 17) & 0xFF;
+        $pcr_bytes[2] = ($corrected_pcr_base >> 9) & 0xFF;
+        $pcr_bytes[3] = ($corrected_pcr_base >> 1) & 0xFF;
+        $pcr_bytes[4] = (($corrected_pcr_base & 0x01) << 7) | 0x7E | (($pcr_ext >> 8) & 0x01);
+        $pcr_bytes[5] = $pcr_ext & 0xFF;
+
+        substr($packet_data, $offset + 1, 6) = pack('C6', @pcr_bytes);
+    }
+
+    return $packet_data;
+}
+
+sub processPesTimestamps {
+    my ($packet_data, $offset, $ts_info) = @_;
+
+    return $packet_data if $offset + 9 >= 188;
+
+    # PES Header prüfen (0x000001)
+    my @pes_start = unpack('C3', substr($packet_data, $offset, 3));
+    return $packet_data unless ($pes_start[0] == 0x00 && $pes_start[1] == 0x00 && $pes_start[2] == 0x01);
+
+    # Stream ID prüfen (Video/Audio)
+    my $stream_id = unpack('C', substr($packet_data, $offset + 3, 1));
+    return $packet_data unless (($stream_id >= 0xC0 && $stream_id <= 0xDF) || # Audio
+        ($stream_id >= 0xE0 && $stream_id <= 0xEF));   # Video
+
+    return $packet_data if $offset + 8 >= 188;
+
+    # PES Header Flags
+    my $pes_flags = unpack('C', substr($packet_data, $offset + 7, 1));
+    my $pts_dts_flags = ($pes_flags & 0xC0) >> 6;
+    my $header_length = unpack('C', substr($packet_data, $offset + 8, 1));
+
+    return $packet_data unless $pts_dts_flags > 0;
+    return $packet_data if $offset + 9 + $header_length >= 188;
+
+    my $pts_offset = $offset + 9;
+
+    # PTS korrigieren
+    if ($pts_dts_flags >= 2 && $pts_offset + 4 < 188) {
+        $packet_data = correctPts($packet_data, $pts_offset, $ts_info);
+    }
+
+    # DTS korrigieren falls vorhanden
+    if ($pts_dts_flags == 3 && $pts_offset + 9 < 188) {
+        $packet_data = correctDts($packet_data, $pts_offset + 5, $ts_info);
+    }
+
+    return $packet_data;
+}
+
+sub correctPts {
+    my ($packet_data, $pts_offset, $ts_info) = @_;
+
+    # PTS extrahieren (5 Bytes, 33-bit Wert)
+    my @pts_bytes = unpack('C5', substr($packet_data, $pts_offset, 5));
+    my $pts = (($pts_bytes[0] & 0x0E) << 29) | ($pts_bytes[1] << 22) |
+        (($pts_bytes[2] & 0xFE) << 14) | ($pts_bytes[3] << 7) |
+        (($pts_bytes[4] & 0xFE) >> 1);
+
+    # PTS korrigieren mit Discontinuity-Behandlung
+    my $corrected_pts;
+
+    if ($ts_info->{first_segment}) {
+        # Erstes Segment: PTS als Basis verwenden
+        $ts_info->{pts_offset} = 0;
+        $corrected_pts = $pts;
+    } elsif ($ts_info->{discontinuity_reset}) {
+        # Nach Discontinuity: Neuen Offset basierend auf virtueller Timeline berechnen
+        $ts_info->{pts_offset} = $ts_info->{virtual_pts} - $pts;
+        $corrected_pts = $pts + $ts_info->{pts_offset};
+        printf("PTS discontinuity reset: original=%d, virtual=%d, offset=%d, corrected=%d\n",
+            $pts, $ts_info->{virtual_pts}, $ts_info->{pts_offset}, $corrected_pts);
+    } else {
+        # Normale Fortsetzung: Bestehenden Offset anwenden
+        $corrected_pts = $pts + $ts_info->{pts_offset};
+
+        # Prüfe auf unerwartete Sprünge (nicht durch Discontinuity verursacht)
+        my $expected_pts = $ts_info->{last_pts} + $ts_info->{segment_duration};
+        my $pts_diff = abs($corrected_pts - $expected_pts);
+
+        if ($pts_diff > $ts_info->{segment_duration} * 2) {
+            # Großer Sprung erkannt - möglicherweise 33-bit Wrap-around
+            if ($corrected_pts < $expected_pts) {
+                $ts_info->{pts_offset} += 2**33;  # 33-bit wrap
+                $corrected_pts += 2**33;
+                printf("PTS wrap-around detected and corrected\n");
+            }
+        }
+    }
+
+    $ts_info->{last_pts} = $corrected_pts;
+
+    # Korrigierte PTS zurück ins Paket schreiben (33-bit wrap)
+    $corrected_pts = $corrected_pts & (2**33 - 1);
+
+    $pts_bytes[0] = ($pts_bytes[0] & 0xF1) | (($corrected_pts >> 29) & 0x0E);
+    $pts_bytes[1] = ($corrected_pts >> 22) & 0xFF;
+    $pts_bytes[2] = (($corrected_pts >> 14) & 0xFE) | 0x01;
+    $pts_bytes[3] = ($corrected_pts >> 7) & 0xFF;
+    $pts_bytes[4] = (($corrected_pts << 1) & 0xFE) | 0x01;
+
+    substr($packet_data, $pts_offset, 5) = pack('C5', @pts_bytes);
+
+    return $packet_data;
+}
+
+sub correctDts {
+    my ($packet_data, $dts_offset, $ts_info) = @_;
+
+    # DTS extrahieren (5 Bytes, 33-bit Wert)
+    my @dts_bytes = unpack('C5', substr($packet_data, $dts_offset, 5));
+    my $dts = (($dts_bytes[0] & 0x0E) << 29) | ($dts_bytes[1] << 22) |
+        (($dts_bytes[2] & 0xFE) << 14) | ($dts_bytes[3] << 7) |
+        (($dts_bytes[4] & 0xFE) >> 1);
+
+    # DTS korrigieren mit Discontinuity-Behandlung
+    my $corrected_dts;
+
+    if ($ts_info->{first_segment}) {
+        # Erstes Segment: DTS als Basis verwenden
+        $ts_info->{dts_offset} = 0;
+        $corrected_dts = $dts;
+        $ts_info->{first_segment} = 0;  # Nach dem ersten Segment zurücksetzen
+    } elsif ($ts_info->{discontinuity_reset}) {
+        # Nach Discontinuity: Neuen Offset basierend auf virtueller Timeline berechnen
+        $ts_info->{dts_offset} = $ts_info->{virtual_dts} - $dts;
+        $corrected_dts = $dts + $ts_info->{dts_offset};
+        printf("DTS discontinuity reset: original=%d, virtual=%d, offset=%d, corrected=%d\n",
+            $dts, $ts_info->{virtual_dts}, $ts_info->{dts_offset}, $corrected_dts);
+
+        # Discontinuity Reset Flag zurücksetzen nachdem alle Timestamps verarbeitet wurden
+        $ts_info->{discontinuity_reset} = 0;
+    } else {
+        # Normale Fortsetzung: Bestehenden Offset anwenden
+        $corrected_dts = $dts + $ts_info->{dts_offset};
+
+        # Prüfe auf unerwartete Sprünge (nicht durch Discontinuity verursacht)
+        my $expected_dts = $ts_info->{last_dts} + $ts_info->{segment_duration};
+        my $dts_diff = abs($corrected_dts - $expected_dts);
+
+        if ($dts_diff > $ts_info->{segment_duration} * 2) {
+            # Großer Sprung erkannt - möglicherweise 33-bit Wrap-around
+            if ($corrected_dts < $expected_dts) {
+                $ts_info->{dts_offset} += 2**33;  # 33-bit wrap
+                $corrected_dts += 2**33;
+                printf("DTS wrap-around detected and corrected\n");
+            }
+        }
+    }
+
+    $ts_info->{last_dts} = $corrected_dts;
+
+    # Korrigierte DTS zurück ins Paket schreiben (33-bit wrap)
+    $corrected_dts = $corrected_dts & (2**33 - 1);
+
+    $dts_bytes[0] = ($dts_bytes[0] & 0xF1) | (($corrected_dts >> 29) & 0x0E);
+    $dts_bytes[1] = ($corrected_dts >> 22) & 0xFF;
+    $dts_bytes[2] = (($corrected_dts >> 14) & 0xFE) | 0x01;
+    $dts_bytes[3] = ($corrected_dts >> 7) & 0xFF;
+    $dts_bytes[4] = (($corrected_dts << 1) & 0xFE) | 0x01;
+
+    substr($packet_data, $dts_offset, 5) = pack('C5', @dts_bytes);
+
+    return $packet_data;
 }
 
 sub cleanupOldSegments {
