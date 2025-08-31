@@ -475,14 +475,13 @@ sub extractSegmentsFromPlaylist {
     $$runningNumberRef = 1;
 
     for my $line (@lines) {
-        if ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
+        if ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            $inDiscontinuityBlock = 1;
+        }
+        elsif ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
             $currentSegment{keyUri} = $1;
             $currentSegment{iv} = $2;
             $currentSegment{iv} =~ s/^0x//;
-            $inDiscontinuityBlock = 0;
-        }
-        elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-            $inDiscontinuityBlock = 1;
         }
         elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
             $currentSegment{duration} = $1;
@@ -499,6 +498,7 @@ sub extractSegmentsFromPlaylist {
                 push @segments, { %currentSegment };
             }
             %currentSegment = ();
+            $inDiscontinuityBlock = 0;
             $sequenceNumber++;
             $$runningNumberRef++;
             if($$runningNumberRef > 1000000) {
@@ -600,14 +600,17 @@ sub correctMpegTsTimestamps {
     my ($data, $channelId, $is_discontinuity) = @_;
     unless (exists $channel_timestamps{$channelId}) {
         $channel_timestamps{$channelId} = {
-            last_pcr => 0,
-            last_pts => 0,
-            last_dts => 0,
+            last_pcr => undef,
+            last_pts => undef,
+            last_dts => undef,
             pcr_offset => 0,
             pts_offset => 0,
             dts_offset => 0,
-            first_segment => 1,
-            segment_duration => 90000 * 10
+            cc_counters => {},
+            discontinuity_reset => 0,
+            pcr_calculated => 0,
+            pts_calculated => 0,
+            dts_calculated => 0
         };
     }
     my $ts_info = $channel_timestamps{$channelId};
@@ -616,6 +619,10 @@ sub correctMpegTsTimestamps {
             printf("DISCONTINUITY detected for channel %s\n", $channelId);
         }
         $ts_info->{discontinuity_reset} = 1;
+        $ts_info->{cc_counters} = {};
+        $ts_info->{pcr_calculated} = 0;
+        $ts_info->{pts_calculated} = 0;
+        $ts_info->{dts_calculated} = 0;
     }
     my $output = '';
     my $packet_size = 188;
@@ -636,31 +643,46 @@ sub correctMpegTsTimestamps {
             }
             next unless $found_sync;
         }
+        $packet_data = correctContinuityCounter($packet_data, $ts_info);
         $packet_data = processTimestampsInPacket($packet_data, $ts_info);
         $output .= $packet_data;
     }
-    $ts_info->{first_segment} = 0;
-    $ts_info->{discontinuity_reset} = 0;
     return $output;
+}
+
+sub correctContinuityCounter {
+    my ($packet_data, $ts_info) = @_;
+    my @header = unpack('C4', substr($packet_data, 0, 4));
+    my $pid = (($header[1] & 0x1F) << 8) | $header[2];
+    unless (exists $ts_info->{cc_counters}->{$pid}) {
+        $ts_info->{cc_counters}->{$pid} = -1;
+    }
+    my $cc = ($ts_info->{cc_counters}->{$pid} + 1) % 16;
+    my $header_byte_4 = $header[3];
+    my $adaptation_field = ($header_byte_4 & 0xF0);
+    my $corrected_header_byte_4 = $adaptation_field | $cc;
+    substr($packet_data, 3, 1) = pack('C', $corrected_header_byte_4);
+    $ts_info->{cc_counters}->{$pid} = $cc;
+    return $packet_data;
 }
 
 sub processTimestampsInPacket {
     my ($packet_data, $ts_info) = @_;
+    my $pos = 4;
     my @header = unpack('C4', substr($packet_data, 0, 4));
     my $payload_start = ($header[1] & 0x40) >> 6;
     my $pid = (($header[1] & 0x1F) << 8) | $header[2];
     my $adaptation_field = ($header[3] & 0x30) >> 4;
-    my $offset = 4;
     if ($adaptation_field == 2 || $adaptation_field == 3) {
-        my $adaptation_length = unpack('C', substr($packet_data, $offset, 1));
-        $offset++;
+        my $adaptation_length = unpack('C', substr($packet_data, $pos, 1));
+        $pos++;
         if ($adaptation_length > 0) {
-            $packet_data = processPcr($packet_data, $offset, $adaptation_length, $ts_info);
+            $packet_data = processPcr($packet_data, $pos, $adaptation_length, $ts_info);
         }
-        $offset += $adaptation_length;
+        $pos += $adaptation_length;
     }
-    if (($adaptation_field == 1 || $adaptation_field == 3) && $payload_start && $offset < 188) {
-        $packet_data = processPesTimestamps($packet_data, $offset, $ts_info);
+    if (($adaptation_field == 1 || $adaptation_field == 3) && $payload_start && $pos < 188) {
+        $packet_data = processPesTimestamps($packet_data, $pos, $ts_info);
     }
     return $packet_data;
 }
@@ -676,10 +698,9 @@ sub processPcr {
             ($pcr_bytes[2] << 9) | ($pcr_bytes[3] << 1) |
             (($pcr_bytes[4] & 0x80) >> 7);
         my $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
-        if ($ts_info->{discontinuity_reset}) {
-            $ts_info->{pcr_offset} = $ts_info->{last_pcr} - $pcr_base;
-        } elsif ($ts_info->{first_segment}) {
-            $ts_info->{pcr_offset} = 0;
+        if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated}) {
+            $ts_info->{pcr_offset} = $ts_info->{last_pcr} + 1 - $pcr_base;
+            $ts_info->{pcr_calculated} = 1;
         }
         my $corrected_pcr_base = $pcr_base + $ts_info->{pcr_offset};
         if ($debug) {
@@ -691,7 +712,7 @@ sub processPcr {
         $pcr_bytes[1] = ($corrected_pcr_base >> 17) & 0xFF;
         $pcr_bytes[2] = ($corrected_pcr_base >> 9) & 0xFF;
         $pcr_bytes[3] = ($corrected_pcr_base >> 1) & 0xFF;
-        $pcr_bytes[4] = (($corrected_pcr_base & 0x01) << 7) | 0x7E | (($pcr_ext >> 8) & 0x01);
+        $pcr_bytes[4] = (($corrected_pcr_base & 0x01) << 7) | (($pcr_ext >> 8) & 0x01);
         $pcr_bytes[5] = $pcr_ext & 0xFF;
         substr($packet_data, $offset + 1, 6) = pack('C6', @pcr_bytes);
     }
@@ -728,10 +749,9 @@ sub correctPts {
     my $pts = (($pts_bytes[0] & 0x0E) << 29) | ($pts_bytes[1] << 22) |
         (($pts_bytes[2] & 0xFE) << 14) | ($pts_bytes[3] << 7) |
         (($pts_bytes[4] & 0xFE) >> 1);
-    if ($ts_info->{discontinuity_reset}) {
-        $ts_info->{pts_offset} = $ts_info->{last_pts} - $pts;
-    } elsif ($ts_info->{first_segment}) {
-        $ts_info->{pts_offset} = 0;
+    if ($ts_info->{discontinuity_reset} && !$ts_info->{pts_calculated}) {
+        $ts_info->{pts_offset} = $ts_info->{last_pts} + 1 - $pts;
+        $ts_info->{pts_calculated} = 1;
     }
     my $corrected_pts = $pts + $ts_info->{pts_offset};
     if ($debug) {
@@ -754,10 +774,9 @@ sub correctDts {
     my $dts = (($dts_bytes[0] & 0x0E) << 29) | ($dts_bytes[1] << 22) |
         (($dts_bytes[2] & 0xFE) << 14) | ($dts_bytes[3] << 7) |
         (($dts_bytes[4] & 0xFE) >> 1);
-    if ($ts_info->{discontinuity_reset}) {
-        $ts_info->{dts_offset} = $ts_info->{last_dts} - $dts;
-    } elsif ($ts_info->{first_segment}) {
-        $ts_info->{dts_offset} = 0;
+    if ($ts_info->{discontinuity_reset} && !$ts_info->{dts_calculated}) {
+        $ts_info->{dts_offset} = $ts_info->{last_dts} + 1 - $dts;
+        $ts_info->{dts_calculated} = 1;
     }
     my $corrected_dts = $dts + $ts_info->{dts_offset};
     if ($debug) {
