@@ -619,7 +619,6 @@ sub correctMpegTsTimestamps {
             printf("DISCONTINUITY detected for channel %s\n", $channelId);
         }
         $ts_info->{discontinuity_reset} = 1;
-        $ts_info->{cc_counters} = {};
         $ts_info->{pcr_calculated} = 0;
         $ts_info->{pts_calculated} = 0;
         $ts_info->{dts_calculated} = 0;
