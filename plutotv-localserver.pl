@@ -688,6 +688,7 @@ sub processTimestampsInPacket {
 
 sub processPcr {
     my ($packet_data, $offset, $adaptation_length, $ts_info) = @_;
+    my $pcr_ext;
     return $packet_data if $adaptation_length < 1;
     my $flags = unpack('C', substr($packet_data, $offset, 1));
     my $pcr_flag = ($flags & 0x10) >> 4;
@@ -696,15 +697,15 @@ sub processPcr {
         my $pcr_base = ($pcr_bytes[0] << 25) | ($pcr_bytes[1] << 17) |
             ($pcr_bytes[2] << 9) | ($pcr_bytes[3] << 1) |
             (($pcr_bytes[4] & 0x80) >> 7);
-        my $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
+        $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
+
         if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated}) {
-            $ts_info->{pcr_offset} = $ts_info->{last_pcr} + 1 - $pcr_base;
+            $ts_info->{pcr_offset} = $ts_info->{last_pcr} - $pcr_base;
             $ts_info->{pcr_calculated} = 1;
+            $ts_info->{discontinuity_reset} = 0;
         }
         my $corrected_pcr_base = $pcr_base + $ts_info->{pcr_offset};
-        if ($debug) {
-            printf("PCR: corrected=%d, original=%d, offset=%d\n", $corrected_pcr_base, $pcr_base, $ts_info->{pcr_offset});
-        }
+
         $ts_info->{last_pcr} = $corrected_pcr_base;
         $corrected_pcr_base = $corrected_pcr_base & (2**33 - 1);
         $pcr_bytes[0] = ($corrected_pcr_base >> 25) & 0xFF;
@@ -748,13 +749,18 @@ sub correctPts {
     my $pts = (($pts_bytes[0] & 0x0E) << 29) | ($pts_bytes[1] << 22) |
         (($pts_bytes[2] & 0xFE) << 14) | ($pts_bytes[3] << 7) |
         (($pts_bytes[4] & 0xFE) >> 1);
-    if ($ts_info->{discontinuity_reset} && !$ts_info->{pts_calculated}) {
-        $ts_info->{pts_offset} = $ts_info->{last_pts} + 1 - $pts;
-        $ts_info->{pts_calculated} = 1;
-    }
-    my $corrected_pts = $pts + $ts_info->{pts_offset};
+
     if ($debug) {
-        printf("PTS: corrected=%d, original=%d, offset=%d\n", $corrected_pts, $pts, $ts_info->{pts_offset});
+        printf("PTS: original=%d\n", $pts);
+    }
+
+    my $corrected_pts = $pts;
+    if (defined $ts_info->{pcr_offset}) {
+        $corrected_pts = $pts + $ts_info->{pcr_offset};
+    }
+
+    if ($debug) {
+        printf("PTS: corrected=%d, offset=%d\n", $corrected_pts, $ts_info->{pcr_offset} // 0);
     }
     $ts_info->{last_pts} = $corrected_pts;
     $corrected_pts = $corrected_pts & (2**33 - 1);
@@ -773,14 +779,12 @@ sub correctDts {
     my $dts = (($dts_bytes[0] & 0x0E) << 29) | ($dts_bytes[1] << 22) |
         (($dts_bytes[2] & 0xFE) << 14) | ($dts_bytes[3] << 7) |
         (($dts_bytes[4] & 0xFE) >> 1);
-    if ($ts_info->{discontinuity_reset} && !$ts_info->{dts_calculated}) {
-        $ts_info->{dts_offset} = $ts_info->{last_dts} + 1 - $dts;
-        $ts_info->{dts_calculated} = 1;
+
+    my $corrected_dts = $dts;
+    if (defined $ts_info->{pcr_offset}) {
+        $corrected_dts = $dts + $ts_info->{pcr_offset};
     }
-    my $corrected_dts = $dts + $ts_info->{dts_offset};
-    if ($debug) {
-        printf("DTS: corrected=%d, original=%d, offset=%d\n", $corrected_dts, $dts, $ts_info->{dts_offset});
-    }
+
     $ts_info->{last_dts} = $corrected_dts;
     $corrected_dts = $corrected_dts & (2**33 - 1);
     $dts_bytes[0] = ($dts_bytes[0] & 0xF1) | (($corrected_dts >> 29) & 0x0E);
