@@ -147,7 +147,7 @@ sub buildM3uLegacy {
         my $name = $channel->{name};
         my $number = $channel->{number};
         my $id = $channel->{_id};
-        $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . uri_escape_utf8($name) .
+        $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . $id .
             "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
         if ($useStreamlink) {
             my $url = "https://pluto.tv/" . $session->{session}->{activeRegion} .
@@ -175,7 +175,7 @@ sub buildM3uDirect {
         my $name = $channel->{name};
         my $number = $channel->{number};
         my $id = $channel->{_id};
-        $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . uri_escape_utf8($name) .
+        $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . $id .
             "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
         $m3u .= "http://$hostIp:$port/stream/$id.m3u8\n";
     }
