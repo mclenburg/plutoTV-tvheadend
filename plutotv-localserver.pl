@@ -102,6 +102,7 @@ sub getChannelJson {
     my $url = "$apiUrl?start=${from}Z&stop=${to}Z";
     my $content = getFromUrl($url);
     return () unless $content;
+    try { utf8::decode($content) };
     my $channels = try { parse_json($content) };
     return $channels ? @{$channels} : ();
 }
