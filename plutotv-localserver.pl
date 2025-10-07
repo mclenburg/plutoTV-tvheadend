@@ -226,6 +226,7 @@ sub sendXmltvEpgFile {
             next unless $start && $stop;
             $start =~ s/[-:Z\.T]//g;
             $stop =~ s/[-:Z\.T]//g;
+            $start = substr($start, 0, 14);
             $stop = substr($stop, 0, 14);
             $epg .= "<programme start=\"$start +0000\" stop=\"$stop +0000\" channel=\"$channelId\">\n";
             my $episode = $programme->{episode} || {};
