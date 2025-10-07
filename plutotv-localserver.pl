@@ -208,7 +208,7 @@ sub sendXmltvEpgFile {
     for my $channel (@channels) {
         next unless $channel->{number} > 0;
         my $channelName = $channel->{name};
-        my $channelId = uri_escape_utf8($channelName);
+        my $channelId = $channel->{_id};
         $epg .= "<channel id=\"$channelId\">\n";
         $epg .= "<display-name lang=\"$langcode\"><![CDATA[$channelName]]></display-name>\n";
         if (my $logo = $channel->{logo}) {
@@ -220,7 +220,7 @@ sub sendXmltvEpgFile {
     }
     for my $channel (@channels) {
         next unless $channel->{number} > 0;
-        my $channelId = uri_escape_utf8($channel->{name});
+        my $channelId = $channel->{_id};
         for my $programme (@{$channel->{timelines} || []}) {
             my ($start, $stop) = ($programme->{start}, $programme->{stop});
             next unless $start && $stop;
