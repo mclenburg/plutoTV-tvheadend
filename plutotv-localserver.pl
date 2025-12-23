@@ -1,5 +1,8 @@
 #!/usr/bin/perl
 
+# debian
+# libhttp-daemon-perl libhttp-request-params-perl libdatetime-perl libjson-parse-perl libuuid-tiny-perl libfile-which-perl libnet-address-ip-local-perl libcrypt-cbc-perl libipc-run-perl
+
 package PlutoTVServer;
 
 use strict;
@@ -138,7 +141,7 @@ sub getBootFromPluto {
 }
 
 sub buildM3uLegacy {
-    my ($session, @channels) = @_;
+    my ($proto, $host, $session, @channels) = @_;
     my $m3u = "#EXTM3U\n";
     for my $channel (@channels) {
         next unless $channel->{number} > 0 && $channel->{number} != 2000;
@@ -156,7 +159,7 @@ sub buildM3uLegacy {
                 "--hls-live-restart --url \"$url\"\n";
         } else {
             $m3u .= "pipe://$ffmpeg -loglevel fatal -threads 0 -nostdin -re " .
-                "-i \"http://$hostIp:$port/master3u8?id=$id\" " .
+                "-i \"$proto://$host/stream/$id.m3u8?proto=$proto\" " .
                 "-c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts " .
                 "-tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv " .
                 "-metadata service_name=\"$name\" pipe:1\n";
@@ -166,7 +169,7 @@ sub buildM3uLegacy {
 }
 
 sub buildM3uDirect {
-    my (@channels) = @_;
+    my ($proto, $host, @channels) = @_;
     my $m3u = "#EXTM3U\n";
     for my $channel (@channels) {
         next unless $channel->{number} > 0 && $channel->{number} != 2000;
@@ -177,7 +180,7 @@ sub buildM3uDirect {
         my $id = $channel->{_id};
         $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . $id .
             "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
-        $m3u .= "http://$hostIp:$port/stream/$id.m3u8\n";
+        $m3u .= "$proto://$host/stream/$id.m3u8?proto=$proto\n";
     }
     return $m3u;
 }
@@ -250,17 +253,21 @@ sub sendXmltvEpgFile {
 sub sendM3uFile {
     my ($client, $useDirectStreams, $request) = @_;
     my $region = 'DE';
+    my $proto = 'http';
+    my $host_dynamic = $hostIp;
     if ($request) {
         my $params = try { HTTP::Request::Params->new({ req => $request })->params };
         $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+        $proto = $params->{'proto'} if $params && $params->{'proto'};
     }
+    $host_dynamic =  $request->header('Host') if $request->header('Host');
     my @channels = getChannelJson($region);
     unless (@channels) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
         return;
     }
     my $session = getBootFromPluto($region);
-    my $m3uContent = $useDirectStreams ? buildM3uDirect(@channels) : buildM3uLegacy($session, @channels);
+    my $m3uContent = $useDirectStreams ? buildM3uDirect($proto, $host_dynamic, @channels) : buildM3uLegacy($proto, $host_dynamic, $session, @channels);
     my $response = HTTP::Response->new();
     $response->header("content-type", "audio/x-mpegurl");
     $response->header("content-disposition", "filename=\"plutotv.m3u8\"");
@@ -274,6 +281,13 @@ sub sendDirectStream {
     my ($client, $request) = @_;
     my $path = $request->uri->path;
     my ($channelId) = $path =~ m{/stream/([^/]+)\.m3u8$};
+    my $proto = 'http';
+    my $host_dynamic = $hostIp;
+    if ($request) {
+        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+        $proto = $params->{'proto'} if $params && $params->{'proto'};
+    }
+    $host_dynamic =  $request->header('Host') if $request->header('Host');
     unless ($channelId) {
         $client->send_error(RC_BAD_REQUEST, "Invalid stream path");
         return;
@@ -290,7 +304,7 @@ sub sendDirectStream {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
         return;
     }
-    my $dynamicM3u = createDynamicPlaylist($master, $channelId, $baseUrl);
+    my $dynamicM3u = createDynamicPlaylist($proto, $host_dynamic , $master, $channelId, $baseUrl);
     my $response = HTTP::Response->new();
     $response->code(200);
     $response->message("OK");
@@ -303,7 +317,7 @@ sub sendDirectStream {
 }
 
 sub createDynamicPlaylist {
-    my ($masterPlaylist, $channelId, $baseUrl) = @_;
+    my ($proto, $host, $masterPlaylist, $channelId, $baseUrl) = @_;
     my @lines = split /\r?\n/, $masterPlaylist;
     my $bestStreamUrl;
     my $bestBandwidth = 0;
@@ -332,7 +346,7 @@ sub createDynamicPlaylist {
     $dynamicPlaylist .= "#EXT-X-MEDIA-SEQUENCE:0\n";
     $dynamicPlaylist .= "#EXT-X-PLAYLIST-TYPE:EVENT\n";
     $dynamicPlaylist .= "#EXTINF:86400.0,\n";
-    $dynamicPlaylist .= "http://$hostIp:$port/dynamic_stream/$channelId.ts\n";
+    $dynamicPlaylist .= "$proto://$host/dynamic_stream/$channelId.ts\n";
     $dynamicPlaylist .= "#EXT-X-ENDLIST\n";
     return $dynamicPlaylist;
 }
@@ -845,7 +859,6 @@ if (defined(getArgsValue("--port"))) {
 }
 
 my $daemon = HTTP::Daemon->new(
-    LocalAddr => $hostIp,
     LocalPort => $port,
     Reuse => 1,
     ReuseAddr => 1,
@@ -860,7 +873,7 @@ $SIG{PIPE} = sub {
 };
 $SIG{CHLD} = 'IGNORE';
 
-printf("PlutoTVServer started in version $version listening on $hostIp using port $port.\n");
+printf("PlutoTVServer started in version $version listening on 0.0.0.0 using port $port.\n");
 
 while (my $client = $daemon->accept) {
     if (forkProcess() == 1) {
