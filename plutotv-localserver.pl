@@ -15,6 +15,7 @@ use HTTP::Request ();
 use HTTP::Headers;
 use LWP::UserAgent;
 use URI::Escape qw(uri_escape_utf8 uri_unescape);
+use URI;
 use UUID::Tiny ':std';
 use File::Which;
 use Net::Address::IP::Local;
@@ -33,7 +34,7 @@ my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channe
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $version = "2.3.5";
+my $version = "2.3.6";
 my $appName = "web";
 my $appVersion = "9.20.0-89258290264838515e264f5b051b7c1602a58482";
 my $deviceVersion = "148.0.0";
@@ -59,6 +60,7 @@ GetOptions("debug" => \$debug);
 our %channel_timestamps = ();
 our %session_cache = ();
 our %channel_cache = ();
+our %master_url_cache = ();
 
 my $sessionRefreshInterval = 25 * 60;
 my $sessionRetryCooldown = 30;
@@ -284,15 +286,43 @@ sub extractSessionId {
 }
 
 sub buildStitchQuery {
-    my ($bootJson) = @_;
+    my ($bootJson, $region) = @_;
+    $region ||= 'DE';
     return '' unless $bootJson;
-    my %pairs = parseQueryString($bootJson->{stitcherParams} || '');
-    my $sid = extractSessionId($bootJson);
-    $pairs{sid} = $sid if defined $sid && length $sid;
-    $pairs{sessionID} = $sid if defined $sid && length $sid;
-    $pairs{deviceId} = $deviceId unless defined $pairs{deviceId} && length $pairs{deviceId};
-    $pairs{clientID} = $deviceId unless defined $pairs{clientID} && length $pairs{clientID};
-    $pairs{jwt} = $bootJson->{sessionToken} if $bootJson->{sessionToken};
+
+    my $regionData = $regions{$region} || $regions{'DE'};
+    my $sid = extractSessionId($bootJson) || '';
+    my $jwt = $bootJson->{sessionToken} || '';
+
+    my %pairs = (
+        advertisingId         => '',
+        appName               => $appName,
+        appVersion            => $appVersion,
+        app_name              => $appName,
+        clientDeviceType      => 0,
+        clientID              => $deviceId,
+        clientModelNumber     => $clientModelNumber,
+        country               => $region,
+        deviceDNT             => 'false',
+        deviceId              => $deviceId,
+        deviceLat             => $regionData->{lat},
+        deviceLon             => $regionData->{lon},
+        deviceMake            => $deviceMake,
+        deviceModel           => $deviceModel,
+        deviceType            => $deviceType,
+        deviceVersion         => $deviceVersion,
+        marketingRegion       => $region,
+        serverSideAds         => 'false',
+        sessionID             => $sid,
+        sid                   => $sid,
+        userId                => '',
+        jwt                   => $jwt,
+        masterJWTPassthrough  => 'true',
+        includeExtendedEvents => 'true',
+        eventVOD              => 'false',
+        profilesFromStream    => 'true',
+    );
+
     return buildQueryString(%pairs);
 }
 
@@ -367,40 +397,7 @@ sub resolvePlaylistUrlPreserveQuery {
     my ($baseUrl, $value) = @_;
     return undef unless defined $value && length $value;
     return $value if $value =~ m{^data:}i;
-
-    my $isAbsolute = ($value =~ m{^https?://}i) ? 1 : 0;
-    my $hasOwnQuery = (index($value, '?') >= 0) ? 1 : 0;
-
-    my $resolved = resolvePlaylistUrl($baseUrl, $value);
-    return $resolved unless defined $resolved && length $resolved;
-
-    # Pluto liefert inzwischen bei Child-Playlists und vielen Media-URLs bereits
-    # vollständige, signierte URLs samt Query. Diese dürfen nicht nochmals mit der
-    # Parent-Query angereichert werden, sonst werden signierte Media-URLs ungültig.
-    return $resolved if $isAbsolute || $hasOwnQuery;
-
-    my ($baseQuery) = $baseUrl =~ /\?(.+)$/;
-    return $resolved unless defined $baseQuery && length $baseQuery;
-
-    # Parent-Query nur für relative Referenzen ohne eigene Query anfügen.
-    # Das ist vor allem für relative Child-Playlists und relative KEY/MAP-URIs nötig.
-    my $shouldMerge = (
-        $resolved =~ m{/v2?/stitch/}i ||
-            $resolved =~ /\.m3u8(?:$|[?#])/i ||
-            $resolved =~ /\/(?:audio|video|subtitle|subs)\//i
-    );
-    return $resolved unless $shouldMerge;
-
-    my ($resolvedBase, $resolvedQuery) = split /\?/, $resolved, 2;
-    my %merged = parseQueryString($baseQuery);
-    my %child  = parseQueryString($resolvedQuery || '');
-
-    for my $key (keys %child) {
-        $merged{$key} = $child{$key};
-    }
-
-    my $query = buildQueryString(%merged);
-    return $query ? ($resolvedBase . '?' . $query) : $resolvedBase;
+    return URI->new_abs($value, $baseUrl)->as_string;
 }
 
 sub rewriteManifestAttributeLine {
@@ -476,7 +473,7 @@ sub getChannelJson {
 }
 
 sub buildDirectMasterUrl {
-    my ($bootJson, $channelOrId) = @_;
+    my ($bootJson, $channelOrId, $region) = @_;
     return undef unless $bootJson && $bootJson->{servers} && $bootJson->{servers}->{stitcher};
     my $channelId;
     my $stitchedPath;
@@ -492,12 +489,57 @@ sub buildDirectMasterUrl {
     my $url = $stitchedPath =~ m{^https?://}
         ? $stitchedPath
         : $bootJson->{servers}->{stitcher} . $stitchedPath;
-    my $query = buildStitchQuery($bootJson);
+    my $query = buildStitchQuery($bootJson, $region);
     if ($query) {
         $url .= ($url =~ /\?/) ? '&' : '?';
         $url .= $query;
     }
     return $url;
+}
+
+sub buildMasterUrlCandidates {
+    my ($bootJson, $channel, $channelId, $region) = @_;
+    my @candidates;
+
+    push @candidates, $master_url_cache{$channelId} if $master_url_cache{$channelId};
+
+    if ($channel) {
+        my $direct = buildDirectMasterUrl($bootJson, $channel, $region);
+        push @candidates, $direct if $direct;
+
+        if (($channel->{stitchedPath} || '') =~ m{/channel/([^/]+)/master\.m3u8$}) {
+            my $id_in_path = $1;
+            my $live_path = $channel->{stitchedPath};
+            $live_path =~ s{/channel/[^/]+/master\.m3u8$}{/channel/${id_in_path}livestitch/master.m3u8};
+            my $live = buildDirectMasterUrl($bootJson, { %$channel, stitchedPath => $live_path }, $region);
+            push @candidates, $live if $live;
+        }
+    }
+
+    my $fallback = buildDirectMasterUrl($bootJson, $channelId, $region);
+    push @candidates, $fallback if $fallback;
+
+    my $live_fallback = buildDirectMasterUrl(
+        $bootJson,
+        { id => $channelId, stitchedPath => "/stitch/hls/channel/${channelId}livestitch/master.m3u8" },
+        $region,
+    );
+    push @candidates, $live_fallback if $live_fallback;
+
+    my %seen;
+    return grep { defined $_ && length $_ && !$seen{$_}++ } @candidates;
+}
+
+sub fetchMasterPlaylistForChannel {
+    my ($bootJson, $channel, $channelId, $region) = @_;
+    my @candidates = buildMasterUrlCandidates($bootJson, $channel, $channelId, $region);
+    for my $masterUrl (@candidates) {
+        my $master = getFromUrl($masterUrl, token => $bootJson->{sessionToken});
+        next unless $master;
+        $master_url_cache{$channelId} = $masterUrl;
+        return ($masterUrl, $master);
+    }
+    return;
 }
 
 sub getChannelById {
@@ -515,10 +557,8 @@ sub getMasterPlaylistForChannel {
     my $bootJson = getBootFromPluto($region, $forceRefresh);
     return unless $bootJson && $bootJson->{servers};
     my $channel = getChannelById($channelId, $region);
-    my $masterUrl = buildDirectMasterUrl($bootJson, $channel || $channelId);
-    return unless $masterUrl;
-    my $master = getFromUrl($masterUrl, token => $bootJson->{sessionToken});
-    return unless $master;
+    my ($masterUrl, $master) = fetchMasterPlaylistForChannel($bootJson, $channel, $channelId, $region);
+    return unless $masterUrl && $master;
     return ($bootJson, $channel, $masterUrl, $master);
 }
 
@@ -1011,7 +1051,9 @@ sub sendDynamicStream {
 }
 sub extractBestPlaylistUrl {
     my ($masterPlaylist, $baseUrl, $channelId, $masterUrl) = @_;
-    my @lines = split /\r?\n/, $masterPlaylist;
+    my @lines = split /
+?
+/, $masterPlaylist;
     my $bestStreamUrl;
     my $bestBandwidth = 0;
     for my $i (0 .. $#lines) {
@@ -1028,11 +1070,8 @@ sub extractBestPlaylistUrl {
         }
     }
     return unless $bestStreamUrl;
-    unless ($bestStreamUrl =~ /^https?:\/\//) {
-        my $resolverBase = $masterUrl || $baseUrl;
-        $bestStreamUrl = resolvePlaylistUrlPreserveQuery($resolverBase, $bestStreamUrl);
-    }
-    return $bestStreamUrl;
+    my $resolverBase = $masterUrl || $baseUrl;
+    return resolvePlaylistUrl($resolverBase, $bestStreamUrl);
 }
 sub streamWithDiscontinuityRestart {
     my ($client, $channelId, $region, $playlistUrl) = @_;
@@ -1158,14 +1197,7 @@ sub resolvePlaylistUrl {
     my ($baseUrl, $value) = @_;
     return undef unless defined $value && length $value;
     return $value if $value =~ m{^(?:https?://|data:)}i;
-
-    my ($schemeHost) = $baseUrl =~ m{^(https?://[^/]+)}i;
-    my ($playlistBase) = $baseUrl =~ m{^(.+)/[^/]+(?:\?.*)?$};
-
-    if ($value =~ m{^/}) {
-        return ($schemeHost || '') . $value;
-    }
-    return ($playlistBase || $baseUrl) . "/" . $value;
+    return URI->new_abs($value, $baseUrl)->as_string;
 }
 
 sub extractSegmentsFromPlaylist {
