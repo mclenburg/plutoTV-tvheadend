@@ -1076,14 +1076,15 @@ sub streamMuxedFromLocalChildStreams {
 
     my @cmd = (
         $ffmpeg, '-loglevel', 'error', '-nostdin',
-        '-thread_queue_size', '256', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
-        '-thread_queue_size', '256', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
+        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
+        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
         '-map', '0:v:0', '-map', '1:a:0',
         '-c', 'copy',
         '-muxdelay', '0', '-muxpreload', '0',
         '-mpegts_flags', '+resend_headers',
         '-avoid_negative_ts', 'make_zero',
-        '-max_interleave_delta', '0',
+        '-flush_packets', '1',
+        '-max_interleave_delta', '1000000',
         '-f', 'mpegts', 'pipe:1'
     );
 
