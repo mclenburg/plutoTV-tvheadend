@@ -33,7 +33,7 @@ my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channe
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $version = "2.3.4-full";
+my $version = "2.3.5";
 my $appName = "web";
 my $appVersion = "9.20.0-89258290264838515e264f5b051b7c1602a58482";
 my $deviceVersion = "148.0.0";
@@ -368,17 +368,26 @@ sub resolvePlaylistUrlPreserveQuery {
     return undef unless defined $value && length $value;
     return $value if $value =~ m{^data:}i;
 
+    my $isAbsolute = ($value =~ m{^https?://}i) ? 1 : 0;
+    my $hasOwnQuery = (index($value, '?') >= 0) ? 1 : 0;
+
     my $resolved = resolvePlaylistUrl($baseUrl, $value);
     return $resolved unless defined $resolved && length $resolved;
+
+    # Pluto liefert inzwischen bei Child-Playlists und vielen Media-URLs bereits
+    # vollständige, signierte URLs samt Query. Diese dürfen nicht nochmals mit der
+    # Parent-Query angereichert werden, sonst werden signierte Media-URLs ungültig.
+    return $resolved if $isAbsolute || $hasOwnQuery;
 
     my ($baseQuery) = $baseUrl =~ /\?(.+)$/;
     return $resolved unless defined $baseQuery && length $baseQuery;
 
+    # Parent-Query nur für relative Referenzen ohne eigene Query anfügen.
+    # Das ist vor allem für relative Child-Playlists und relative KEY/MAP-URIs nötig.
     my $shouldMerge = (
         $resolved =~ m{/v2?/stitch/}i ||
             $resolved =~ /\.m3u8(?:$|[?#])/i ||
-            $resolved =~ /\/(?:audio|video)\//i ||
-            $resolved =~ /\.(?:ts|m4s|mp4)(?:$|[?#])/i
+            $resolved =~ /\/(?:audio|video|subtitle|subs)\//i
     );
     return $resolved unless $shouldMerge;
 
@@ -786,7 +795,7 @@ sub streamPlaylistToHandle {
     my %processedSegments = ();
     my %processedMaps = ();
     my $runningNumber = 1;
-    my $lastRefreshAt = 0;
+    my $lastRefreshAt = $playlistUrl ? time() : 0;
     my $consecutiveFailures = 0;
 
     while (1) {
@@ -824,6 +833,11 @@ sub streamPlaylistToHandle {
         my $playlistInfo = parsePlaylistInfo($playlistContent);
         my @allSegments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$runningNumber);
         my @newSegments = filterNewSegments(\@allSegments, \%processedSegments);
+        if ($debug && @allSegments == 0) {
+            printf("No %s segments found for %s
+Playlist URL: %s
+", ($kind || 'video'), $channelId, ($playlistUrl || ''));
+        }
         if (@newSegments == 0) {
             sleep(1);
             next;
@@ -1045,7 +1059,7 @@ sub streamWithDiscontinuityRestart {
     my %processedSegments = ();
     my %processedMaps = ();
     my $runningNumber = 1;
-    my $lastRefreshAt = 0;
+    my $lastRefreshAt = $playlistUrl ? time() : 0;
     my $consecutiveFailures = 0;
     if ($debug) {
         printf("Starting stream for channel $channelId
@@ -1086,6 +1100,11 @@ sub streamWithDiscontinuityRestart {
         my $playlistInfo = parsePlaylistInfo($playlistContent);
         my @allSegments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$runningNumber);
         my @newSegments = filterNewSegments(\@allSegments, \%processedSegments);
+        if ($debug && @allSegments == 0) {
+            printf("No segments found for channel %s
+Playlist URL: %s
+", $channelId, ($playlistUrl || ''));
+        }
         if (@newSegments == 0) {
             sleep(1);
             next;
