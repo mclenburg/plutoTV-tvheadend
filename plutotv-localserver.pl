@@ -31,7 +31,7 @@ my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channe
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $version = "2.3.1";
+my $version = "2.3.2";
 my $appName = "web";
 my $appVersion = "9.20.0-89258290264838515e264f5b051b7c1602a58482";
 my $deviceVersion = "148.0.0";
@@ -104,6 +104,9 @@ sub createUserAgent {
     $headers->header('DNT'             => '1');
     $headers->header('Sec-GPC'         => '1');
     $headers->header('Connection'      => 'keep-alive');
+    $headers->header('Sec-Fetch-Dest'  => 'empty');
+    $headers->header('Sec-Fetch-Mode'  => 'cors');
+    $headers->header('Sec-Fetch-Site'  => 'same-site');
     if ($opts{token}) {
         $headers->header('Authorization' => 'Bearer ' . $opts{token});
     }
@@ -117,6 +120,13 @@ sub getFromUrl {
     my $ua = $opts{ua} || createUserAgent(%opts);
     my $response = $ua->request($request);
     return $response->is_success ? $response->decoded_content : undef;
+}
+
+sub getResponseFromUrl {
+    my ($url, %opts) = @_;
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = $opts{ua} || createUserAgent(%opts);
+    return $ua->request($request);
 }
 
 sub pickLogoUrl {
@@ -294,12 +304,25 @@ sub resolvePlaylistUrlPreserveQuery {
 
     my ($baseQuery) = $baseUrl =~ /\?(.+)$/;
     return $resolved unless defined $baseQuery && length $baseQuery;
-    return $resolved if $resolved =~ /\?/;
 
-    if ($resolved =~ m{/v2?/stitch/}i || $resolved =~ /\.m3u8(?:$|[?#])/i || $resolved =~ /\/(?:audio|video)\//i) {
-        $resolved .= '?' . $baseQuery;
+    my $shouldMerge = (
+        $resolved =~ m{/v2?/stitch/}i ||
+            $resolved =~ /\.m3u8(?:$|[?#])/i ||
+            $resolved =~ /\/(?:audio|video)\//i ||
+            $resolved =~ /\.(?:ts|m4s|mp4)(?:$|[?#])/i
+    );
+    return $resolved unless $shouldMerge;
+
+    my ($resolvedBase, $resolvedQuery) = split /\?/, $resolved, 2;
+    my %merged = parseQueryString($baseQuery);
+    my %child  = parseQueryString($resolvedQuery || '');
+
+    for my $key (keys %child) {
+        $merged{$key} = $child{$key};
     }
-    return $resolved;
+
+    my $query = buildQueryString(%merged);
+    return $query ? ($resolvedBase . '?' . $query) : $resolvedBase;
 }
 
 sub rewriteManifestAttributeLine {
@@ -758,12 +781,16 @@ sub streamWithDiscontinuityRestart {
             }
         }
 
-        my $playlistContent = getFromUrl($playlistUrl, ua => $ua);
+        my $playlistResponse = getResponseFromUrl($playlistUrl, ua => $ua);
+        my $playlistContent = $playlistResponse && $playlistResponse->is_success
+            ? $playlistResponse->decoded_content
+            : undef;
         unless ($playlistContent) {
             $consecutiveFailures++;
             if ($debug) {
-                printf("Failed to fetch playlist for %s (attempt %d)
-", $channelId, $consecutiveFailures);
+                my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
+                printf("Failed to fetch playlist for %s (attempt %d): %s\nURL: %s
+", $channelId, $consecutiveFailures, $status, $playlistUrl);
             }
             my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
             $playlistUrl = $refreshedPlaylistUrl if $refreshedPlaylistUrl;
