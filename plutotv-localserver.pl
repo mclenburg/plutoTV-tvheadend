@@ -31,7 +31,7 @@ my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channe
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $version = "2.3.2";
+my $version = "2.3.3";
 my $appName = "web";
 my $appVersion = "9.20.0-89258290264838515e264f5b051b7c1602a58482";
 my $deviceVersion = "148.0.0";
@@ -294,6 +294,73 @@ sub buildStitchQuery {
     return buildQueryString(%pairs);
 }
 
+sub parseAttributeList {
+    my ($attrString) = @_;
+    my %attrs;
+    return %attrs unless defined $attrString;
+    while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
+        my ($k, $v) = ($1, $2);
+        $v =~ s/^"//;
+        $v =~ s/"$//;
+        $attrs{$k} = $v;
+    }
+    return %attrs;
+}
+
+sub extractPlaybackUrls {
+    my ($masterPlaylist, $masterUrl) = @_;
+    my @lines = split /
+?
+/, ($masterPlaylist || '');
+    my %audioGroups;
+    my $bestBandwidth = -1;
+    my ($bestVideoUrl, $bestAudioGroup);
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-MEDIA:(.+)$/i) {
+            my %attrs = parseAttributeList($1);
+            next unless (($attrs{'TYPE'} || '') eq 'AUDIO');
+            my $group = $attrs{'GROUP-ID'} || next;
+            my $uri = $attrs{'URI'} || next;
+            my $isDefault = (($attrs{'DEFAULT'} || '') =~ /^YES$/i) ? 1 : 0;
+            my $name = $attrs{'NAME'} || '';
+            my $lang = $attrs{'LANGUAGE'} || '';
+            $audioGroups{$group} ||= [];
+            push @{$audioGroups{$group}}, {
+                uri => resolvePlaylistUrlPreserveQuery($masterUrl, $uri),
+                default => $isDefault,
+                name => $name,
+                language => $lang,
+            };
+        }
+    }
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        next unless $line =~ /^#EXT-X-STREAM-INF:(.+)$/i;
+        my %attrs = parseAttributeList($1);
+        my $bandwidth = int($attrs{'BANDWIDTH'} || 0);
+        next unless $i + 1 <= $#lines;
+        my $urlLine = $lines[$i + 1];
+        next if !defined($urlLine) || $urlLine =~ /^#/ || $urlLine eq '';
+        if ($bandwidth > $bestBandwidth) {
+            $bestBandwidth = $bandwidth;
+            $bestVideoUrl = resolvePlaylistUrlPreserveQuery($masterUrl, $urlLine);
+            $bestAudioGroup = $attrs{'AUDIO'};
+        }
+    }
+
+    my $bestAudioUrl;
+    if ($bestAudioGroup && $audioGroups{$bestAudioGroup} && @{$audioGroups{$bestAudioGroup}}) {
+        my ($default) = grep { $_->{default} } @{$audioGroups{$bestAudioGroup}};
+        $default ||= $audioGroups{$bestAudioGroup}[0];
+        $bestAudioUrl = $default->{uri};
+    }
+
+    return ($bestVideoUrl, $bestAudioUrl, $bestAudioGroup);
+}
+
 sub resolvePlaylistUrlPreserveQuery {
     my ($baseUrl, $value) = @_;
     return undef unless defined $value && length $value;
@@ -452,6 +519,15 @@ sub getPlaylistUrlForChannel {
     my $playlistUrl = extractBestPlaylistUrl($master, $bootJson->{servers}->{stitcher}, $channelId, $masterUrl);
     return unless $playlistUrl;
     return ($bootJson, $channel, $masterUrl, $playlistUrl, $master);
+}
+
+sub getPlaybackUrlsForChannel {
+    my ($channelId, $region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    my ($bootJson, $channel, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, $forceRefresh);
+    return unless $bootJson && $master;
+    my ($videoUrl, $audioUrl, $audioGroup) = extractPlaybackUrls($master, $masterUrl);
+    return ($bootJson, $channel, $masterUrl, $master, $videoUrl, $audioUrl, $audioGroup);
 }
 
 sub buildM3uLegacy {
@@ -693,6 +769,86 @@ sub createDynamicPlaylist {
     return $dynamicPlaylist;
 }
 
+sub buildLocalChildStreamUrl {
+    my ($channelId, $region, $kind) = @_;
+    my $path = ($kind && $kind eq 'audio') ? 'dynamic_audio_stream' : 'dynamic_video_stream';
+    my $url = 'http://' . $hostIp . ':' . $port . '/' . $path . '/' . $channelId . '.ts';
+    $url .= '?region=' . uri_escape_utf8($region) if defined $region && length $region;
+    return $url;
+}
+
+sub streamMuxedFromLocalChildStreams {
+    my ($client, $channelId, $region) = @_;
+    return 0 unless $ffmpeg;
+    my $videoUrl = buildLocalChildStreamUrl($channelId, $region, 'video');
+    my $audioUrl = buildLocalChildStreamUrl($channelId, $region, 'audio');
+
+    eval {
+        $client->write("HTTP/1.1 200 OK
+");
+        $client->write("Content-Type: video/mp2t
+");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate
+");
+        $client->write("Connection: close
+
+");
+    };
+    if ($@) {
+        printf("Failed to send headers - client disconnected: %s\n", $@);
+        return 0;
+    }
+
+    my @cmd = (
+        $ffmpeg, '-loglevel', 'error', '-nostdin',
+        '-thread_queue_size', '512', '-i', $videoUrl,
+        '-thread_queue_size', '512', '-i', $audioUrl,
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c', 'copy', '-mpegts_copyts', '1',
+        '-f', 'mpegts', 'pipe:1'
+    );
+
+    if ($debug) {
+        printf("Muxing separate video/audio for %s using ffmpeg\n", $channelId);
+    }
+
+    open(my $ffh, '-|', @cmd) or do {
+        warn "Failed to start ffmpeg for muxing: $!\n";
+        return 0;
+    };
+    binmode($ffh);
+    my $buffer = '';
+    while (1) {
+        my $read = sysread($ffh, $buffer, 1316);
+        last unless defined $read && $read > 0;
+        my $ok = eval { $client->write($buffer); 1 };
+        last unless $ok;
+    }
+    close($ffh);
+    return 1;
+}
+
+sub sendElementaryDynamicStream {
+    my ($client, $request, $kind) = @_;
+    my $path = $request->uri->path;
+    my ($channelId) = $path =~ m{/dynamic_(?:video|audio)_stream/([^/]+)\.ts$};
+    unless ($channelId) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
+        return;
+    }
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+
+    my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
+    my $playlistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
+    unless ($playlistUrl) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
+        return;
+    }
+    streamWithDiscontinuityRestart($client, $channelId . '-' . ($kind || 'video'), $region, $playlistUrl);
+}
+
 sub sendDynamicStream {
     my ($client, $request) = @_;
     my $path = $request->uri->path;
@@ -705,12 +861,18 @@ sub sendDynamicStream {
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
-    my (undef, undef, undef, $playlistUrl) = getPlaylistUrlForChannel($channelId, $region);
-    unless ($playlistUrl) {
+    my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
+    unless ($videoUrl) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
         return;
     }
-    streamWithDiscontinuityRestart($client, $channelId, $region, $playlistUrl);
+
+    if ($audioUrl && $ffmpeg) {
+        streamMuxedFromLocalChildStreams($client, $channelId, $region);
+        return;
+    }
+
+    streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
 }
 sub extractBestPlaylistUrl {
     my ($masterPlaylist, $baseUrl, $channelId, $masterUrl) = @_;
@@ -1331,6 +1493,10 @@ sub processRequest {
         sendXmltvEpgFile($client, $request);
     } elsif ($path =~ m{^/dynamic_stream/}) {
         sendDynamicStream($client, $request);
+    } elsif ($path =~ m{^/dynamic_video_stream/}) {
+        sendElementaryDynamicStream($client, $request, 'video');
+    } elsif ($path =~ m{^/dynamic_audio_stream/}) {
+        sendElementaryDynamicStream($client, $request, 'audio');
     } elsif ($path eq "/") {
         sendHelp($client, $request);
     } else {
