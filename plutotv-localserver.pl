@@ -24,6 +24,8 @@ use Crypt::CBC;
 use IPC::Run qw(run);
 use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
+use File::Temp qw(tempdir);
+use POSIX qw(mkfifo WNOHANG);
 
 my $hostIp = "127.0.0.1";
 my $port = "9000";
@@ -31,7 +33,7 @@ my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channe
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $version = "2.3.1";
+my $version = "2.3.4-full";
 my $appName = "web";
 my $appVersion = "9.20.0-89258290264838515e264f5b051b7c1602a58482";
 my $deviceVersion = "148.0.0";
@@ -104,6 +106,9 @@ sub createUserAgent {
     $headers->header('DNT'             => '1');
     $headers->header('Sec-GPC'         => '1');
     $headers->header('Connection'      => 'keep-alive');
+    $headers->header('Sec-Fetch-Dest'  => 'empty');
+    $headers->header('Sec-Fetch-Mode'  => 'cors');
+    $headers->header('Sec-Fetch-Site'  => 'same-site');
     if ($opts{token}) {
         $headers->header('Authorization' => 'Bearer ' . $opts{token});
     }
@@ -117,6 +122,13 @@ sub getFromUrl {
     my $ua = $opts{ua} || createUserAgent(%opts);
     my $response = $ua->request($request);
     return $response->is_success ? $response->decoded_content : undef;
+}
+
+sub getResponseFromUrl {
+    my ($url, %opts) = @_;
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = $opts{ua} || createUserAgent(%opts);
+    return $ua->request($request);
 }
 
 sub pickLogoUrl {
@@ -284,6 +296,73 @@ sub buildStitchQuery {
     return buildQueryString(%pairs);
 }
 
+sub parseAttributeList {
+    my ($attrString) = @_;
+    my %attrs;
+    return %attrs unless defined $attrString;
+    while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
+        my ($k, $v) = ($1, $2);
+        $v =~ s/^"//;
+        $v =~ s/"$//;
+        $attrs{$k} = $v;
+    }
+    return %attrs;
+}
+
+sub extractPlaybackUrls {
+    my ($masterPlaylist, $masterUrl) = @_;
+    my @lines = split /
+?
+/, ($masterPlaylist || '');
+    my %audioGroups;
+    my $bestBandwidth = -1;
+    my ($bestVideoUrl, $bestAudioGroup);
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-MEDIA:(.+)$/i) {
+            my %attrs = parseAttributeList($1);
+            next unless (($attrs{'TYPE'} || '') eq 'AUDIO');
+            my $group = $attrs{'GROUP-ID'} || next;
+            my $uri = $attrs{'URI'} || next;
+            my $isDefault = (($attrs{'DEFAULT'} || '') =~ /^YES$/i) ? 1 : 0;
+            my $name = $attrs{'NAME'} || '';
+            my $lang = $attrs{'LANGUAGE'} || '';
+            $audioGroups{$group} ||= [];
+            push @{$audioGroups{$group}}, {
+                uri => resolvePlaylistUrlPreserveQuery($masterUrl, $uri),
+                default => $isDefault,
+                name => $name,
+                language => $lang,
+            };
+        }
+    }
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        next unless $line =~ /^#EXT-X-STREAM-INF:(.+)$/i;
+        my %attrs = parseAttributeList($1);
+        my $bandwidth = int($attrs{'BANDWIDTH'} || 0);
+        next unless $i + 1 <= $#lines;
+        my $urlLine = $lines[$i + 1];
+        next if !defined($urlLine) || $urlLine =~ /^#/ || $urlLine eq '';
+        if ($bandwidth > $bestBandwidth) {
+            $bestBandwidth = $bandwidth;
+            $bestVideoUrl = resolvePlaylistUrlPreserveQuery($masterUrl, $urlLine);
+            $bestAudioGroup = $attrs{'AUDIO'};
+        }
+    }
+
+    my $bestAudioUrl;
+    if ($bestAudioGroup && $audioGroups{$bestAudioGroup} && @{$audioGroups{$bestAudioGroup}}) {
+        my ($default) = grep { $_->{default} } @{$audioGroups{$bestAudioGroup}};
+        $default ||= $audioGroups{$bestAudioGroup}[0];
+        $bestAudioUrl = $default->{uri};
+    }
+
+    return ($bestVideoUrl, $bestAudioUrl, $bestAudioGroup);
+}
+
 sub resolvePlaylistUrlPreserveQuery {
     my ($baseUrl, $value) = @_;
     return undef unless defined $value && length $value;
@@ -294,12 +373,25 @@ sub resolvePlaylistUrlPreserveQuery {
 
     my ($baseQuery) = $baseUrl =~ /\?(.+)$/;
     return $resolved unless defined $baseQuery && length $baseQuery;
-    return $resolved if $resolved =~ /\?/;
 
-    if ($resolved =~ m{/v2?/stitch/}i || $resolved =~ /\.m3u8(?:$|[?#])/i || $resolved =~ /\/(?:audio|video)\//i) {
-        $resolved .= '?' . $baseQuery;
+    my $shouldMerge = (
+        $resolved =~ m{/v2?/stitch/}i ||
+            $resolved =~ /\.m3u8(?:$|[?#])/i ||
+            $resolved =~ /\/(?:audio|video)\//i ||
+            $resolved =~ /\.(?:ts|m4s|mp4)(?:$|[?#])/i
+    );
+    return $resolved unless $shouldMerge;
+
+    my ($resolvedBase, $resolvedQuery) = split /\?/, $resolved, 2;
+    my %merged = parseQueryString($baseQuery);
+    my %child  = parseQueryString($resolvedQuery || '');
+
+    for my $key (keys %child) {
+        $merged{$key} = $child{$key};
     }
-    return $resolved;
+
+    my $query = buildQueryString(%merged);
+    return $query ? ($resolvedBase . '?' . $query) : $resolvedBase;
 }
 
 sub rewriteManifestAttributeLine {
@@ -429,6 +521,15 @@ sub getPlaylistUrlForChannel {
     my $playlistUrl = extractBestPlaylistUrl($master, $bootJson->{servers}->{stitcher}, $channelId, $masterUrl);
     return unless $playlistUrl;
     return ($bootJson, $channel, $masterUrl, $playlistUrl, $master);
+}
+
+sub getPlaybackUrlsForChannel {
+    my ($channelId, $region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    my ($bootJson, $channel, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, $forceRefresh);
+    return unless $bootJson && $master;
+    my ($videoUrl, $audioUrl, $audioGroup) = extractPlaybackUrls($master, $masterUrl);
+    return ($bootJson, $channel, $masterUrl, $master, $videoUrl, $audioUrl, $audioGroup);
 }
 
 sub buildM3uLegacy {
@@ -670,6 +771,205 @@ sub createDynamicPlaylist {
     return $dynamicPlaylist;
 }
 
+sub buildLocalChildStreamUrl {
+    my ($channelId, $region, $kind) = @_;
+    my $path = ($kind && $kind eq 'audio') ? 'dynamic_audio_stream' : 'dynamic_video_stream';
+    my $url = 'http://' . $hostIp . ':' . $port . '/' . $path . '/' . $channelId . '.ts';
+    $url .= '?region=' . uri_escape_utf8($region) if defined $region && length $region;
+    return $url;
+}
+
+sub streamPlaylistToHandle {
+    my ($fh, $channelId, $region, $playlistUrl, $kind) = @_;
+    $region ||= 'DE';
+    my $ua = createUserAgent();
+    my %processedSegments = ();
+    my %processedMaps = ();
+    my $runningNumber = 1;
+    my $lastRefreshAt = 0;
+    my $consecutiveFailures = 0;
+
+    while (1) {
+        if (!$playlistUrl || (time() - $lastRefreshAt) >= $sessionRefreshInterval) {
+            my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
+            my $refreshedPlaylistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
+            if ($refreshedPlaylistUrl) {
+                $playlistUrl = $refreshedPlaylistUrl;
+                $lastRefreshAt = time();
+                if ($debug) {
+                    printf("Refreshed %s session/playlist for %s\n", ($kind || 'video'), $channelId);
+                }
+            }
+        }
+
+        my $playlistResponse = getResponseFromUrl($playlistUrl, ua => $ua);
+        my $playlistContent = $playlistResponse && $playlistResponse->is_success
+            ? $playlistResponse->decoded_content
+            : undef;
+        unless ($playlistContent) {
+            $consecutiveFailures++;
+            if ($debug) {
+                my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
+                printf("Failed to fetch %s playlist for %s (attempt %d): %s\nURL: %s\n", ($kind || 'video'), $channelId, $consecutiveFailures, $status, ($playlistUrl || ''));
+            }
+            my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
+            my $refreshedPlaylistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
+            $playlistUrl = $refreshedPlaylistUrl if $refreshedPlaylistUrl;
+            last if $consecutiveFailures >= 5;
+            sleep(1);
+            next;
+        }
+        $consecutiveFailures = 0;
+
+        my $playlistInfo = parsePlaylistInfo($playlistContent);
+        my @allSegments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$runningNumber);
+        my @newSegments = filterNewSegments(\@allSegments, \%processedSegments);
+        if (@newSegments == 0) {
+            sleep(1);
+            next;
+        }
+        if ($debug) {
+            printf("Processing %d new %s segments for channel %s\n", scalar(@newSegments), ($kind || 'video'), $channelId);
+        }
+        my $streamOk = 1;
+        for my $segment (@newSegments) {
+            my $success = streamSegment($fh, $ua, $segment, $channelId . '-' . ($kind || 'video'), \%processedMaps);
+            unless ($success) {
+                $streamOk = 0;
+                if ($debug) {
+                    printf("Failed to stream %s segment, ending stream for %s\n", ($kind || 'video'), $channelId);
+                }
+                last;
+            }
+            $processedSegments{$segment->{url}} = time();
+            $processedMaps{$segment->{mapUrl}} = 1 if $segment->{mapUrl};
+        }
+        last unless $streamOk;
+        cleanupOldSegments(\%processedSegments);
+        sleep(2);
+    }
+
+    return 1;
+}
+
+sub streamMuxedFromLocalChildStreams {
+    my ($client, $channelId, $region, $videoUrl, $audioUrl) = @_;
+    return 0 unless $ffmpeg;
+    return 0 unless $videoUrl && $audioUrl;
+
+    my $tmpdir = tempdir('plutotv-mux-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my $videoFifo = "$tmpdir/video.ts";
+    my $audioFifo = "$tmpdir/audio.ts";
+    mkfifo($videoFifo, 0700) or do { warn "Failed to create video fifo: $!
+"; return 0; };
+    mkfifo($audioFifo, 0700) or do { warn "Failed to create audio fifo: $!
+"; unlink $videoFifo; return 0; };
+
+    eval {
+        $client->write("HTTP/1.1 200 OK
+");
+        $client->write("Content-Type: video/mp2t
+");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate
+");
+        $client->write("Connection: close
+
+");
+    };
+    if ($@) {
+        printf("Failed to send headers - client disconnected: %s
+", $@);
+        unlink $videoFifo;
+        unlink $audioFifo;
+        return 0;
+    }
+
+    if ($debug) {
+        printf("Muxing separate video/audio for %s using FIFOs
+", $channelId);
+    }
+
+    my @children;
+    for my $spec (
+        { kind => 'video', fifo => $videoFifo, url => $videoUrl },
+        { kind => 'audio', fifo => $audioFifo, url => $audioUrl },
+    ) {
+        my $pid = fork();
+        if (!defined $pid) {
+            warn "Failed to fork $spec->{kind} worker: $!
+";
+            next;
+        }
+        if ($pid == 0) {
+            local $SIG{PIPE} = 'DEFAULT';
+            open(my $fh, '>', $spec->{fifo}) or do { warn "Failed to open $spec->{kind} fifo for writing: $!
+"; exit(1); };
+            binmode($fh);
+            eval { streamPlaylistToHandle($fh, $channelId, $region, $spec->{url}, $spec->{kind}); };
+            close($fh);
+            exit(0);
+        }
+        push @children, $pid;
+    }
+
+    my @cmd = (
+        $ffmpeg, '-loglevel', 'error', '-nostdin',
+        '-thread_queue_size', '512', '-fflags', '+genpts', '-i', $videoFifo,
+        '-thread_queue_size', '512', '-fflags', '+genpts', '-i', $audioFifo,
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c', 'copy', '-mpegts_copyts', '1',
+        '-f', 'mpegts', 'pipe:1'
+    );
+
+    open(my $ffh, '-|', @cmd) or do {
+        warn "Failed to start ffmpeg for muxing: $!
+";
+        for my $pid (@children) { kill 'TERM', $pid if $pid; }
+        unlink $videoFifo;
+        unlink $audioFifo;
+        return 0;
+    };
+    binmode($ffh);
+
+    my $buffer = '';
+    while (1) {
+        my $read = sysread($ffh, $buffer, 1316);
+        last unless defined $read && $read > 0;
+        my $ok = eval { $client->write($buffer); 1 };
+        last unless $ok;
+    }
+    close($ffh);
+
+    for my $pid (@children) {
+        kill 'TERM', $pid if $pid;
+        waitpid($pid, 0);
+    }
+    unlink $videoFifo if -p $videoFifo || -e $videoFifo;
+    unlink $audioFifo if -p $audioFifo || -e $audioFifo;
+    return 1;
+}
+
+sub sendElementaryDynamicStream {
+    my ($client, $request, $kind) = @_;
+    my $path = $request->uri->path;
+    my ($channelId) = $path =~ m{/dynamic_(?:video|audio)_stream/([^/]+)\.ts$};
+    unless ($channelId) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
+        return;
+    }
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+
+    my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
+    my $playlistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
+    unless ($playlistUrl) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
+        return;
+    }
+    streamWithDiscontinuityRestart($client, $channelId . '-' . ($kind || 'video'), $region, $playlistUrl);
+}
+
 sub sendDynamicStream {
     my ($client, $request) = @_;
     my $path = $request->uri->path;
@@ -682,12 +982,18 @@ sub sendDynamicStream {
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
-    my (undef, undef, undef, $playlistUrl) = getPlaylistUrlForChannel($channelId, $region);
-    unless ($playlistUrl) {
+    my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
+    unless ($videoUrl) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
         return;
     }
-    streamWithDiscontinuityRestart($client, $channelId, $region, $playlistUrl);
+
+    if ($audioUrl && $ffmpeg) {
+        streamMuxedFromLocalChildStreams($client, $channelId, $region, $videoUrl, $audioUrl);
+        return;
+    }
+
+    streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
 }
 sub extractBestPlaylistUrl {
     my ($masterPlaylist, $baseUrl, $channelId, $masterUrl) = @_;
@@ -758,12 +1064,16 @@ sub streamWithDiscontinuityRestart {
             }
         }
 
-        my $playlistContent = getFromUrl($playlistUrl, ua => $ua);
+        my $playlistResponse = getResponseFromUrl($playlistUrl, ua => $ua);
+        my $playlistContent = $playlistResponse && $playlistResponse->is_success
+            ? $playlistResponse->decoded_content
+            : undef;
         unless ($playlistContent) {
             $consecutiveFailures++;
             if ($debug) {
-                printf("Failed to fetch playlist for %s (attempt %d)
-", $channelId, $consecutiveFailures);
+                my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
+                printf("Failed to fetch playlist for %s (attempt %d): %s\nURL: %s
+", $channelId, $consecutiveFailures, $status, $playlistUrl);
             }
             my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
             $playlistUrl = $refreshedPlaylistUrl if $refreshedPlaylistUrl;
@@ -1304,6 +1614,10 @@ sub processRequest {
         sendXmltvEpgFile($client, $request);
     } elsif ($path =~ m{^/dynamic_stream/}) {
         sendDynamicStream($client, $request);
+    } elsif ($path =~ m{^/dynamic_video_stream/}) {
+        sendElementaryDynamicStream($client, $request, 'video');
+    } elsif ($path =~ m{^/dynamic_audio_stream/}) {
+        sendElementaryDynamicStream($client, $request, 'audio');
     } elsif ($path eq "/") {
         sendHelp($client, $request);
     } else {
