@@ -907,6 +907,18 @@ sub buildLocalChildStreamUrl {
     return $url;
 }
 
+sub resetStreamState {
+    my ($streamKey, $processedSegmentsRef, $processedMapsRef, %opts) = @_;
+    %{$processedSegmentsRef || {}} = ();
+    %{$processedMapsRef || {}} = ();
+    delete $channel_timestamps{$streamKey} if defined $streamKey;
+    if ($debug) {
+        my $reason = $opts{reason} || 'reset';
+        printf("Reset stream state for %s (%s)\n", ($streamKey || 'unknown'), $reason);
+    }
+    return 1;
+}
+
 sub streamPlaylistToHandle {
     my ($fh, $channelId, $region, $playlistUrl, $kind) = @_;
     $region ||= 'DE';
@@ -925,7 +937,8 @@ sub streamPlaylistToHandle {
                 $playlistUrl = $refreshedPlaylistUrl;
                 $lastRefreshAt = time();
                 if ($debug) {
-                    printf("Refreshed %s session/playlist for %s\n", ($kind || 'video'), $channelId);
+                    printf("Refreshed %s session/playlist for %s
+", ($kind || 'video'), $channelId);
                 }
             }
         }
@@ -938,7 +951,9 @@ sub streamPlaylistToHandle {
             $consecutiveFailures++;
             if ($debug) {
                 my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
-                printf("Failed to fetch %s playlist for %s (attempt %d): %s\nURL: %s\n", ($kind || 'video'), $channelId, $consecutiveFailures, $status, ($playlistUrl || ''));
+                printf("Failed to fetch %s playlist for %s (attempt %d): %s
+URL: %s
+", ($kind || 'video'), $channelId, $consecutiveFailures, $status, ($playlistUrl || ''));
             }
             my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
             my $refreshedPlaylistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
@@ -962,22 +977,29 @@ Playlist URL: %s
             next;
         }
         if ($debug) {
-            printf("Processing %d new %s segments for channel %s\n", scalar(@newSegments), ($kind || 'video'), $channelId);
+            printf("Processing %d new %s segments for channel %s
+", scalar(@newSegments), ($kind || 'video'), $channelId);
         }
         my $streamOk = 1;
+        my $streamKey = $channelId . '-' . ($kind || 'video');
         for my $segment (@newSegments) {
-            my $success = streamSegment($fh, $ua, $segment, $channelId . '-' . ($kind || 'video'), \%processedMaps);
-            unless ($success) {
-                if ($segment->{isDiscontinuity}) {
-                    if ($debug) {
-                        printf("Failed to stream %s discontinuity segment, refreshing playlist for %s\n", ($kind || 'video'), $channelId);
-                    }
-                    $lastRefreshAt = 0;
-                    next;
+            if ($segment->{isDiscontinuity}) {
+                resetStreamState($streamKey, \%processedSegments, \%processedMaps,
+                    reason => (($kind || 'video') . ' discontinuity'));
+                $lastRefreshAt = 0;
+                if ($debug) {
+                    printf("Skipping first %s segment after discontinuity for %s
+", ($kind || 'video'), $channelId);
                 }
+                next;
+            }
+
+            my $success = streamSegment($fh, $ua, $segment, $streamKey, \%processedMaps);
+            unless ($success) {
                 $streamOk = 0;
                 if ($debug) {
-                    printf("Failed to stream %s segment, ending stream for %s\n", ($kind || 'video'), $channelId);
+                    printf("Failed to stream %s segment, ending stream for %s
+", ($kind || 'video'), $channelId);
                 }
                 last;
             }
@@ -1054,10 +1076,14 @@ sub streamMuxedFromLocalChildStreams {
 
     my @cmd = (
         $ffmpeg, '-loglevel', 'error', '-nostdin',
-        '-thread_queue_size', '512', '-fflags', '+genpts', '-i', $videoFifo,
-        '-thread_queue_size', '512', '-fflags', '+genpts', '-i', $audioFifo,
+        '-thread_queue_size', '256', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
+        '-thread_queue_size', '256', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
         '-map', '0:v:0', '-map', '1:a:0',
-        '-c', 'copy', '-mpegts_copyts', '1',
+        '-c', 'copy',
+        '-muxdelay', '0', '-muxpreload', '0',
+        '-mpegts_flags', '+resend_headers',
+        '-avoid_negative_ts', 'make_zero',
+        '-max_interleave_delta', '0',
         '-f', 'mpegts', 'pipe:1'
     );
 
@@ -1211,7 +1237,8 @@ sub streamWithDiscontinuityRestart {
             $consecutiveFailures++;
             if ($debug) {
                 my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
-                printf("Failed to fetch playlist for %s (attempt %d): %s\nURL: %s
+                printf("Failed to fetch playlist for %s (attempt %d): %s
+URL: %s
 ", $channelId, $consecutiveFailures, $status, $playlistUrl);
             }
             my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
@@ -1240,6 +1267,17 @@ Playlist URL: %s
         }
         my $streamOk = 1;
         for my $segment (@newSegments) {
+            if ($segment->{isDiscontinuity}) {
+                resetStreamState($channelId, \%processedSegments, \%processedMaps,
+                    reason => 'channel discontinuity');
+                $lastRefreshAt = 0;
+                if ($debug) {
+                    printf("Skipping first segment after discontinuity for %s
+", $channelId);
+                }
+                next;
+            }
+
             my $success = streamSegment($client, $ua, $segment, $channelId, \%processedMaps);
             unless ($success) {
                 $streamOk = 0;
