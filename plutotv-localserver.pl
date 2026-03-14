@@ -586,14 +586,30 @@ sub parsePlaylistInfo {
     return \%info;
 }
 
+sub resolvePlaylistUrl {
+    my ($baseUrl, $value) = @_;
+    return undef unless defined $value && length $value;
+    return $value if $value =~ m{^https?://}i;
+
+    my ($schemeHost) = $baseUrl =~ m{^(https?://[^/]+)}i;
+    my ($playlistBase) = $baseUrl =~ m{^(.+)/[^/]+(?:\?.*)?$};
+
+    if ($value =~ m{^/}) {
+        return ($schemeHost || '') . $value;
+    }
+    return ($playlistBase || $baseUrl) . "/" . $value;
+}
+
 sub extractSegmentsFromPlaylist {
     my ($playlistContent, $baseUrl, $playlistInfo, $runningNumberRef) = @_;
-    my @lines = split /\r?\n/, $playlistContent;
+    my @lines = split /
+?
+/, $playlistContent;
     my @segments = ();
     my %currentSegment;
     my $sequenceNumber = $playlistInfo->{mediaSequence} || 0;
-    my ($playlistBase) = $baseUrl =~ m{^(.+)/[^/]+$};
     my $inDiscontinuityBlock = 0;
+    my %currentKey = (method => 'NONE');
 
     $$runningNumberRef = 1;
 
@@ -601,28 +617,45 @@ sub extractSegmentsFromPlaylist {
         if ($line =~ /^#EXT-X-DISCONTINUITY$/) {
             $inDiscontinuityBlock = 1;
         }
-        elsif ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
-            $currentSegment{keyUri} = $1;
-            unless ($currentSegment{keyUri} =~ m{^https?://}) {
-                $currentSegment{keyUri} = "$playlistBase/$currentSegment{keyUri}";
+        elsif ($line =~ /^#EXT-X-KEY:(.+)$/) {
+            my $attrString = $1;
+            my %attrs;
+            while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
+                my ($k, $v) = ($1, $2);
+                $v =~ s/^"//;
+                $v =~ s/"$//;
+                $attrs{$k} = $v;
             }
-            $currentSegment{iv} = $2;
-            $currentSegment{iv} =~ s/^0x//;
+
+            my $method = $attrs{METHOD} || 'NONE';
+            if ($method eq 'NONE') {
+                %currentKey = (method => 'NONE');
+            } else {
+                %currentKey = (
+                    method => $method,
+                    keyUri => resolvePlaylistUrl($baseUrl, $attrs{URI}),
+                    iv     => $attrs{IV},
+                );
+                $currentKey{iv} =~ s/^0x//i if defined $currentKey{iv};
+            }
         }
         elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
             $currentSegment{duration} = $1;
         }
         elsif ($line !~ /^#/ && $line =~ /\.(?:ts|m4s)(?:\?.*)?$/) {
-            $currentSegment{url} = $line;
+            $currentSegment{url} = resolvePlaylistUrl($baseUrl, $line);
             $currentSegment{sequence} = $sequenceNumber;
             $currentSegment{running} = $$runningNumberRef;
             $currentSegment{isDiscontinuity} = $inDiscontinuityBlock;
-            unless ($currentSegment{url} =~ /^https?:\/\//) {
-                $currentSegment{url} = "$playlistBase/$currentSegment{url}";
+
+            if (($currentKey{method} || 'NONE') eq 'AES-128' && $currentKey{keyUri}) {
+                $currentSegment{keyUri} = $currentKey{keyUri};
+                $currentSegment{iv} = defined $currentKey{iv} && length $currentKey{iv}
+                    ? $currentKey{iv}
+                    : sprintf('%032x', $sequenceNumber);
             }
-            if (exists $currentSegment{keyUri} && exists $currentSegment{iv}) {
-                push @segments, { %currentSegment };
-            }
+
+            push @segments, { %currentSegment };
             %currentSegment = ();
             $inDiscontinuityBlock = 0;
             $sequenceNumber++;
@@ -657,51 +690,68 @@ sub streamSegment {
         }
         return 0;
     }
-    my $keyRes = $ua->get($segment->{keyUri});
-    unless ($keyRes->is_success) {
-        if ($debug) {
-            printf("Failed to fetch key %s: %s\n", $segment->{keyUri}, $keyRes->status_line);
-        }
-        return 0;
-    }
-    my $encryptionKey = $keyRes->content;
-    if (length($encryptionKey) != 16) {
-        if ($debug) {
-            printf("Invalid key length: %d bytes (expected 16)\n", length($encryptionKey));
-        }
-        return 0;
-    }
-    my $hexKey = unpack('H*', $encryptionKey);
+
     my $chunk = $res->content;
     my $decryptedData;
-    if (which('openssl')) {
-        my $opensslStderr = '';
-        run(
-            [
-                "openssl", "aes-128-cbc", "-d",
-                "-in", "-",
-                "-out", "-",
-                "-K", $hexKey,
-                "-iv", $segment->{iv}
-            ],
-            "<", \$chunk,
-            ">", \$decryptedData,
-            "2>", \$opensslStderr
-        );
-    } else {
-        if ($debug) {
-            printf("Using Crypt::CBC\n");
+
+    if ($segment->{keyUri}) {
+        my $keyRes = $ua->get($segment->{keyUri});
+        unless ($keyRes->is_success) {
+            if ($debug) {
+                printf("Failed to fetch key %s: %s\n", $segment->{keyUri}, $keyRes->status_line);
+            }
+            return 0;
         }
-        my $ivBin = pack 'H*', $segment->{iv};
-        my $cipher = Crypt::CBC->new(
-            -key     => $encryptionKey,
-            -cipher  => 'Rijndael',
-            -iv      => $ivBin,
-            -header  => 'none',
-            -padding => 'standard',
-        );
-        $decryptedData = $cipher->decrypt($chunk);
+        my $encryptionKey = $keyRes->content;
+        if (length($encryptionKey) != 16) {
+            if ($debug) {
+                printf("Invalid key length: %d bytes (expected 16)\n", length($encryptionKey));
+            }
+            return 0;
+        }
+
+        my $iv = $segment->{iv};
+        $iv = sprintf('%032x', $segment->{sequence} || 0) unless defined $iv && length $iv;
+        my $hexKey = unpack('H*', $encryptionKey);
+
+        if (which('openssl')) {
+            my $opensslStderr = '';
+            run(
+                [
+                    "openssl", "aes-128-cbc", "-d",
+                    "-in", "-",
+                    "-out", "-",
+                    "-K", $hexKey,
+                    "-iv", $iv
+                ],
+                "<", \$chunk,
+                ">", \$decryptedData,
+                "2>", \$opensslStderr
+            );
+            if (!defined $decryptedData || !length $decryptedData) {
+                if ($debug && length $opensslStderr) {
+                    printf("OpenSSL decrypt failed for %s: %s\n", $segment->{url}, $opensslStderr);
+                }
+                return 0;
+            }
+        } else {
+            if ($debug) {
+                printf("Using Crypt::CBC\n");
+            }
+            my $ivBin = pack 'H*', $iv;
+            my $cipher = Crypt::CBC->new(
+                -key     => $encryptionKey,
+                -cipher  => 'Rijndael',
+                -iv      => $ivBin,
+                -header  => 'none',
+                -padding => 'standard',
+            );
+            $decryptedData = $cipher->decrypt($chunk);
+        }
+    } else {
+        $decryptedData = $chunk;
     }
+
     if (length($decryptedData) > 0) {
         my $firstByte = unpack('C', substr($decryptedData, 0, 1));
         unless ($firstByte == 0x47) {
