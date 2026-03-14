@@ -671,46 +671,118 @@ sub xmltvTimestampFromIso {
     return undef;
 }
 
-sub buildGuideUrl {
-    my ($region) = @_;
-    my $now = DateTime->now(time_zone => 'UTC');
-    my $stop = $now->clone->add(hours => 6);
-    return 'https://service-channels.clusters.pluto.tv/v2/guide?start=' .
-        uri_escape_utf8($now->strftime('%Y-%m-%dT%H:%M:%SZ')) .
-        '&stop=' .
-        uri_escape_utf8($stop->strftime('%Y-%m-%dT%H:%M:%SZ'));
+sub buildTimelineUrl {
+    my ($startIso, $durationMinutes, $channelIdsRef) = @_;
+    $durationMinutes ||= 240;
+    my @channelIds = grep { defined $_ && length $_ } @{ $channelIdsRef || [] };
+    return undef unless @channelIds;
+    return 'https://service-channels.clusters.pluto.tv/v2/guide/timelines?start=' .
+        uri_escape_utf8($startIso) .
+        '&channelIds=' .
+        join('%2C', map { uri_escape_utf8($_) } @channelIds) .
+        '&duration=' . $durationMinutes;
 }
 
-sub extractGuideChannels {
+sub extractTimelineEntries {
     my ($parsed) = @_;
     return () unless $parsed;
+    return @{ $parsed->{data} } if ref($parsed) eq 'HASH' && ref($parsed->{data}) eq 'ARRAY';
     return @{ $parsed } if ref($parsed) eq 'ARRAY';
-    return @{ $parsed->{channels} } if ref($parsed->{channels}) eq 'ARRAY';
-    return @{ $parsed->{data} } if ref($parsed->{data}) eq 'ARRAY';
-    return @{ $parsed->{guides} } if ref($parsed->{guides}) eq 'ARRAY';
-    return @{ $parsed->{EPG} } if ref($parsed->{EPG}) eq 'ARRAY';
     return ();
 }
 
+sub timelineProgrammeKey {
+    my ($programme) = @_;
+    return '' unless $programme && ref($programme) eq 'HASH';
+    my $episode = $programme->{episode} || {};
+    return join('|',
+        ($programme->{start} || ''),
+        ($programme->{stop} || ''),
+        ($programme->{title} || ''),
+        ($episode->{_id} || $episode->{id} || ''),
+        ($episode->{name} || '')
+    );
+}
+
+sub mergeTimelineBlocks {
+    my (@timelineBlocks) = @_;
+    my %byChannel;
+    for my $entry (@timelineBlocks) {
+        next unless $entry && ref($entry) eq 'HASH';
+        my $channelId = $entry->{channelId} || $entry->{id} || $entry->{_id} || next;
+        $byChannel{$channelId} ||= {
+            channelId => $channelId,
+            channelSlug => ($entry->{channelSlug} || ''),
+            timelines => [],
+        };
+        my %seen = map { timelineProgrammeKey($_) => 1 } @{ $byChannel{$channelId}->{timelines} };
+        for my $programme (@{ $entry->{timelines} || [] }) {
+            next unless $programme && ref($programme) eq 'HASH';
+            my $key = timelineProgrammeKey($programme);
+            next if !$key || $seen{$key};
+            push @{ $byChannel{$channelId}->{timelines} }, $programme;
+            $seen{$key} = 1;
+        }
+        @{ $byChannel{$channelId}->{timelines} } = sort {
+            ($a->{start} || '') cmp ($b->{start} || '')
+        } @{ $byChannel{$channelId}->{timelines} };
+    }
+    return values %byChannel;
+}
+
+sub chunkArray {
+    my ($itemsRef, $chunkSize) = @_;
+    $chunkSize ||= 40;
+    my @chunks;
+    my @items = @{ $itemsRef || [] };
+    while (@items) {
+        push @chunks, [ splice(@items, 0, $chunkSize) ];
+    }
+    return @chunks;
+}
+
 sub getGuideChannelJson {
-    my ($region) = @_;
+    my ($region, $channelsRef) = @_;
     $region ||= 'DE';
     my $boot = getBootFromPluto($region);
     return () unless $boot && $boot->{sessionToken};
-    my $content = getFromUrl(buildGuideUrl($region), token => $boot->{sessionToken});
-    return () unless $content;
-    my $parsed = try { parse_json($content) };
-    return () unless $parsed;
-    my @guideChannels = map { normalizeChannel($_) } extractGuideChannels($parsed);
-    @guideChannels = grep { $_ && ref($_->{timelines}) eq 'ARRAY' } @guideChannels;
-    return @guideChannels;
+
+    my @channels = @{ $channelsRef || [] };
+    return () unless @channels;
+    my @channelIds = map { $_->{id} || $_->{_id} } grep { ($_->{id} || $_->{_id}) } @channels;
+    return () unless @channelIds;
+
+    my $now = DateTime->now(time_zone => 'UTC');
+    $now->set_minute(0);
+    $now->set_second(0);
+    my @windows;
+    for my $offset (0, 240, 480, 720, 960, 1200) {
+        push @windows, $now->clone->add(minutes => $offset);
+    }
+
+    my @timelineBlocks;
+    my @chunks = chunkArray(\@channelIds, 40);
+    for my $windowStart (@windows) {
+        my $startIso = $windowStart->strftime('%Y-%m-%dT%H:%M:%S.000Z');
+        for my $chunk (@chunks) {
+            my $url = buildTimelineUrl($startIso, 240, $chunk);
+            next unless $url;
+            my $content = getFromUrl($url, token => $boot->{sessionToken});
+            next unless $content;
+            my $parsed = try { parse_json($content) };
+            next unless $parsed;
+            push @timelineBlocks, extractTimelineEntries($parsed);
+        }
+    }
+
+    return mergeTimelineBlocks(@timelineBlocks);
 }
 
 sub mergeChannelsWithGuide {
     my ($channelsRef, $guideChannelsRef) = @_;
     my %byId = map { (($_->{id} || $_->{_id}) => { %$_ }) } @{ $channelsRef || [] };
     for my $guide (@{ $guideChannelsRef || [] }) {
-        my $id = $guide->{id} || $guide->{_id} || next;
+        my $id = $guide->{channelId} || $guide->{id} || $guide->{_id} || next;
         my $base = $byId{$id} || {};
         my %merged = (%$base, %$guide);
         $merged{id} = $id;
@@ -734,7 +806,7 @@ sub sendXmltvEpgFile {
         return;
     }
 
-    my @guideChannels = getGuideChannelJson($region);
+    my @guideChannels = getGuideChannelJson($region, \@channels);
     @channels = mergeChannelsWithGuide(\@channels, \@guideChannels) if @guideChannels;
 
     my $langcode = "en";
