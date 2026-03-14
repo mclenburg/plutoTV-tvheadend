@@ -210,7 +210,10 @@ sub getChannelJson {
     my $boot = getBootFromPluto($region);
     my @channels;
 
-    if ($boot && ref($boot->{EPG}) eq 'ARRAY' && @{ $boot->{EPG} }) {
+    # Pluto returns EPG in boot/start, but current responses may contain only the
+    # starting channel instead of the full channel catalog. So only trust EPG when
+    # it contains a plausibly complete list.
+    if ($boot && ref($boot->{EPG}) eq 'ARRAY' && @{ $boot->{EPG} } >= 10) {
         @channels = map { normalizeChannel($_) } @{ $boot->{EPG} };
         @channels = grep { $_ } @channels;
         return @channels if @channels;
