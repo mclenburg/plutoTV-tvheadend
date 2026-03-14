@@ -12,6 +12,7 @@ use HTTP::Request::Params;
 use DateTime;
 use JSON::Parse ':all';
 use HTTP::Request ();
+use HTTP::Headers;
 use LWP::UserAgent;
 use URI::Escape qw(uri_escape_utf8);
 use UUID::Tiny ':std';
@@ -25,11 +26,18 @@ use open qw(:std :utf8);
 
 my $hostIp = "127.0.0.1";
 my $port = "9000";
-my $apiUrl = "http://api.pluto.tv/v2/channels";
+my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channels";
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
-my $version = "2.0.0";
+my $version = "2.1.0";
+my $appName = "web";
+my $appVersion = "9.20.0-89258290264838515e264f5b051b7c1602a58482";
+my $deviceVersion = "148.0.0";
+my $deviceModel = "web";
+my $deviceMake = "firefox";
+my $deviceType = "web";
+my $clientModelNumber = "1.0.0";
 
 my %regions = (
     'DE' => { lat => '52.5200', lon => '13.4050', name => 'Germany' },
@@ -77,80 +85,186 @@ sub sortByRunningNumber {
 }
 
 sub createUserAgent {
-    my $ua = LWP::UserAgent->new(keep_alive => 1);
-    $ua->agent('Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/109.0');
+    my (%opts) = @_;
+    my $ua = LWP::UserAgent->new(keep_alive => 1, timeout => 20);
+    $ua->agent('Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0');
     my $headers = HTTP::Headers->new;
-    $headers->header('Cache-Control' => 'no-cache');
-    $headers->header('Pragma'        => 'no-cache');
+    $headers->header('Cache-Control'   => 'no-cache');
+    $headers->header('Pragma'          => 'no-cache');
+    $headers->header('Accept'          => '*/*');
+    $headers->header('Accept-Language' => 'de,en-US;q=0.9,en;q=0.8');
+    $headers->header('Referer'         => 'https://pluto.tv/');
+    $headers->header('Origin'          => 'https://pluto.tv');
+    $headers->header('DNT'             => '1');
+    $headers->header('Sec-GPC'         => '1');
+    $headers->header('Connection'      => 'keep-alive');
+    if ($opts{token}) {
+        $headers->header('Authorization' => 'Bearer ' . $opts{token});
+    }
     $ua->default_headers($headers);
     return $ua;
 }
 
 sub getFromUrl {
-    my ($url) = @_;
+    my ($url, %opts) = @_;
     my $request = HTTP::Request->new(GET => $url);
-    my $ua = createUserAgent();
+    my $ua = createUserAgent(%opts);
     my $response = $ua->request($request);
     return $response->is_success ? $response->decoded_content : undef;
 }
 
-sub getChannelJson {
+sub pickLogoUrl {
+    my ($channel) = @_;
+    return undef unless $channel;
+    if (ref($channel->{logo}) eq 'HASH' && $channel->{logo}->{path}) {
+        return $channel->{logo}->{path};
+    }
+    my @preferred = qw(logo colorLogoPNG solidLogoPNG colorLogoSVG solidLogoSVG featuredImage hero tileColor tileGrayscale);
+    my %imagesByType = map { ($_->{type} || '') => ($_->{url} || '') } @{ $channel->{images} || [] };
+    for my $type (@preferred) {
+        return $imagesByType{$type} if $imagesByType{$type};
+    }
+    for my $image (@{ $channel->{images} || [] }) {
+        return $image->{url} if $image->{url};
+    }
+    return undef;
+}
+
+sub normalizeChannel {
+    my ($channel) = @_;
+    return undef unless $channel && ref($channel) eq 'HASH';
+    my $id = $channel->{id} || $channel->{_id};
+    return undef unless $id;
+
+    my $stitchedPath;
+    if (ref($channel->{stitched}) eq 'HASH' && ref($channel->{stitched}->{paths}) eq 'ARRAY') {
+        for my $path (@{ $channel->{stitched}->{paths} }) {
+            next unless ref($path) eq 'HASH';
+            if (($path->{type} || '') eq 'hls' && $path->{path}) {
+                $stitchedPath = $path->{path};
+                last;
+            }
+        }
+        unless ($stitchedPath) {
+            for my $path (@{ $channel->{stitched}->{paths} }) {
+                next unless ref($path) eq 'HASH';
+                if ($path->{path}) {
+                    $stitchedPath = $path->{path};
+                    last;
+                }
+            }
+        }
+    }
+
+    return {
+        %{$channel},
+        id           => $id,
+        _id          => $id,
+        name         => $channel->{name} || '',
+        slug         => $channel->{slug} || '',
+        number       => $channel->{number} || 0,
+        logo_url     => pickLogoUrl($channel),
+        stitchedPath => $stitchedPath,
+    };
+}
+
+sub getBootQueryString {
     my ($region) = @_;
     $region ||= 'DE';
-    my $from = DateTime->now();
-    my $to = DateTime->now()->add(days => 2);
-    my $url = "$apiUrl?start=${from}Z&stop=${to}Z";
-    my $content = getFromUrl($url);
-    return () unless $content;
-    my $channels = try { parse_json($content) };
-    return $channels ? @{$channels} : ();
+    my $regionData = $regions{$region} || $regions{'DE'};
+    my $now = DateTime->now(time_zone => 'UTC');
+    my $launchTime = $now->strftime('%Y-%m-%dT%H:%M:%S.000Z');
+    my $clientTime = $now->strftime('%Y-%m-%dT%H:%M:%S.001Z');
+    return join('&',
+        "appName=$appName",
+        "appVersion=$appVersion",
+        "deviceVersion=$deviceVersion",
+        "deviceModel=$deviceModel",
+        "deviceMake=$deviceMake",
+        "deviceType=$deviceType",
+        "clientID=$deviceId",
+        "clientModelNumber=$clientModelNumber",
+        'serverSideAds=false',
+        'drmCapabilities=widevine%3AL3',
+        'blockingMode=',
+        'notificationVersion=1',
+        'appLaunchCount=0',
+        'lastAppLaunchDate=' . uri_escape_utf8($launchTime),
+        'clientTime=' . uri_escape_utf8($clientTime),
+        'deviceLat=' . $regionData->{lat},
+        'deviceLon=' . $regionData->{lon}
+    );
 }
 
 sub getBootFromPluto {
     my ($region) = @_;
     $region ||= 'DE';
-    my $regionData = $regions{$region};
-    unless ($regionData) {
-        warn "Unknown region: $region, using DE as fallback\n";
-        $regionData = $regions{'DE'};
-    }
-    my $url = "https://boot.pluto.tv/v4/start?" . join('&',
-        "deviceId=$deviceId",
-        "deviceMake=Firefox",
-        "deviceType=web",
-        "deviceVersion=109.0",
-        "deviceModel=web",
-        "DNT=1",
-        "appName=web",
-        "appVersion=5.17.0",
-        "clientID=$deviceId",
-        "clientModelNumber=na",
-        "serverSideAds=false",
-        "includeExtendedEvents=false",
-        "deviceLat=$regionData->{lat}",
-        "deviceLon=$regionData->{lon}"
-    );
+    my $url = 'https://boot.pluto.tv/v4/start?' . getBootQueryString($region);
     my $content = getFromUrl($url);
     return unless $content;
-    my $session = try { parse_json($content) };
-    return $session;
+    return try { parse_json($content) };
+}
+
+sub getChannelJson {
+    my ($region) = @_;
+    my $boot = getBootFromPluto($region);
+    my @channels;
+
+    if ($boot && ref($boot->{EPG}) eq 'ARRAY' && @{ $boot->{EPG} }) {
+        @channels = map { normalizeChannel($_) } @{ $boot->{EPG} };
+        @channels = grep { $_ } @channels;
+        return @channels if @channels;
+    }
+
+    return () unless $boot && $boot->{servers} && $boot->{sessionToken};
+    my $url = $channelsApiUrl . '?channelIds=&offset=0&limit=1000&sort=number%3Aasc';
+    my $content = getFromUrl($url, token => $boot->{sessionToken});
+    return () unless $content;
+    my $parsed = try { parse_json($content) };
+    my $items = ref($parsed) eq 'HASH' ? ($parsed->{data} || $parsed->{channels} || []) : [];
+    @channels = map { normalizeChannel($_) } @{ $items || [] };
+    @channels = grep { $_ } @channels;
+    return @channels;
+}
+
+sub buildDirectMasterUrl {
+    my ($bootJson, $channelOrId) = @_;
+    return undef unless $bootJson && $bootJson->{servers} && $bootJson->{servers}->{stitcher};
+    my $channelId;
+    my $stitchedPath;
+    if (ref($channelOrId) eq 'HASH') {
+        $channelId = $channelOrId->{id} || $channelOrId->{_id};
+        $stitchedPath = $channelOrId->{stitchedPath};
+    } else {
+        $channelId = $channelOrId;
+    }
+    return undef unless $channelId;
+    $stitchedPath ||= "/stitch/hls/channel/$channelId/master.m3u8";
+    my $url = $stitchedPath =~ m{^https?://}
+        ? $stitchedPath
+        : $bootJson->{servers}->{stitcher} . $stitchedPath;
+    if ($bootJson->{stitcherParams}) {
+        $url .= ($url =~ /\?/) ? '&' : '?';
+        $url .= $bootJson->{stitcherParams};
+    }
+    return $url;
 }
 
 sub buildM3uLegacy {
     my ($session, @channels) = @_;
     my $m3u = "#EXTM3U\n";
+    my $activeRegion = $session && $session->{session} && $session->{session}->{activeRegion}
+        ? lc($session->{session}->{activeRegion}) : 'de';
     for my $channel (@channels) {
-        next unless $channel->{number} > 0 && $channel->{number} != 2000;
-        next unless defined $channel->{logo}->{path};
-        my $logo = $channel->{logo}->{path};
+        next unless ($channel->{number} || 0) > 0 && ($channel->{number} || 0) != 2000;
+        my $logo = $channel->{logo_url} || '';
         my $name = $channel->{name};
         my $number = $channel->{number};
-        my $id = $channel->{_id};
+        my $id = $channel->{id};
         $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . uri_escape_utf8($name) .
             "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
         if ($useStreamlink) {
-            my $url = "https://pluto.tv/" . $session->{session}->{activeRegion} .
-                "/live-tv/" . $channel->{slug};
+            my $url = "https://pluto.tv/$activeRegion/live-tv/" . $channel->{slug};
             $m3u .= "pipe://$streamlink --stdout --quiet --default-stream best " .
                 "--hls-live-restart --url \"$url\"\n";
         } else {
@@ -168,17 +282,28 @@ sub buildM3uDirect {
     my (@channels) = @_;
     my $m3u = "#EXTM3U\n";
     for my $channel (@channels) {
-        next unless $channel->{number} > 0 && $channel->{number} != 2000;
-        next unless defined $channel->{logo}->{path};
-        my $logo = $channel->{logo}->{path};
+        next unless ($channel->{number} || 0) > 0 && ($channel->{number} || 0) != 2000;
+        my $logo = $channel->{logo_url} || '';
         my $name = $channel->{name};
         my $number = $channel->{number};
-        my $id = $channel->{_id};
+        my $id = $channel->{id};
         $m3u .= "#EXTINF:-1 tvg-chno=\"$number\" tvg-id=\"" . uri_escape_utf8($name) .
             "\" tvg-name=\"$name\" tvg-logo=\"$logo\" group-title=\"PlutoTV\",$name\n";
         $m3u .= "http://$hostIp:$port/stream/$id.m3u8\n";
     }
     return $m3u;
+}
+
+sub sendMasterAlias {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = $params && $params->{id} ? $params->{id} : undef;
+    unless ($channelId) {
+        $client->send_error(RC_BAD_REQUEST, "Missing id parameter");
+        return;
+    }
+    my $fakeRequest = HTTP::Request->new(GET => "/stream/$channelId.m3u8");
+    sendDirectStream($client, $fakeRequest);
 }
 
 sub sendHelp {
@@ -190,6 +315,7 @@ sub sendHelp {
         "\t/playlist?region=REGION\tfor full m3u8-file (legacy pipes)\n" .
         "\t/tvheadend?region=REGION\tfor direct streams (tvheadend optimized)\n" .
         "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
+        "\t/master3u8?id=ID\tlegacy alias for ffmpeg pipe input\n" .
         "\t/epg\t\tfor xmltv-epg-file\n\n" .
         "Available regions: " . join(", ", sort keys %regions) . "\n" .
         "Example: /tvheadend?region=US\n");
@@ -206,20 +332,19 @@ sub sendXmltvEpgFile {
     my $langcode = "en";
     my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
     for my $channel (@channels) {
-        next unless $channel->{number} > 0;
+        next unless ($channel->{number} || 0) > 0;
         my $channelName = $channel->{name};
         my $channelId = uri_escape_utf8($channelName);
         $epg .= "<channel id=\"$channelId\">\n";
         $epg .= "<display-name lang=\"$langcode\"><![CDATA[$channelName]]></display-name>\n";
-        if (my $logo = $channel->{logo}) {
-            my $logoPath = $logo->{path};
+        if (my $logoPath = $channel->{logo_url}) {
             $logoPath = substr($logoPath, 0, index($logoPath, "?")) if index($logoPath, "?") >= 0;
             $epg .= "<icon src=\"$logoPath\" />\n";
         }
         $epg .= "</channel>\n";
     }
     for my $channel (@channels) {
-        next unless $channel->{number} > 0;
+        next unless ($channel->{number} || 0) > 0;
         my $channelId = uri_escape_utf8($channel->{name});
         for my $programme (@{$channel->{timelines} || []}) {
             my ($start, $stop) = ($programme->{start}, $programme->{stop});
@@ -281,14 +406,14 @@ sub sendDirectStream {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to get session data");
         return;
     }
-    my $baseUrl = $bootJson->{servers}->{stitcher};
-    my $url = "$baseUrl/stitch/hls/channel/$channelId/master.m3u8?" . $bootJson->{stitcherParams};
+    my ($channel) = grep { ($_->{id} || '') eq $channelId } getChannelJson();
+    my $url = buildDirectMasterUrl($bootJson, $channel || $channelId);
     my $master = getFromUrl($url);
     unless ($master) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
         return;
     }
-    my $dynamicM3u = createDynamicPlaylist($master, $channelId, $baseUrl);
+    my $dynamicM3u = createDynamicPlaylist($master, $channelId, $bootJson->{servers}->{stitcher});
     my $response = HTTP::Response->new();
     $response->code(200);
     $response->message("OK");
@@ -318,9 +443,7 @@ sub createDynamicPlaylist {
             }
         }
     }
-    unless ($bestStreamUrl) {
-        return $masterPlaylist;
-    }
+    return $masterPlaylist unless $bestStreamUrl;
     unless ($bestStreamUrl =~ /^https?:\/\//) {
         $bestStreamUrl = "$baseUrl/stitch/hls/channel/$channelId/$bestStreamUrl";
     }
@@ -348,14 +471,14 @@ sub sendDynamicStream {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to get session data");
         return;
     }
-    my $baseUrl = $bootJson->{servers}->{stitcher};
-    my $masterUrl = "$baseUrl/stitch/hls/channel/$channelId/master.m3u8?" . $bootJson->{stitcherParams};
+    my ($channel) = grep { ($_->{id} || '') eq $channelId } getChannelJson();
+    my $masterUrl = buildDirectMasterUrl($bootJson, $channel || $channelId);
     my $master = getFromUrl($masterUrl);
     unless ($master) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch master playlist");
         return;
     }
-    my $playlistUrl = extractBestPlaylistUrl($master, $baseUrl, $channelId);
+    my $playlistUrl = extractBestPlaylistUrl($master, $bootJson->{servers}->{stitcher}, $channelId);
     unless ($playlistUrl) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to find playlist URL");
         return;
@@ -480,14 +603,17 @@ sub extractSegmentsFromPlaylist {
         }
         elsif ($line =~ /^#EXT-X-KEY:METHOD=AES-128,URI="(.+?)",IV=(.+?)$/) {
             $currentSegment{keyUri} = $1;
+            unless ($currentSegment{keyUri} =~ m{^https?://}) {
+                $currentSegment{keyUri} = "$playlistBase/$currentSegment{keyUri}";
+            }
             $currentSegment{iv} = $2;
             $currentSegment{iv} =~ s/^0x//;
         }
         elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
             $currentSegment{duration} = $1;
         }
-        elsif ($line =~ /^(https?:\/\/.+?\.ts)$/) {
-            $currentSegment{url} = $1;
+        elsif ($line !~ /^#/ && $line =~ /\.(?:ts|m4s)(?:\?.*)?$/) {
+            $currentSegment{url} = $line;
             $currentSegment{sequence} = $sequenceNumber;
             $currentSegment{running} = $$runningNumberRef;
             $currentSegment{isDiscontinuity} = $inDiscontinuityBlock;
@@ -501,7 +627,7 @@ sub extractSegmentsFromPlaylist {
             $inDiscontinuityBlock = 0;
             $sequenceNumber++;
             $$runningNumberRef++;
-            if($$runningNumberRef > 1000000) {
+            if ($$runningNumberRef > 1000000) {
                 $$runningNumberRef = 1;
             }
         }
@@ -670,7 +796,6 @@ sub processTimestampsInPacket {
     my $pos = 4;
     my @header = unpack('C4', substr($packet_data, 0, 4));
     my $payload_start = ($header[1] & 0x40) >> 6;
-    my $pid = (($header[1] & 0x1F) << 8) | $header[2];
     my $adaptation_field = ($header[3] & 0x30) >> 4;
     if ($adaptation_field == 2 || $adaptation_field == 3) {
         my $adaptation_length = unpack('C', substr($packet_data, $pos, 1));
@@ -699,7 +824,7 @@ sub processPcr {
             (($pcr_bytes[4] & 0x80) >> 7);
         $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
 
-        if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated}) {
+        if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated} && defined $ts_info->{last_pcr}) {
             $ts_info->{pcr_offset} = $ts_info->{last_pcr} - $pcr_base;
             $ts_info->{pcr_calculated} = 1;
             $ts_info->{discontinuity_reset} = 0;
@@ -750,18 +875,11 @@ sub correctPts {
         (($pts_bytes[2] & 0xFE) << 14) | ($pts_bytes[3] << 7) |
         (($pts_bytes[4] & 0xFE) >> 1);
 
-    if ($debug) {
-        printf("PTS: original=%d\n", $pts);
-    }
-
     my $corrected_pts = $pts;
     if (defined $ts_info->{pcr_offset}) {
         $corrected_pts = $pts + $ts_info->{pcr_offset};
     }
 
-    if ($debug) {
-        printf("PTS: corrected=%d, offset=%d\n", $corrected_pts, $ts_info->{pcr_offset} // 0);
-    }
     $ts_info->{last_pts} = $corrected_pts;
     $corrected_pts = $corrected_pts & (2**33 - 1);
     $pts_bytes[0] = ($pts_bytes[0] & 0xF1) | (($corrected_pts >> 29) & 0x0E);
@@ -827,6 +945,8 @@ sub processRequest {
         sendM3uFile($client, 1, $request);
     } elsif ($path =~ m{^/stream/}) {
         sendDirectStream($client, $request);
+    } elsif ($path eq "/master3u8") {
+        sendMasterAlias($client, $request);
     } elsif ($path eq "/epg") {
         sendXmltvEpgFile($client, $request);
     } elsif ($path =~ m{^/dynamic_stream/}) {
