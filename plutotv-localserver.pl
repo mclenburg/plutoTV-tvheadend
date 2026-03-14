@@ -662,16 +662,84 @@ sub sendHelp {
     $client->send_response($response);
 }
 
+sub xmltvTimestampFromIso {
+    my ($iso) = @_;
+    return undef unless defined $iso && length $iso;
+    if ($iso =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        return "$1$2$3$4$5$6 +0000";
+    }
+    return undef;
+}
+
+sub buildGuideUrl {
+    my ($region) = @_;
+    my $now = DateTime->now(time_zone => 'UTC');
+    my $stop = $now->clone->add(hours => 6);
+    return 'https://service-channels.clusters.pluto.tv/v2/guide?start=' .
+        uri_escape_utf8($now->strftime('%Y-%m-%dT%H:%M:%SZ')) .
+        '&stop=' .
+        uri_escape_utf8($stop->strftime('%Y-%m-%dT%H:%M:%SZ'));
+}
+
+sub extractGuideChannels {
+    my ($parsed) = @_;
+    return () unless $parsed;
+    return @{ $parsed } if ref($parsed) eq 'ARRAY';
+    return @{ $parsed->{channels} } if ref($parsed->{channels}) eq 'ARRAY';
+    return @{ $parsed->{data} } if ref($parsed->{data}) eq 'ARRAY';
+    return @{ $parsed->{guides} } if ref($parsed->{guides}) eq 'ARRAY';
+    return @{ $parsed->{EPG} } if ref($parsed->{EPG}) eq 'ARRAY';
+    return ();
+}
+
+sub getGuideChannelJson {
+    my ($region) = @_;
+    $region ||= 'DE';
+    my $boot = getBootFromPluto($region);
+    return () unless $boot && $boot->{sessionToken};
+    my $content = getFromUrl(buildGuideUrl($region), token => $boot->{sessionToken});
+    return () unless $content;
+    my $parsed = try { parse_json($content) };
+    return () unless $parsed;
+    my @guideChannels = map { normalizeChannel($_) } extractGuideChannels($parsed);
+    @guideChannels = grep { $_ && ref($_->{timelines}) eq 'ARRAY' } @guideChannels;
+    return @guideChannels;
+}
+
+sub mergeChannelsWithGuide {
+    my ($channelsRef, $guideChannelsRef) = @_;
+    my %byId = map { (($_->{id} || $_->{_id}) => { %$_ }) } @{ $channelsRef || [] };
+    for my $guide (@{ $guideChannelsRef || [] }) {
+        my $id = $guide->{id} || $guide->{_id} || next;
+        my $base = $byId{$id} || {};
+        my %merged = (%$base, %$guide);
+        $merged{id} = $id;
+        $merged{_id} = $id;
+        $merged{timelines} = $guide->{timelines} if ref($guide->{timelines}) eq 'ARRAY';
+        $merged{logo_url} ||= pickLogoUrl(\%merged);
+        $byId{$id} = \%merged;
+    }
+    return values %byId;
+}
+
 sub sendXmltvEpgFile {
     my ($client, $request) = @_;
-    my @channels = getChannelJson();
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+
+    my @channels = getChannelJson($region);
     unless (@channels) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
         return;
     }
+
+    my @guideChannels = getGuideChannelJson($region);
+    @channels = mergeChannelsWithGuide(\@channels, \@guideChannels) if @guideChannels;
+
     my $langcode = "en";
     my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
-    for my $channel (@channels) {
+    for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
         next unless ($channel->{number} || 0) > 0;
         my $channelName = $channel->{name};
         my $channelId = uri_escape_utf8($channelName);
@@ -683,26 +751,37 @@ sub sendXmltvEpgFile {
         }
         $epg .= "</channel>\n";
     }
-    for my $channel (@channels) {
+
+    for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
         next unless ($channel->{number} || 0) > 0;
         my $channelId = uri_escape_utf8($channel->{name});
-        for my $programme (@{$channel->{timelines} || []}) {
-            my ($start, $stop) = ($programme->{start}, $programme->{stop});
+        for my $programme (@{ $channel->{timelines} || [] }) {
+            my $start = xmltvTimestampFromIso($programme->{start});
+            my $stop  = xmltvTimestampFromIso($programme->{stop});
             next unless $start && $stop;
-            $start =~ s/[-:Z\.T]//g;
-            $stop =~ s/[-:Z\.T]//g;
-            $stop = substr($stop, 0, 14);
-            $epg .= "<programme start=\"$start +0000\" stop=\"$stop +0000\" channel=\"$channelId\">\n";
+
             my $episode = $programme->{episode} || {};
-            my $title = $programme->{title};
+            my $title = $programme->{title} || $episode->{name} || $channel->{name} || '';
+            my $subtitle = $episode->{name} || '';
+            my $desc = $episode->{description} || '';
+            my $genre = $episode->{genre} || '';
             my $rating = $episode->{rating} || '';
-            $epg .= "<title lang=\"$langcode\"><![CDATA[$title - $rating]]></title>\n";
-            $epg .= "<desc lang=\"$langcode\"><![CDATA[" . ($episode->{description} || '') . "]]></desc>\n";
+
+            $epg .= "<programme start=\"$start\" stop=\"$stop\" channel=\"$channelId\">\n";
+            $epg .= "<title lang=\"$langcode\"><![CDATA[$title]]></title>\n";
+            $epg .= "<sub-title lang=\"$langcode\"><![CDATA[$subtitle]]></sub-title>\n" if length $subtitle;
+            $epg .= "<desc lang=\"$langcode\"><![CDATA[$desc]]></desc>\n" if length $desc;
+            $epg .= "<category lang=\"$langcode\"><![CDATA[$genre]]></category>\n" if length $genre;
+            if (length $rating) {
+                $epg .= "<rating><value><![CDATA[$rating]]></value></rating>\n";
+            }
             $epg .= "</programme>\n";
         }
     }
-    $epg .= "\n</tv>\n\n\n";
+
+    $epg .= "\n</tv>\n";
     my $response = HTTP::Response->new();
+    $response->header("content-type", "application/xml; charset=utf-8");
     $response->header("content-disposition", "filename=\"plutotv-epg.xml\"");
     $response->code(200);
     $response->message("OK");
