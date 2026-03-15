@@ -31,6 +31,9 @@ use POSIX qw(mkfifo WNOHANG);
 my $hostIp = "127.0.0.1";
 my $port = "9000";
 my $channelsApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/channels";
+my $guideTimelinesApiUrl = "https://service-channels.clusters.pluto.tv/v2/guide/timelines";
+my $guideDurationMinutes = 240;
+my $guideBatchSize = 25;
 my $deviceId = uuid_to_string(create_uuid(UUID_V1));
 my $ffmpeg = which 'ffmpeg';
 my $streamlink = which 'streamlink';
@@ -54,8 +57,25 @@ my %regions = (
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $debug = 0;
+my %hybrid_harmonize_channels = ();
 
 GetOptions("debug" => \$debug);
+
+sub parseChannelListArg {
+    my ($value) = @_;
+    return () unless defined $value && length $value;
+    my %out;
+    for my $id (split /[\s,;]+/, $value) {
+        next unless defined $id && length $id;
+        $out{$id} = 1;
+    }
+    return %out;
+}
+
+%hybrid_harmonize_channels = (
+    parseChannelListArg($ENV{PLUTOTV_HARMONIZE_CHANNELS}),
+    parseChannelListArg(getArgsValue("--harmonizechannels")),
+);
 
 our %channel_timestamps = ();
 our %session_cache = ();
@@ -671,22 +691,30 @@ sub xmltvTimestampFromIso {
     return undef;
 }
 
-sub buildGuideUrl {
-    my ($region) = @_;
+sub buildGuideStartIso {
     my $now = DateTime->now(time_zone => 'UTC');
-    my $stop = $now->clone->add(hours => 6);
-    return 'https://service-channels.clusters.pluto.tv/v2/guide?start=' .
-        uri_escape_utf8($now->strftime('%Y-%m-%dT%H:%M:%SZ')) .
-        '&stop=' .
-        uri_escape_utf8($stop->strftime('%Y-%m-%dT%H:%M:%SZ'));
+    my $minute = $now->minute;
+    my $roundedMinute = int($minute / 30) * 30;
+    $now->set(minute => $roundedMinute, second => 0, nanosecond => 0);
+    return $now->strftime('%Y-%m-%dT%H:%M:%S.000Z');
+}
+
+sub buildGuideUrl {
+    my ($region, $channelIdsRef) = @_;
+    $region ||= 'DE';
+    my @channelIds = grep { defined $_ && length $_ } @{ $channelIdsRef || [] };
+    return undef unless @channelIds;
+    return $guideTimelinesApiUrl . '?start=' . uri_escape_utf8(buildGuideStartIso()) .
+        '&channelIds=' . uri_escape_utf8(join(',', @channelIds)) .
+        '&duration=' . $guideDurationMinutes;
 }
 
 sub extractGuideChannels {
     my ($parsed) = @_;
     return () unless $parsed;
+    return @{ $parsed->{data} } if ref($parsed->{data}) eq 'ARRAY';
     return @{ $parsed } if ref($parsed) eq 'ARRAY';
     return @{ $parsed->{channels} } if ref($parsed->{channels}) eq 'ARRAY';
-    return @{ $parsed->{data} } if ref($parsed->{data}) eq 'ARRAY';
     return @{ $parsed->{guides} } if ref($parsed->{guides}) eq 'ARRAY';
     return @{ $parsed->{EPG} } if ref($parsed->{EPG}) eq 'ARRAY';
     return ();
@@ -697,12 +725,33 @@ sub getGuideChannelJson {
     $region ||= 'DE';
     my $boot = getBootFromPluto($region);
     return () unless $boot && $boot->{sessionToken};
-    my $content = getFromUrl(buildGuideUrl($region), token => $boot->{sessionToken});
-    return () unless $content;
-    my $parsed = try { parse_json($content) };
-    return () unless $parsed;
-    my @guideChannels = map { normalizeChannel($_) } extractGuideChannels($parsed);
-    @guideChannels = grep { $_ && ref($_->{timelines}) eq 'ARRAY' } @guideChannels;
+
+    my @channels = getChannelJson($region);
+    my @channelIds = map { $_->{id} || $_->{_id} } grep { ($_->{id} || $_->{_id}) } @channels;
+    return () unless @channelIds;
+
+    my @guideChannels;
+    while (@channelIds) {
+        my @batch = splice(@channelIds, 0, $guideBatchSize);
+        my $url = buildGuideUrl($region, \@batch);
+        next unless $url;
+        my $content = getFromUrl($url, token => $boot->{sessionToken});
+        next unless $content;
+        my $parsed = try { parse_json($content) };
+        next unless $parsed;
+        for my $entry (extractGuideChannels($parsed)) {
+            next unless ref($entry) eq 'HASH';
+            my $id = $entry->{channelId} || $entry->{id} || $entry->{_id};
+            next unless $id;
+            push @guideChannels, {
+                id => $id,
+                _id => $id,
+                slug => $entry->{channelSlug} || '',
+                timelines => (ref($entry->{timelines}) eq 'ARRAY' ? $entry->{timelines} : []),
+            };
+        }
+    }
+
     return @guideChannels;
 }
 
@@ -907,18 +956,6 @@ sub buildLocalChildStreamUrl {
     return $url;
 }
 
-sub resetStreamState {
-    my ($streamKey, $processedSegmentsRef, $processedMapsRef, %opts) = @_;
-    %{$processedSegmentsRef || {}} = ();
-    %{$processedMapsRef || {}} = ();
-    delete $channel_timestamps{$streamKey} if defined $streamKey;
-    if ($debug) {
-        my $reason = $opts{reason} || 'reset';
-        printf("Reset stream state for %s (%s)\n", ($streamKey || 'unknown'), $reason);
-    }
-    return 1;
-}
-
 sub streamPlaylistToHandle {
     my ($fh, $channelId, $region, $playlistUrl, $kind) = @_;
     $region ||= 'DE';
@@ -937,8 +974,7 @@ sub streamPlaylistToHandle {
                 $playlistUrl = $refreshedPlaylistUrl;
                 $lastRefreshAt = time();
                 if ($debug) {
-                    printf("Refreshed %s session/playlist for %s
-", ($kind || 'video'), $channelId);
+                    printf("Refreshed %s session/playlist for %s\n", ($kind || 'video'), $channelId);
                 }
             }
         }
@@ -951,9 +987,7 @@ sub streamPlaylistToHandle {
             $consecutiveFailures++;
             if ($debug) {
                 my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
-                printf("Failed to fetch %s playlist for %s (attempt %d): %s
-URL: %s
-", ($kind || 'video'), $channelId, $consecutiveFailures, $status, ($playlistUrl || ''));
+                printf("Failed to fetch %s playlist for %s (attempt %d): %s\nURL: %s\n", ($kind || 'video'), $channelId, $consecutiveFailures, $status, ($playlistUrl || ''));
             }
             my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
             my $refreshedPlaylistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
@@ -977,29 +1011,22 @@ Playlist URL: %s
             next;
         }
         if ($debug) {
-            printf("Processing %d new %s segments for channel %s
-", scalar(@newSegments), ($kind || 'video'), $channelId);
+            printf("Processing %d new %s segments for channel %s\n", scalar(@newSegments), ($kind || 'video'), $channelId);
         }
         my $streamOk = 1;
-        my $streamKey = $channelId . '-' . ($kind || 'video');
         for my $segment (@newSegments) {
-            if ($segment->{isDiscontinuity}) {
-                resetStreamState($streamKey, \%processedSegments, \%processedMaps,
-                    reason => (($kind || 'video') . ' discontinuity'));
-                $lastRefreshAt = 0;
-                if ($debug) {
-                    printf("Skipping first %s segment after discontinuity for %s
-", ($kind || 'video'), $channelId);
-                }
-                next;
-            }
-
-            my $success = streamSegment($fh, $ua, $segment, $streamKey, \%processedMaps);
+            my $success = streamSegment($fh, $ua, $segment, $channelId . '-' . ($kind || 'video'), \%processedMaps);
             unless ($success) {
+                if ($segment->{isDiscontinuity}) {
+                    if ($debug) {
+                        printf("Failed to stream %s discontinuity segment, refreshing playlist for %s\n", ($kind || 'video'), $channelId);
+                    }
+                    $lastRefreshAt = 0;
+                    next;
+                }
                 $streamOk = 0;
                 if ($debug) {
-                    printf("Failed to stream %s segment, ending stream for %s
-", ($kind || 'video'), $channelId);
+                    printf("Failed to stream %s segment, ending stream for %s\n", ($kind || 'video'), $channelId);
                 }
                 last;
             }
@@ -1083,8 +1110,8 @@ sub streamMuxedFromLocalChildStreams {
         '-muxdelay', '0', '-muxpreload', '0',
         '-mpegts_flags', '+resend_headers',
         '-avoid_negative_ts', 'make_zero',
-        '-flush_packets', '1',
         '-max_interleave_delta', '1000000',
+        '-flush_packets', '1',
         '-f', 'mpegts', 'pipe:1'
     );
 
@@ -1137,6 +1164,103 @@ sub sendElementaryDynamicStream {
     streamWithDiscontinuityRestart($client, $channelId . '-' . ($kind || 'video'), $region, $playlistUrl);
 }
 
+sub streamHlsViaFfmpeg {
+    my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName) = @_;
+    return 0 unless $ffmpeg;
+    return 0 unless $videoUrl;
+
+    $client->timeout(5);
+    eval {
+        $client->write("HTTP/1.1 200 OK
+");
+        $client->write("Content-Type: video/mp2t
+");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate
+");
+        $client->write("Connection: close
+
+");
+    };
+    if ($@) {
+        if ($debug) {
+            printf("Failed to send headers - client disconnected: %s
+", $@);
+        }
+        return 0;
+    }
+
+    my @cmd = (
+        $ffmpeg, '-loglevel', 'error', '-nostdin',
+        '-fflags', '+genpts+discardcorrupt',
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+        '-i', $videoUrl,
+    );
+
+    if ($audioUrl) {
+        push @cmd,
+            '-fflags', '+genpts+discardcorrupt',
+            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+            '-i', $audioUrl,
+            '-map', '0:v:0?', '-map', '1:a:0?';
+    } else {
+        push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+    }
+
+    push @cmd,
+        '-c:v', 'copy',
+        '-bsf:v', 'h264_mp4toannexb',
+        '-c:a', 'copy',
+        '-muxdelay', '0', '-muxpreload', '0',
+        '-mpegts_flags', '+resend_headers',
+        '-avoid_negative_ts', 'make_zero',
+        '-max_interleave_delta', '1000000',
+        '-flush_packets', '1',
+        '-metadata', 'service_provider=PlutoTV',
+        '-metadata', 'service_name=' . ($channelName || $channelId),
+        '-f', 'mpegts', 'pipe:1';
+
+    if ($debug) {
+        printf("Starting ffmpeg HLS harmonizer for %s
+", $channelId);
+    }
+
+    open(my $ffh, '-|', @cmd) or do {
+        warn "Failed to start ffmpeg HLS harmonizer: $!
+";
+        return 0;
+    };
+    binmode($ffh);
+
+    my $buffer = '';
+    while (1) {
+        my $read = sysread($ffh, $buffer, 1316);
+        last unless defined $read && $read > 0;
+        my $ok = eval { $client->write($buffer); 1 };
+        last unless $ok;
+    }
+    close($ffh);
+    return 1;
+}
+
+sub shouldUseHlsHarmonizer {
+    my ($channelId, $request) = @_;
+    return 0 unless $ffmpeg;
+    return 1 if $hybrid_harmonize_channels{$channelId};
+
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    if ($params && defined $params->{mode}) {
+        my $mode = lc($params->{mode});
+        return 1 if $mode eq 'harmonize';
+        return 0 if $mode eq 'copy';
+    }
+    if ($params && defined $params->{harmonize}) {
+        my $flag = lc($params->{harmonize});
+        return 1 if $flag =~ /^(1|true|yes|on)$/;
+        return 0 if $flag =~ /^(0|false|no|off)$/;
+    }
+    return 0;
+}
+
 sub sendDynamicStream {
     my ($client, $request) = @_;
     my $path = $request->uri->path;
@@ -1149,15 +1273,30 @@ sub sendDynamicStream {
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
-    my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
+    my (undef, $channel, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
     unless ($videoUrl) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
         return;
     }
 
+    my $preferHarmonizer = shouldUseHlsHarmonizer($channelId, $request);
+    if ($debug) {
+        printf("Dynamic stream mode for %s: %s\n", $channelId, ($preferHarmonizer ? 'harmonize' : 'copy'));
+    }
+
+    if ($preferHarmonizer) {
+        my $ok = streamHlsViaFfmpeg($client, $channelId, $region, $videoUrl, $audioUrl, ($channel ? $channel->{name} : undef));
+        return if $ok;
+    }
+
     if ($audioUrl && $ffmpeg) {
-        streamMuxedFromLocalChildStreams($client, $channelId, $region, $videoUrl, $audioUrl);
-        return;
+        my $ok = streamMuxedFromLocalChildStreams($client, $channelId, $region, $videoUrl, $audioUrl);
+        return if $ok;
+    }
+
+    if (!$preferHarmonizer && $ffmpeg) {
+        my $ok = streamHlsViaFfmpeg($client, $channelId, $region, $videoUrl, $audioUrl, ($channel ? $channel->{name} : undef));
+        return if $ok;
     }
 
     streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
@@ -1238,8 +1377,7 @@ sub streamWithDiscontinuityRestart {
             $consecutiveFailures++;
             if ($debug) {
                 my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
-                printf("Failed to fetch playlist for %s (attempt %d): %s
-URL: %s
+                printf("Failed to fetch playlist for %s (attempt %d): %s\nURL: %s
 ", $channelId, $consecutiveFailures, $status, $playlistUrl);
             }
             my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
@@ -1268,17 +1406,6 @@ Playlist URL: %s
         }
         my $streamOk = 1;
         for my $segment (@newSegments) {
-            if ($segment->{isDiscontinuity}) {
-                resetStreamState($channelId, \%processedSegments, \%processedMaps,
-                    reason => 'channel discontinuity');
-                $lastRefreshAt = 0;
-                if ($debug) {
-                    printf("Skipping first segment after discontinuity for %s
-", $channelId);
-                }
-                next;
-            }
-
             my $success = streamSegment($client, $ua, $segment, $channelId, \%processedMaps);
             unless ($success) {
                 $streamOk = 0;
