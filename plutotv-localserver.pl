@@ -5,7 +5,7 @@ package PlutoTVServer;
 use strict;
 use warnings;
 use utf8;
-use Encode qw(encode_utf8);
+use Encode qw(encode_utf8 decode_utf8 is_utf8);
 use HTTP::Daemon;
 use HTTP::Status;
 use HTTP::Request::Params;
@@ -771,6 +771,23 @@ sub mergeChannelsWithGuide {
     return values %byId;
 }
 
+
+sub forceUtf8 {
+    my ($value) = @_;
+    return '' unless defined $value;
+    return $value if ref($value);
+    return $value if is_utf8($value);
+    my $decoded = eval { decode_utf8($value, 1) };
+    return defined($decoded) ? $decoded : $value;
+}
+
+sub xmlCdata {
+    my ($value) = @_;
+    $value = forceUtf8($value);
+    $value =~ s/\]\]>/]]]]><![CDATA[>/g;
+    return '<![CDATA[' . $value . ']]>';
+}
+
 sub sendXmltvEpgFile {
     my ($client, $request) = @_;
     my $region = 'DE';
@@ -786,11 +803,11 @@ sub sendXmltvEpgFile {
     my @guideChannels = getGuideChannelJson($region);
     @channels = mergeChannelsWithGuide(\@channels, \@guideChannels) if @guideChannels;
 
-    my $langcode = "en";
+    my $langcode = "de";
     my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
     for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
         next unless ($channel->{number} || 0) > 0;
-        my $channelName = $channel->{name};
+        my $channelName = forceUtf8($channel->{name} || "");
         my $channelId = uri_escape_utf8($channelName);
         $epg .= "<channel id=\"$channelId\">\n";
         $epg .= "<display-name lang=\"$langcode\"><![CDATA[$channelName]]></display-name>\n";
@@ -803,18 +820,18 @@ sub sendXmltvEpgFile {
 
     for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
         next unless ($channel->{number} || 0) > 0;
-        my $channelId = uri_escape_utf8($channel->{name});
+        my $channelId = uri_escape_utf8(forceUtf8($channel->{name} || ""));
         for my $programme (@{ $channel->{timelines} || [] }) {
             my $start = xmltvTimestampFromIso($programme->{start});
             my $stop  = xmltvTimestampFromIso($programme->{stop});
             next unless $start && $stop;
 
             my $episode = $programme->{episode} || {};
-            my $title = $programme->{title} || $episode->{name} || $channel->{name} || '';
-            my $subtitle = $episode->{name} || '';
-            my $desc = $episode->{description} || '';
-            my $genre = $episode->{genre} || '';
-            my $rating = $episode->{rating} || '';
+            my $title = forceUtf8($programme->{title} || $episode->{name} || $channel->{name} || '');
+            my $subtitle = forceUtf8($episode->{name} || '');
+            my $desc = forceUtf8($episode->{description} || '');
+            my $genre = forceUtf8($episode->{genre} || '');
+            my $rating = forceUtf8($episode->{rating} || '');
 
             $epg .= "<programme start=\"$start\" stop=\"$stop\" channel=\"$channelId\">\n";
             $epg .= "<title lang=\"$langcode\"><![CDATA[$title]]></title>\n";
@@ -822,7 +839,7 @@ sub sendXmltvEpgFile {
             $epg .= "<desc lang=\"$langcode\"><![CDATA[$desc]]></desc>\n" if length $desc;
             $epg .= "<category lang=\"$langcode\"><![CDATA[$genre]]></category>\n" if length $genre;
             if (length $rating) {
-                $epg .= "<rating><value><![CDATA[$rating]]></value></rating>\n";
+                $epg .= "<rating><value>" . xmlCdata($rating) . "</value></rating>\n";
             }
             $epg .= "</programme>\n";
         }
