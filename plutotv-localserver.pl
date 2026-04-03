@@ -1423,12 +1423,21 @@ Playlist URL: %s
         }
         my $streamOk = 1;
         for my $segment (@newSegments) {
+            if ($segment->{isDiscontinuity} && $segment->{mapUrl}) {
+                delete $processedMaps{$segment->{mapUrl}};
+            }
             my $success = streamSegment($client, $ua, $segment, $channelId, \%processedMaps);
             unless ($success) {
+                if ($segment->{isDiscontinuity}) {
+                    if ($debug) {
+                        printf("Failed to stream discontinuity segment, refreshing playlist for %s\n", $channelId);
+                    }
+                    $lastRefreshAt = 0;
+                    next;
+                }
                 $streamOk = 0;
                 if ($debug) {
-                    printf("Failed to stream segment, ending stream for %s
-", $channelId);
+                    printf("Failed to stream segment, ending stream for %s\n", $channelId);
                 }
                 last;
             }
