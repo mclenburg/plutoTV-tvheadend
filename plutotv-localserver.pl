@@ -1667,7 +1667,7 @@ sub streamHlsViaFfmpeg {
                     }
                     appendRecentLog('DISCONTINUITY-Neustart: ' . $channelId);
                     $restart_due_to_discontinuity = 1;
-                    last_restart_at = time();
+                    $last_restart_at = time();
                     last;
                 }
             }
