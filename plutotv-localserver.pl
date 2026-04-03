@@ -1606,8 +1606,17 @@ sub streamHlsViaFfmpeg {
         binmode($ffh);
 
         my $client_alive = 1;
+        my $mode_switch_requested = 0;
         my $buffer = '';
+        my $iteration = 0;
         while (1) {
+            if ($opts->{desired_mode_cb} && (++$iteration % 20 == 0)) {
+                my $desired = $opts->{desired_mode_cb}->();
+                if (defined $desired && $desired ne 'harmonize') {
+                    $mode_switch_requested = 1;
+                    last;
+                }
+            }
             my $read = sysread($ffh, $buffer, 1316);
             last unless defined $read && $read > 0;
             my $ok = eval { $client->write($buffer); 1 };
