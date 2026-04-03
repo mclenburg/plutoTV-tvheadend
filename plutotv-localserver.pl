@@ -1063,100 +1063,127 @@ sub streamMuxedFromLocalChildStreams {
     return 0 unless $ffmpeg;
     return 0 unless $videoUrl && $audioUrl;
 
-    my $tmpdir = tempdir('plutotv-mux-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-    my $videoFifo = "$tmpdir/video.ts";
-    my $audioFifo = "$tmpdir/audio.ts";
-    mkfifo($videoFifo, 0700) or do { warn "Failed to create video fifo: $!
-"; return 0; };
-    mkfifo($audioFifo, 0700) or do { warn "Failed to create audio fifo: $!
-"; unlink $videoFifo; return 0; };
-
     eval {
-        $client->write("HTTP/1.1 200 OK
-");
-        $client->write("Content-Type: video/mp2t
-");
-        $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-        $client->write("Connection: close
-
-");
+        $client->write("HTTP/1.1 200 OK\n");
+        $client->write("Content-Type: video/mp2t\n");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+        $client->write("Connection: close\n");
+        $client->write("\n");
     };
     if ($@) {
-        printf("Failed to send headers - client disconnected: %s
-", $@);
-        unlink $videoFifo;
-        unlink $audioFifo;
+        printf("Failed to send headers - client disconnected: %s\n", $@);
         return 0;
     }
 
-    if ($debug) {
-        printf("Muxing separate video/audio for %s using FIFOs
-", $channelId);
-    }
+    my $maxFailures = 5;
+    my $failures = 0;
 
-    my @children;
-    for my $spec (
-        { kind => 'video', fifo => $videoFifo, url => $videoUrl },
-        { kind => 'audio', fifo => $audioFifo, url => $audioUrl },
-    ) {
-        my $pid = fork();
-        if (!defined $pid) {
-            warn "Failed to fork $spec->{kind} worker: $!
-";
+    while ($failures < $maxFailures) {
+        if ($failures > 0) {
+            if ($debug) {
+                printf("Restarting mux for %s (attempt %d/%d)\n",
+                    $channelId, $failures + 1, $maxFailures);
+            }
+            sleep(2);
+            my (undef, undef, undef, undef, $freshVideo, $freshAudio) =
+                getPlaybackUrlsForChannel($channelId, $region, 1);
+            $videoUrl = $freshVideo if $freshVideo;
+            $audioUrl = $freshAudio if $freshAudio;
+        }
+
+        my $tmpdir = tempdir('plutotv-mux-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+        my $videoFifo = "$tmpdir/video.ts";
+        my $audioFifo = "$tmpdir/audio.ts";
+
+        unless (mkfifo($videoFifo, 0700)) {
+            warn "Failed to create video fifo: $!\n";
+            $failures++;
             next;
         }
-        if ($pid == 0) {
-            local $SIG{PIPE} = 'DEFAULT';
-            open(my $fh, '>', $spec->{fifo}) or do { warn "Failed to open $spec->{kind} fifo for writing: $!
-"; exit(1); };
-            binmode($fh);
-            eval { streamPlaylistToHandle($fh, $channelId, $region, $spec->{url}, $spec->{kind}); };
-            close($fh);
-            exit(0);
+        unless (mkfifo($audioFifo, 0700)) {
+            warn "Failed to create audio fifo: $!\n";
+            unlink $videoFifo;
+            $failures++;
+            next;
         }
-        push @children, $pid;
+
+        if ($debug) {
+            printf("Muxing separate video/audio for %s using FIFOs\n", $channelId);
+        }
+
+        my @children;
+        for my $spec (
+            { kind => 'video', fifo => $videoFifo, url => $videoUrl },
+            { kind => 'audio', fifo => $audioFifo, url => $audioUrl },
+        ) {
+            my $pid = fork();
+            if (!defined $pid) {
+                warn "Failed to fork $spec->{kind} worker: $!\n";
+                next;
+            }
+            if ($pid == 0) {
+                local $SIG{PIPE} = 'DEFAULT';
+                open(my $fh, '>', $spec->{fifo}) or do {
+                    warn "Failed to open $spec->{kind} fifo for writing: $!\n";
+                    exit(1);
+                };
+                binmode($fh);
+                eval { streamPlaylistToHandle($fh, $channelId, $region, $spec->{url}, $spec->{kind}); };
+                close($fh);
+                exit(0);
+            }
+            push @children, $pid;
+        }
+
+        my @cmd = (
+            $ffmpeg, '-loglevel', 'error', '-nostdin',
+            '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
+            '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-c', 'copy',
+            '-muxdelay', '0', '-muxpreload', '0',
+            '-mpegts_flags', '+resend_headers',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_interleave_delta', '1000000',
+            '-flush_packets', '1',
+            '-f', 'mpegts', 'pipe:1'
+        );
+
+        my $ffh;
+        unless (open($ffh, '-|', @cmd)) {
+            warn "Failed to start ffmpeg for muxing: $!\n";
+            for my $pid (@children) { kill 'TERM', $pid if $pid; }
+            unlink $videoFifo;
+            unlink $audioFifo;
+            $failures++;
+            next;
+        }
+        binmode($ffh);
+
+        my $client_alive = 1;
+        my $buffer = '';
+        while (1) {
+            my $read = sysread($ffh, $buffer, 1316);
+            last unless defined $read && $read > 0;
+            my $ok = eval { $client->write($buffer); 1 };
+            unless ($ok) {
+                $client_alive = 0;
+                last;
+            }
+        }
+        close($ffh);
+
+        for my $pid (@children) {
+            kill 'TERM', $pid if $pid;
+            waitpid($pid, 0);
+        }
+        unlink $videoFifo if -p $videoFifo || -e $videoFifo;
+        unlink $audioFifo if -p $audioFifo || -e $audioFifo;
+
+        last unless $client_alive;
+        $failures++;
     }
 
-    my @cmd = (
-        $ffmpeg, '-loglevel', 'error', '-nostdin',
-        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
-        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
-        '-map', '0:v:0', '-map', '1:a:0',
-        '-c', 'copy',
-        '-muxdelay', '0', '-muxpreload', '0',
-        '-mpegts_flags', '+resend_headers',
-        '-avoid_negative_ts', 'make_zero',
-        '-max_interleave_delta', '1000000',
-        '-flush_packets', '1',
-        '-f', 'mpegts', 'pipe:1'
-    );
-
-    open(my $ffh, '-|', @cmd) or do {
-        warn "Failed to start ffmpeg for muxing: $!
-";
-        for my $pid (@children) { kill 'TERM', $pid if $pid; }
-        unlink $videoFifo;
-        unlink $audioFifo;
-        return 0;
-    };
-    binmode($ffh);
-
-    my $buffer = '';
-    while (1) {
-        my $read = sysread($ffh, $buffer, 1316);
-        last unless defined $read && $read > 0;
-        my $ok = eval { $client->write($buffer); 1 };
-        last unless $ok;
-    }
-    close($ffh);
-
-    for my $pid (@children) {
-        kill 'TERM', $pid if $pid;
-        waitpid($pid, 0);
-    }
-    unlink $videoFifo if -p $videoFifo || -e $videoFifo;
-    unlink $audioFifo if -p $audioFifo || -e $audioFifo;
     return 1;
 }
 
@@ -1188,74 +1215,94 @@ sub streamHlsViaFfmpeg {
 
     $client->timeout(5);
     eval {
-        $client->write("HTTP/1.1 200 OK
-");
-        $client->write("Content-Type: video/mp2t
-");
-        $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-        $client->write("Connection: close
-
-");
+        $client->write("HTTP/1.1 200 OK\n");
+        $client->write("Content-Type: video/mp2t\n");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+        $client->write("Connection: close\n");
+        $client->write("\n");
     };
     if ($@) {
         if ($debug) {
-            printf("Failed to send headers - client disconnected: %s
-", $@);
+            printf("Failed to send headers - client disconnected: %s\n", $@);
         }
         return 0;
     }
 
-    my @cmd = (
-        $ffmpeg, '-loglevel', 'error', '-nostdin',
-        '-fflags', '+genpts+discardcorrupt',
-        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
-        '-i', $videoUrl,
-    );
+    my $maxFailures = 5;
+    my $failures = 0;
 
-    if ($audioUrl) {
-        push @cmd,
+    while ($failures < $maxFailures) {
+        if ($failures > 0) {
+            if ($debug) {
+                printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)\n",
+                    $channelId, $failures + 1, $maxFailures);
+            }
+            sleep(2);
+            my (undef, undef, undef, undef, $freshVideo, $freshAudio) =
+                getPlaybackUrlsForChannel($channelId, $region, 1);
+            $videoUrl = $freshVideo if $freshVideo;
+            $audioUrl = $freshAudio if $freshAudio;
+        }
+
+        my @cmd = (
+            $ffmpeg, '-loglevel', 'error', '-nostdin',
             '-fflags', '+genpts+discardcorrupt',
             '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
-            '-i', $audioUrl,
-            '-map', '0:v:0?', '-map', '1:a:0?';
-    } else {
-        push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+            '-i', $videoUrl,
+        );
+
+        if ($audioUrl) {
+            push @cmd,
+                '-fflags', '+genpts+discardcorrupt',
+                '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+                '-i', $audioUrl,
+                '-map', '0:v:0?', '-map', '1:a:0?';
+        } else {
+            push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+        }
+
+        push @cmd,
+            '-c:v', 'copy',
+            '-bsf:v', 'h264_mp4toannexb',
+            '-c:a', 'copy',
+            '-muxdelay', '0', '-muxpreload', '0',
+            '-mpegts_flags', '+resend_headers',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_interleave_delta', '1000000',
+            '-flush_packets', '1',
+            '-metadata', 'service_provider=PlutoTV',
+            '-metadata', 'service_name=' . ($channelName || $channelId),
+            '-f', 'mpegts', 'pipe:1';
+
+        if ($debug) {
+            printf("Starting ffmpeg HLS harmonizer for %s\n", $channelId);
+        }
+
+        my $ffh;
+        unless (open($ffh, '-|', @cmd)) {
+            warn "Failed to start ffmpeg HLS harmonizer: $!\n";
+            $failures++;
+            next;
+        }
+        binmode($ffh);
+
+        my $client_alive = 1;
+        my $buffer = '';
+        while (1) {
+            my $read = sysread($ffh, $buffer, 1316);
+            last unless defined $read && $read > 0;
+            my $ok = eval { $client->write($buffer); 1 };
+            unless ($ok) {
+                $client_alive = 0;
+                last;
+            }
+        }
+        close($ffh);
+
+        last unless $client_alive;
+        $failures++;
     }
 
-    push @cmd,
-        '-c:v', 'copy',
-        '-bsf:v', 'h264_mp4toannexb',
-        '-c:a', 'copy',
-        '-muxdelay', '0', '-muxpreload', '0',
-        '-mpegts_flags', '+resend_headers',
-        '-avoid_negative_ts', 'make_zero',
-        '-max_interleave_delta', '1000000',
-        '-flush_packets', '1',
-        '-metadata', 'service_provider=PlutoTV',
-        '-metadata', 'service_name=' . ($channelName || $channelId),
-        '-f', 'mpegts', 'pipe:1';
-
-    if ($debug) {
-        printf("Starting ffmpeg HLS harmonizer for %s
-", $channelId);
-    }
-
-    open(my $ffh, '-|', @cmd) or do {
-        warn "Failed to start ffmpeg HLS harmonizer: $!
-";
-        return 0;
-    };
-    binmode($ffh);
-
-    my $buffer = '';
-    while (1) {
-        my $read = sysread($ffh, $buffer, 1316);
-        last unless defined $read && $read > 0;
-        my $ok = eval { $client->write($buffer); 1 };
-        last unless $ok;
-    }
-    close($ffh);
     return 1;
 }
 
@@ -1829,7 +1876,8 @@ sub processPcr {
         $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
 
         if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated} && defined $ts_info->{last_pcr}) {
-            $ts_info->{pcr_offset} = $ts_info->{last_pcr} - $pcr_base;
+            # +9000 ticks = 100ms at 90kHz: ensures PCR moves forward, never stagnates
+            $ts_info->{pcr_offset} = $ts_info->{last_pcr} + 9000 - $pcr_base;
             $ts_info->{pcr_calculated} = 1;
             $ts_info->{discontinuity_reset} = 0;
         }
