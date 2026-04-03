@@ -27,9 +27,6 @@ use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
 use File::Temp qw(tempdir);
 use POSIX qw(mkfifo WNOHANG);
-use JSON::PP qw(encode_json decode_json);
-use Fcntl qw(:flock);
-use File::Basename qw(dirname);
 
 my $hostIp = "127.0.0.1";
 my $port = "9000";
@@ -60,15 +57,9 @@ my %regions = (
 my $localhost = grep { $_ eq '--localonly'} @ARGV;
 my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $debug = 0;
-my $tempFile;
 my %hybrid_harmonize_channels = ();
 
-GetOptions(
-    "debug" => \$debug,
-    "tempFile=s" => \$tempFile,
-    "port=s" => \$port,
-    "harmonizechannels=s" => sub { },
-);
+GetOptions("debug" => \$debug);
 
 sub parseChannelListArg {
     my ($value) = @_;
@@ -80,16 +71,6 @@ sub parseChannelListArg {
     }
     return %out;
 }
-
-my $runtimeStateDir = '/tmp/plutotv-localserver';
-if (defined $tempFile && length $tempFile) {
-    my $derived = -d $tempFile ? $tempFile : dirname($tempFile);
-    $runtimeStateDir = $derived if defined $derived && length $derived;
-}
-my $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
-my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
-my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
-my $adminLogStateFile = $runtimeStateDir . '/admin_events.log';
 
 %hybrid_harmonize_channels = (
     parseChannelListArg($ENV{PLUTOTV_HARMONIZE_CHANNELS}),
@@ -103,287 +84,6 @@ our %master_url_cache = ();
 
 my $sessionRefreshInterval = 25 * 60;
 my $sessionRetryCooldown = 30;
-
-
-sub ensureRuntimeStateDir {
-    return if -d $runtimeStateDir;
-    mkdir $runtimeStateDir;
-}
-
-sub appendAdminLog {
-    my ($message) = @_;
-    return unless defined $message && length $message;
-    ensureRuntimeStateDir();
-    my $line = formatEpochLocal(time()) . ' ' . $message . "\n";
-    open(my $fh, '>>', $adminLogStateFile) or return;
-    flock($fh, LOCK_EX);
-    print $fh $line;
-    close($fh);
-}
-
-sub loadRecentAdminLogs {
-    ensureRuntimeStateDir();
-    return [] unless -e $adminLogStateFile;
-    open(my $fh, '<', $adminLogStateFile) or return [];
-    flock($fh, LOCK_SH);
-    my @lines = <$fh>;
-    close($fh);
-    chomp @lines;
-    @lines = grep { defined $_ && length $_ } @lines;
-    @lines = splice(@lines, -5) if @lines > 5;
-    return \@lines;
-}
-
-sub updateActiveStream {
-    my ($key, %changes) = @_;
-    return unless defined $key && length $key;
-    my $streams = loadActiveStreams();
-    return unless ref($streams->{$key}) eq 'HASH';
-    for my $k (keys %changes) {
-        $streams->{$key}->{$k} = $changes{$k};
-    }
-    saveActiveStreams($streams);
-}
-
-sub markDesiredModeForChannel {
-    my ($channelId, $desiredMode) = @_;
-    return unless defined $channelId && length $channelId;
-    my $streams = loadActiveStreams();
-    my $changed = 0;
-    for my $key (keys %$streams) {
-        my $entry = $streams->{$key};
-        next unless ref($entry) eq 'HASH';
-        next unless ($entry->{channelId} || '') eq $channelId;
-        $entry->{desiredMode} = $desiredMode;
-        $entry->{switching} = (($entry->{mode} || 'copy') ne $desiredMode) ? JSON::PP::true : JSON::PP::false;
-        $changed = 1;
-    }
-    saveActiveStreams($streams) if $changed;
-}
-
-sub buildAdminSnapshot {
-    my ($region) = @_;
-    $region ||= 'DE';
-    my $streams = cleanupStaleActiveStreams();
-    my $harmonize = loadHarmonizeOverrides();
-    my @entries;
-    for my $key (sort keys %$streams) {
-        my $entry = $streams->{$key};
-        next unless ref($entry) eq 'HASH';
-        my $channelId = $entry->{channelId} || '';
-        push @entries, {
-            key => $key,
-            channelId => $channelId,
-            channelName => $entry->{channelName} || $channelId,
-            mode => $entry->{mode} || 'copy',
-            desiredMode => $entry->{desiredMode} || ($entry->{mode} || 'copy'),
-            switching => $entry->{switching} ? JSON::PP::true : JSON::PP::false,
-            started => formatEpochLocal($entry->{startedAt}),
-            harmonize => ($harmonize->{$channelId} || 0) ? JSON::PP::true : JSON::PP::false,
-        };
-    }
-    my @harm;
-    for my $channelId (sort keys %$harmonize) {
-        my $channel = findChannelMetaById($channelId, $region);
-        push @harm, {
-            channelId => $channelId,
-            channelName => $channel ? ($channel->{name} || $channelId) : $channelId,
-        };
-    }
-    return {
-        region => $region,
-        streams => \@entries,
-        harmonize => \@harm,
-        logs => loadRecentAdminLogs(),
-        updatedAt => time(),
-    };
-}
-
-sub sendAdminEvents {
-    my ($client, $request) = @_;
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-
-    eval {
-        $client->write("HTTP/1.1 200 OK\n");
-        $client->write("Content-Type: text/event-stream; charset=utf-8\n");
-        $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-        $client->write("Connection: close\n\n");
-    };
-    return if $@;
-
-    my $last_payload = '';
-    my $keepalive = 0;
-    while (1) {
-        my $payload = encode_json(buildAdminSnapshot($region));
-        if ($payload ne $last_payload) {
-            my $ok = eval {
-                $client->write("event: snapshot\n");
-                $client->write("data: " . $payload . "\n\n");
-                1;
-            };
-            last unless $ok;
-            $last_payload = $payload;
-            $keepalive = 0;
-        } else {
-            $keepalive++;
-            if ($keepalive >= 10) {
-                my $ok = eval { $client->write(": keepalive\n\n"); 1 };
-                last unless $ok;
-                $keepalive = 0;
-            }
-        }
-        sleep 1;
-    }
-}
-
-sub htmlEscape {
-    my ($value) = @_;
-    $value = '' unless defined $value;
-    $value =~ s/&/&amp;/g;
-    $value =~ s/</&lt;/g;
-    $value =~ s/>/&gt;/g;
-    $value =~ s/"/&quot;/g;
-    return $value;
-}
-
-sub loadJsonFile {
-    my ($path, $default) = @_;
-    ensureRuntimeStateDir();
-    return $default unless -e $path;
-    open(my $fh, '<', $path) or return $default;
-    flock($fh, LOCK_SH);
-    local $/;
-    my $content = <$fh>;
-    close($fh);
-    return $default unless defined $content && length $content;
-    my $parsed = eval { decode_json($content) };
-    return defined $parsed ? $parsed : $default;
-}
-
-sub saveJsonFile {
-    my ($path, $data) = @_;
-    ensureRuntimeStateDir();
-    my $tmp = $path . '.tmp.' . $$;
-    open(my $fh, '>', $tmp) or return 0;
-    flock($fh, LOCK_EX);
-    print $fh encode_json($data);
-    close($fh);
-    rename($tmp, $path) or return 0;
-    return 1;
-}
-
-sub loadHarmonizeOverrides {
-    my $parsed = loadJsonFile($harmonizeStateFile, {});
-    return {} unless ref($parsed) eq 'HASH';
-    return $parsed;
-}
-
-sub saveHarmonizeOverrides {
-    my ($hashref) = @_;
-    $hashref ||= {};
-    return saveJsonFile($harmonizeStateFile, $hashref);
-}
-
-for my $id (keys %{ loadHarmonizeOverrides() }) {
-    $hybrid_harmonize_channels{$id} = 1;
-}
-
-sub setHarmonizeOverride {
-    my ($channelId, $enabled) = @_;
-    return 0 unless defined $channelId && length $channelId;
-    my $overrides = loadHarmonizeOverrides();
-    if ($enabled) {
-        $overrides->{$channelId} = JSON::PP::true;
-    } else {
-        delete $overrides->{$channelId};
-    }
-    return saveHarmonizeOverrides($overrides);
-}
-
-sub loadForceDiscontinuityMap {
-    my $parsed = loadJsonFile($forceDiscontinuityStateFile, {});
-    return {} unless ref($parsed) eq 'HASH';
-    return $parsed;
-}
-
-sub queueForcedDiscontinuity {
-    my ($channelId) = @_;
-    return 0 unless defined $channelId && length $channelId;
-    my $map = loadForceDiscontinuityMap();
-    $map->{$channelId} = 1;
-    return saveJsonFile($forceDiscontinuityStateFile, $map);
-}
-
-sub consumeForcedDiscontinuity {
-    my ($channelId) = @_;
-    return 0 unless defined $channelId && length $channelId;
-    my $map = loadForceDiscontinuityMap();
-    return 0 unless $map->{$channelId};
-    delete $map->{$channelId};
-    saveJsonFile($forceDiscontinuityStateFile, $map);
-    return 1;
-}
-
-sub loadActiveStreams {
-    my $parsed = loadJsonFile($activeStreamsStateFile, {});
-    return {} unless ref($parsed) eq 'HASH';
-    return $parsed;
-}
-
-sub saveActiveStreams {
-    my ($hashref) = @_;
-    $hashref ||= {};
-    return saveJsonFile($activeStreamsStateFile, $hashref);
-}
-
-sub registerActiveStream {
-    my (%info) = @_;
-    my $streams = loadActiveStreams();
-    my $key = $$ . '-' . int(time() * 1000) . '-' . int(rand(100000));
-    $info{pid} = $$;
-    $info{startedAt} ||= time();
-    $streams->{$key} = \%info;
-    saveActiveStreams($streams);
-    appendAdminLog('Stream gestartet: ' . ($info{channelName} || $info{channelId} || $key) . ' [' . ($info{mode} || 'copy') . ']');
-    return $key;
-}
-
-sub unregisterActiveStream {
-    my ($key) = @_;
-    return unless defined $key && length $key;
-    my $streams = loadActiveStreams();
-    my $entry = $streams->{$key};
-    delete $streams->{$key};
-    saveActiveStreams($streams);
-    if (ref($entry) eq 'HASH') {
-        appendAdminLog('Stream beendet: ' . ($entry->{channelName} || $entry->{channelId} || $key));
-    }
-}
-
-sub cleanupStaleActiveStreams {
-    my $streams = loadActiveStreams();
-    my $changed = 0;
-    for my $key (keys %$streams) {
-        my $entry = $streams->{$key};
-        my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
-        if (!$pid || !kill(0, $pid)) {
-            delete $streams->{$key};
-            $changed = 1;
-        }
-    }
-    saveActiveStreams($streams) if $changed;
-    return $streams;
-}
-
-sub formatEpochLocal {
-    my ($epoch) = @_;
-    return '' unless defined $epoch && $epoch =~ /^\d+$/;
-    my @lt = localtime($epoch);
-    return sprintf('%04d-%02d-%02d %02d:%02d:%02d',
-        $lt[5] + 1900, $lt[4] + 1, $lt[3], $lt[2], $lt[1], $lt[0]);
-}
 
 sub getArgsValue {
     my ($param) = @_;
@@ -720,6 +420,49 @@ sub resolvePlaylistUrlPreserveQuery {
     return URI->new_abs($value, $baseUrl)->as_string;
 }
 
+
+sub computeDiscontinuitySignatureFromPlaylist {
+    my ($playlistContent) = @_;
+    return '' unless defined $playlistContent && length $playlistContent;
+
+    my @lines = split /\r?\n/, $playlistContent;
+    my $mediaSequence = 0;
+    my $sequence = 0;
+    my $pendingDiscontinuity = 0;
+    my $latestDiscontinuitySequence;
+    my $discontinuityCount = 0;
+
+    for my $line (@lines) {
+        if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
+            $mediaSequence = $1;
+            $sequence = $mediaSequence;
+            next;
+        }
+        if ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            $pendingDiscontinuity = 1;
+            $discontinuityCount++;
+            next;
+        }
+        next if !defined($line) || $line eq '' || $line =~ /^#/;
+        if ($pendingDiscontinuity) {
+            $latestDiscontinuitySequence = $sequence;
+            $pendingDiscontinuity = 0;
+        }
+        $sequence++;
+    }
+
+    my $latest = defined $latestDiscontinuitySequence ? $latestDiscontinuitySequence : -1;
+    return join(':', $mediaSequence, $latest, $discontinuityCount);
+}
+
+sub getPlaylistDiscontinuitySignature {
+    my ($playlistUrl, $ua) = @_;
+    return '' unless defined $playlistUrl && length $playlistUrl;
+    my $content = getFromUrl($playlistUrl, ua => $ua);
+    return '' unless defined $content && length $content;
+    return computeDiscontinuitySignatureFromPlaylist($content);
+}
+
 sub rewriteManifestAttributeLine {
     my ($line, $baseUrl) = @_;
     return $line unless defined $line && defined $baseUrl;
@@ -976,8 +719,7 @@ sub sendHelp {
         "\t/tvheadend?region=REGION\tfor direct streams (tvheadend optimized)\n" .
         "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
         "\t/master3u8?id=ID\tlegacy alias for ffmpeg pipe input\n" .
-        "\t/epg\t\tfor xmltv-epg-file\n" .
-        "\t/admin\t\tfor runtime configuration UI\n\n" .
+        "\t/epg\t\tfor xmltv-epg-file\n\n" .
         "Available regions: " . join(", ", sort keys %regions) . "\n" .
         "Example: /tvheadend?region=US\n");
     $client->send_response($response);
@@ -1235,7 +977,6 @@ sub sendPlaylistProxy {
 
 sub createDynamicPlaylist {
     my ($masterPlaylist, $channelId, $baseUrl) = @_;
-    my $injectDiscontinuity = consumeForcedDiscontinuity($channelId);
     my @lines = split /\r?\n/, $masterPlaylist;
     my $bestStreamUrl;
     my $bestBandwidth = 0;
@@ -1261,7 +1002,6 @@ sub createDynamicPlaylist {
     $dynamicPlaylist .= "#EXT-X-TARGETDURATION:10\n";
     $dynamicPlaylist .= "#EXT-X-MEDIA-SEQUENCE:0\n";
     $dynamicPlaylist .= "#EXT-X-PLAYLIST-TYPE:EVENT\n";
-    $dynamicPlaylist .= "#EXT-X-DISCONTINUITY\n" if $injectDiscontinuity;
     $dynamicPlaylist .= "#EXTINF:86400.0,\n";
     $dynamicPlaylist .= "http://$hostIp:$port/dynamic_stream/$channelId.ts\n";
     $dynamicPlaylist .= "#EXT-X-ENDLIST\n";
@@ -1362,23 +1102,20 @@ Playlist URL: %s
 }
 
 sub streamMuxedFromLocalChildStreams {
-    my ($client, $channelId, $region, $videoUrl, $audioUrl, $opts) = @_;
-    $opts ||= {};
+    my ($client, $channelId, $region, $videoUrl, $audioUrl) = @_;
     return 0 unless $ffmpeg;
     return 0 unless $videoUrl && $audioUrl;
 
-    unless ($opts->{no_headers}) {
-        eval {
-            $client->write("HTTP/1.1 200 OK\n");
-            $client->write("Content-Type: video/mp2t\n");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-            $client->write("Connection: close\n");
-            $client->write("\n");
-        };
-        if ($@) {
-            printf("Failed to send headers - client disconnected: %s\n", $@);
-            return 0;
-        }
+    eval {
+        $client->write("HTTP/1.1 200 OK\n");
+        $client->write("Content-Type: video/mp2t\n");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+        $client->write("Connection: close\n");
+        $client->write("\n");
+    };
+    if ($@) {
+        printf("Failed to send headers - client disconnected: %s\n", $@);
+        return 0;
     }
 
     my $maxFailures = 5;
@@ -1467,17 +1204,8 @@ sub streamMuxedFromLocalChildStreams {
         binmode($ffh);
 
         my $client_alive = 1;
-        my $mode_switch_requested = 0;
         my $buffer = '';
-        my $iteration = 0;
         while (1) {
-            if ($opts->{desired_mode_cb} && (++$iteration % 20 == 0)) {
-                my $desired = $opts->{desired_mode_cb}->();
-                if (defined $desired && $desired ne 'copy') {
-                    $mode_switch_requested = 1;
-                    last;
-                }
-            }
             my $read = sysread($ffh, $buffer, 1316);
             last unless defined $read && $read > 0;
             my $ok = eval { $client->write($buffer); 1 };
@@ -1495,7 +1223,6 @@ sub streamMuxedFromLocalChildStreams {
         unlink $videoFifo if -p $videoFifo || -e $videoFifo;
         unlink $audioFifo if -p $audioFifo || -e $audioFifo;
 
-        return 'switch' if $mode_switch_requested;
         last unless $client_alive;
         $failures++;
     }
@@ -1525,30 +1252,29 @@ sub sendElementaryDynamicStream {
 }
 
 sub streamHlsViaFfmpeg {
-    my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName, $opts) = @_;
-    $opts ||= {};
+    my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName) = @_;
     return 0 unless $ffmpeg;
     return 0 unless $videoUrl;
 
     $client->timeout(5);
-    unless ($opts->{no_headers}) {
-        eval {
-            $client->write("HTTP/1.1 200 OK\n");
-            $client->write("Content-Type: video/mp2t\n");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-            $client->write("Connection: close\n");
-            $client->write("\n");
-        };
-        if ($@) {
-            if ($debug) {
-                printf("Failed to send headers - client disconnected: %s\n", $@);
-            }
-            return 0;
+    eval {
+        $client->write("HTTP/1.1 200 OK\n");
+        $client->write("Content-Type: video/mp2t\n");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+        $client->write("Connection: close\n");
+        $client->write("\n");
+    };
+    if ($@) {
+        if ($debug) {
+            printf("Failed to send headers - client disconnected: %s\n", $@);
         }
+        return 0;
     }
 
     my $maxFailures = 5;
     my $failures = 0;
+    my $monitorUa = createUserAgent();
+    my $lastMonitorCheck = 0;
 
     while ($failures < $maxFailures) {
         if ($failures > 0) {
@@ -1556,15 +1282,18 @@ sub streamHlsViaFfmpeg {
                 printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)\n",
                     $channelId, $failures + 1, $maxFailures);
             }
-            sleep(2);
+            sleep(1);
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) =
                 getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
         }
 
+        my $videoDiscontinuitySignature = getPlaylistDiscontinuitySignature($videoUrl, $monitorUa);
+        my $audioDiscontinuitySignature = $audioUrl ? getPlaylistDiscontinuitySignature($audioUrl, $monitorUa) : '';
+
         my @cmd = (
-            $ffmpeg, '-loglevel', 'error', '-nostdin',
+            $ffmpeg, '-loglevel', 'fatal', '-nostdin',
             '-fflags', '+genpts+discardcorrupt',
             '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
             '-i', $videoUrl,
@@ -1606,19 +1335,29 @@ sub streamHlsViaFfmpeg {
         binmode($ffh);
 
         my $client_alive = 1;
-        my $mode_switch_requested = 0;
+        my $restart_due_to_discontinuity = 0;
         my $buffer = '';
-        my $iteration = 0;
+        $lastMonitorCheck = time();
+
         while (1) {
-            if ($opts->{desired_mode_cb} && (++$iteration % 20 == 0)) {
-                my $desired = $opts->{desired_mode_cb}->();
-                if (defined $desired && $desired ne 'harmonize') {
-                    $mode_switch_requested = 1;
-                    last;
-                }
-            }
             my $read = sysread($ffh, $buffer, 1316);
             last unless defined $read && $read > 0;
+
+            if ((time() - $lastMonitorCheck) >= 2) {
+                my $currentVideoSignature = getPlaylistDiscontinuitySignature($videoUrl, $monitorUa);
+                my $currentAudioSignature = $audioUrl ? getPlaylistDiscontinuitySignature($audioUrl, $monitorUa) : '';
+
+                if ((length($currentVideoSignature) && $currentVideoSignature ne $videoDiscontinuitySignature)
+                    || (length($currentAudioSignature) && $currentAudioSignature ne $audioDiscontinuitySignature)) {
+                    if ($debug) {
+                        printf("Detected playlist discontinuity change for %s, restarting ffmpeg harmonizer\n", $channelId);
+                    }
+                    $restart_due_to_discontinuity = 1;
+                    last;
+                }
+                $lastMonitorCheck = time();
+            }
+
             my $ok = eval { $client->write($buffer); 1 };
             unless ($ok) {
                 $client_alive = 0;
@@ -1627,7 +1366,11 @@ sub streamHlsViaFfmpeg {
         }
         close($ffh);
 
-        return 'switch' if $mode_switch_requested;
+        if ($restart_due_to_discontinuity) {
+            $failures = 0;
+            next;
+        }
+
         last unless $client_alive;
         $failures++;
     }
@@ -1638,8 +1381,6 @@ sub streamHlsViaFfmpeg {
 sub shouldUseHlsHarmonizer {
     my ($channelId, $request) = @_;
     return 0 unless $ffmpeg;
-    my $overrides = loadHarmonizeOverrides();
-    return 1 if $overrides->{$channelId};
     return 1 if $hybrid_harmonize_channels{$channelId};
 
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
@@ -1658,7 +1399,6 @@ sub shouldUseHlsHarmonizer {
 
 sub sendDynamicStream {
     my ($client, $request) = @_;
-    my $activeStreamKey;
     my $path = $request->uri->path;
     my ($channelId) = $path =~ m{/dynamic_stream/([^/]+)\.ts$};
     unless ($channelId) {
@@ -1675,82 +1415,27 @@ sub sendDynamicStream {
         return;
     }
 
-    my $send_headers = 1;
-    $activeStreamKey = registerActiveStream(
-        channelId => $channelId,
-        channelName => ($channel ? ($channel->{name} || $channelId) : $channelId),
-        mode => shouldUseHlsHarmonizer($channelId, $request) ? 'harmonize' : 'copy',
-        desiredMode => shouldUseHlsHarmonizer($channelId, $request) ? 'harmonize' : 'copy',
-        switching => JSON::PP::false,
-    );
-
-    while (1) {
-        my (undef, $currentChannel, undef, undef, $freshVideoUrl, $freshAudioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
-        $channel = $currentChannel if $currentChannel;
-        $videoUrl = $freshVideoUrl if $freshVideoUrl;
-        $audioUrl = $freshAudioUrl if $freshAudioUrl;
-
-        my $desiredMode = shouldUseHlsHarmonizer($channelId, $request) ? 'harmonize' : 'copy';
-        updateActiveStream(
-            $activeStreamKey,
-            mode => $desiredMode,
-            desiredMode => $desiredMode,
-            switching => JSON::PP::false,
-            channelName => ($channel ? ($channel->{name} || $channelId) : $channelId),
-        );
-        appendAdminLog('Modus aktiv für ' . (($channel ? $channel->{name} : $channelId) || $channelId) . ': ' . $desiredMode) if $debug;
-
-        my $result;
-        if ($desiredMode eq 'harmonize') {
-            $result = streamHlsViaFfmpeg(
-                $client, $channelId, $region, $videoUrl, $audioUrl,
-                ($channel ? $channel->{name} : undef),
-                {
-                    no_headers => !$send_headers,
-                    desired_mode_cb => sub {
-                        my $mode = shouldUseHlsHarmonizer($channelId, $request) ? 'harmonize' : 'copy';
-                        if ($mode ne 'harmonize') {
-                            updateActiveStream($activeStreamKey, desiredMode => $mode, switching => JSON::PP::true);
-                            appendAdminLog('Moduswechsel angefordert: ' . (($channel ? $channel->{name} : $channelId) || $channelId) . ' -> ' . $mode);
-                        }
-                        return $mode;
-                    },
-                }
-            );
-        } elsif ($audioUrl && $ffmpeg) {
-            $result = streamMuxedFromLocalChildStreams(
-                $client, $channelId, $region, $videoUrl, $audioUrl,
-                {
-                    no_headers => !$send_headers,
-                    desired_mode_cb => sub {
-                        my $mode = shouldUseHlsHarmonizer($channelId, $request) ? 'harmonize' : 'copy';
-                        if ($mode ne 'copy') {
-                            updateActiveStream($activeStreamKey, desiredMode => $mode, switching => JSON::PP::true);
-                            appendAdminLog('Moduswechsel angefordert: ' . (($channel ? $channel->{name} : $channelId) || $channelId) . ' -> ' . $mode);
-                        }
-                        return $mode;
-                    },
-                }
-            );
-        } elsif ($ffmpeg) {
-            $result = streamHlsViaFfmpeg(
-                $client, $channelId, $region, $videoUrl, $audioUrl,
-                ($channel ? $channel->{name} : undef),
-                { no_headers => !$send_headers }
-            );
-        } else {
-            $result = streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
-        }
-
-        $send_headers = 0;
-        if (defined $result && $result eq 'switch') {
-            next;
-        }
-        unregisterActiveStream($activeStreamKey);
-        return if $result;
-        last;
+    my $preferHarmonizer = shouldUseHlsHarmonizer($channelId, $request);
+    if ($debug) {
+        printf("Dynamic stream mode for %s: %s\n", $channelId, ($preferHarmonizer ? 'harmonize' : 'copy'));
     }
-    unregisterActiveStream($activeStreamKey);
+
+    if ($preferHarmonizer) {
+        my $ok = streamHlsViaFfmpeg($client, $channelId, $region, $videoUrl, $audioUrl, ($channel ? $channel->{name} : undef));
+        return if $ok;
+    }
+
+    if ($audioUrl && $ffmpeg) {
+        my $ok = streamMuxedFromLocalChildStreams($client, $channelId, $region, $videoUrl, $audioUrl);
+        return if $ok;
+    }
+
+    if (!$preferHarmonizer && $ffmpeg) {
+        my $ok = streamHlsViaFfmpeg($client, $channelId, $region, $videoUrl, $audioUrl, ($channel ? $channel->{name} : undef));
+        return if $ok;
+    }
+
+    streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
 }
 sub extractBestPlaylistUrl {
     my ($masterPlaylist, $baseUrl, $channelId, $masterUrl) = @_;
@@ -2370,215 +2055,6 @@ sub cleanupOldSegments {
     }
 }
 
-
-sub findChannelMetaById {
-    my ($channelId, $region) = @_;
-    $region ||= 'DE';
-    for my $channel (getChannelJson($region)) {
-        return $channel if ($channel->{id} || '') eq $channelId;
-    }
-    return undef;
-}
-
-sub sendAdminPage {
-    my ($client, $request) = @_;
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-
-    my $message = $params && $params->{msg} ? $params->{msg} : '';
-    my $snapshot = buildAdminSnapshot($region);
-    my $snapshotJson = encode_json($snapshot);
-
-    my $html = <<"HTML";
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>PlutoTV Server Konfiguration</title>
-    <style>
-        body{font-family:Arial,sans-serif;margin:24px;background:#f5f7fb;color:#1d2733}
-        h1{margin-top:0}
-        table{border-collapse:collapse;width:100%;background:#fff}
-        th,td{border:1px solid #d8dee9;padding:8px 10px;text-align:left;vertical-align:top}
-        th{background:#eef2f7}
-        .msg{padding:10px 12px;background:#dff0d8;border:1px solid #bddbb7;margin-bottom:16px}
-        form{display:inline}
-        button{padding:6px 10px;margin-right:6px}
-        .muted{color:#667085}
-        .card{background:#fff;border:1px solid #d8dee9;padding:16px;margin-bottom:20px}
-        .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2f7}
-        code{white-space:nowrap}
-        pre.logbox{background:#101828;color:#d0d5dd;padding:12px;overflow:auto;min-height:120px}
-    </style>
-</head>
-<body>
-<h1>PlutoTV Server Konfiguration</h1>
-<div class="card">
-    <div><strong>Region:</strong> <span id="regionText"></span></div>
-    <div class="muted">Die Seite aktualisiert sich automatisch über Server-Sent Events. Endpunkte für tvheadend bleiben unverändert.</div>
-</div>
-HTML
-
-    $html .= '<div class="msg">' . htmlEscape($message) . '</div>' if length $message;
-
-    $html .= <<"HTML";
-<div class="card">
-    <h2>Aktive Streams</h2>
-    <table>
-        <thead><tr><th>Sendername</th><th>ID</th><th>Start</th><th>Aktiver Modus</th><th>Harmonize dauerhaft</th><th>Aktionen</th></tr></thead>
-        <tbody id="streamsBody"></tbody>
-    </table>
-</div>
-
-<div class="card">
-    <h2>Dauerhaft aktivierte Harmonize-Sender</h2>
-    <ul id="harmonizeList"></ul>
-    <div id="harmonizeEmpty" class="muted" style="display:none">Aktuell keine dauerhaft aktivierten Harmonize-Sender.</div>
-</div>
-
-<div class="card">
-    <h2>Letzte 5 Script-Einträge</h2>
-    <pre id="logBox" class="logbox"></pre>
-</div>
-
-<script>
-    const region = __REGION_JSON__;
-    const initialSnapshot = __SNAPSHOT_JSON__;
-
-    function esc(v){
-        return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
-
-    function modeText(entry){
-        const mode = entry.mode || 'copy';
-        const desired = entry.desiredMode || mode;
-        if (entry.switching && desired !== mode) return mode + ' → ' + desired + ' …';
-        return mode;
-    }
-
-    function formHtml(entry){
-        const toggleValue = entry.harmonize ? '0' : '1';
-        const toggleText = entry.harmonize ? 'Harmonize ausschalten' : 'Harmonize einschalten';
-        return ''
-            + '<form method="post" action="/admin/toggle_harmonize">'
-            + '<input type="hidden" name="channelId" value="' + esc(entry.channelId) + '">'
-            + '<input type="hidden" name="enabled" value="' + toggleValue + '">'
-            + '<input type="hidden" name="region" value="' + esc(region) + '">'
-            + '<button type="submit">' + esc(toggleText) + '</button></form>'
-            + '<form method="post" action="/admin/force_discontinuity">'
-            + '<input type="hidden" name="channelId" value="' + esc(entry.channelId) + '">'
-            + '<input type="hidden" name="region" value="' + esc(region) + '">'
-            + '<button type="submit">Nächstes m3u8 mit DISCONTINUITY</button></form>';
-    }
-
-    function render(snapshot){
-        document.getElementById('regionText').textContent = snapshot.region || region;
-        const body = document.getElementById('streamsBody');
-        const streams = snapshot.streams || [];
-        if (!streams.length){
-            body.innerHTML = '<tr><td colspan="6" class="muted">Aktuell sind keine Streams aktiv.</td></tr>';
-        } else {
-            body.innerHTML = streams.map(entry =>
-                '<tr>'
-                + '<td>' + esc(entry.channelName) + '</td>'
-                + '<td><code>' + esc(entry.channelId) + '</code></td>'
-                + '<td>' + esc(entry.started || '') + '</td>'
-                + '<td><span class="badge">' + esc(modeText(entry)) + '</span></td>'
-                + '<td>' + (entry.harmonize ? 'an' : 'aus') + '</td>'
-                + '<td>' + formHtml(entry) + '</td>'
-                + '</tr>'
-            ).join('');
-        }
-
-        const harmonize = snapshot.harmonize || [];
-        const list = document.getElementById('harmonizeList');
-        const empty = document.getElementById('harmonizeEmpty');
-        if (!harmonize.length){
-            list.innerHTML = '';
-            empty.style.display = '';
-        } else {
-            list.innerHTML = harmonize.map(entry =>
-                '<li>' + esc(entry.channelName) + ' (<code>' + esc(entry.channelId) + '</code>)</li>'
-            ).join('');
-            empty.style.display = 'none';
-        }
-
-        const logs = snapshot.logs || [];
-        document.getElementById('logBox').textContent = logs.length ? logs.join('\\n') : 'Noch keine Einträge.';
-    }
-
-    render(initialSnapshot);
-    const es = new EventSource('/admin/events?region=' + encodeURIComponent(region));
-    es.addEventListener('snapshot', ev => {
-        try { render(JSON.parse(ev.data)); } catch (e) {}
-    });
-</script>
-</body>
-</html>
-HTML
-    $html =~ s/__REGION_JSON__/encode_json($region)/ge;
-    $html =~ s/__SNAPSHOT_JSON__/$snapshotJson/ge;
-
-    my $response = HTTP::Response->new();
-    $response->header("content-type", "text/html; charset=utf-8");
-    $response->code(200);
-    $response->message("OK");
-    $response->content(encode_utf8($html));
-    $client->send_response($response);
-}
-
-sub sendRedirect {
-    my ($client, $location) = @_;
-    my $response = HTTP::Response->new(303);
-    $response->header('Location' => $location);
-    $response->content('');
-    $client->send_response($response);
-}
-
-sub handleAdminToggleHarmonize {
-    my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    my $enabled = $params && defined $params->{enabled} ? $params->{enabled} : 0;
-    my $region = $params && $params->{region} ? $params->{region} : 'DE';
-
-    unless ($channelId) {
-        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
-        return;
-    }
-
-    my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
-    setHarmonizeOverride($channelId, $on);
-    markDesiredModeForChannel($channelId, $on ? 'harmonize' : 'copy');
-    my $channel = findChannelMetaById($channelId, $region);
-    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
-    my $msg = $on
-        ? "Harmonize für $name aktiviert."
-        : "Harmonize für $name deaktiviert.";
-    appendAdminLog($msg);
-    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
-}
-
-sub handleAdminForceDiscontinuity {
-    my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    my $region = $params && $params->{region} ? $params->{region} : 'DE';
-
-    unless ($channelId) {
-        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
-        return;
-    }
-
-    queueForcedDiscontinuity($channelId);
-    my $channel = findChannelMetaById($channelId, $region);
-    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
-    my $msg = "DISCONTINUITY wird beim nächsten m3u8 für $name eingefügt.";
-    appendAdminLog($msg);
-    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
-}
-
 sub processRequest {
     my ($client) = @_;
     my $request = $client->get_request() or die("could not get Client-Request.\n");
@@ -2605,14 +2081,6 @@ sub processRequest {
         sendElementaryDynamicStream($client, $request, 'video');
     } elsif ($path =~ m{^/dynamic_audio_stream/}) {
         sendElementaryDynamicStream($client, $request, 'audio');
-    } elsif ($path eq "/admin") {
-        sendAdminPage($client, $request);
-    } elsif ($path eq "/admin/events") {
-        sendAdminEvents($client, $request);
-    } elsif ($path eq "/admin/toggle_harmonize") {
-        handleAdminToggleHarmonize($client, $request);
-    } elsif ($path eq "/admin/force_discontinuity") {
-        handleAdminForceDiscontinuity($client, $request);
     } elsif ($path eq "/") {
         sendHelp($client, $request);
     } else {
@@ -2644,8 +2112,6 @@ $SIG{PIPE} = sub {
 };
 $SIG{CHLD} = 'IGNORE';
 
-ensureRuntimeStateDir();
-appendAdminLog("Serverstart auf $hostIp:$port (Version $version)");
 printf("PlutoTVServer started in version $version listening on $hostIp using port $port.\n");
 
 while (my $client = $daemon->accept) {
