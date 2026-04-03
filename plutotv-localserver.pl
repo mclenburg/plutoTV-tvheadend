@@ -2363,26 +2363,27 @@ sub sendAdminPage {
     my $snapshot = buildAdminSnapshot($region, $message);
     my $snapshotJson = encode_json($snapshot);
 
-    my $html = "<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>PlutoTV Server Konfiguration</title>"
-        . "<style>"
-        . "body{font-family:Arial,sans-serif;margin:24px;background:#f5f7fb;color:#1d2733}"
-        . "h1{margin-top:0} table{border-collapse:collapse;width:100%;background:#fff}"
-        . "th,td{border:1px solid #d8dee9;padding:8px 10px;text-align:left;vertical-align:top}"
-        . "th{background:#eef2f7} .msg{padding:10px 12px;background:#dff0d8;border:1px solid #bddbb7;margin-bottom:16px}"
-        . "form{display:inline} button{padding:6px 10px;margin-right:6px}"
-        . ".muted{color:#667085} .card{background:#fff;border:1px solid #d8dee9;padding:16px;margin-bottom:20px}"
-        . ".status{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2f7;font-size:12px}"
-        . ".code{font-family:monospace}"
-        . "</style></head><body>";
+    my $html = <<'HTML_HEAD';
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PlutoTV Server Konfiguration</title><style>
+    body{font-family:Arial,sans-serif;margin:24px;background:#f5f7fb;color:#1d2733}
+    h1{margin-top:0} table{border-collapse:collapse;width:100%;background:#fff}
+    th,td{border:1px solid #d8dee9;padding:8px 10px;text-align:left;vertical-align:top}
+    th{background:#eef2f7} .msg{padding:10px 12px;background:#dff0d8;border:1px solid #bddbb7;margin-bottom:16px}
+    form{display:inline} button{padding:6px 10px;margin-right:6px}
+    .muted{color:#667085} .card{background:#fff;border:1px solid #d8dee9;padding:16px;margin-bottom:20px}
+    .status{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2f7;font-size:12px}
+    .code{font-family:monospace}
+</style></head><body>
+HTML_HEAD
 
-    $html .= "<h1>PlutoTV Server Konfiguration</h1>";
-    $html .= "<div class="card"><div><strong>Region:</strong> <span id="regionText">" . htmlEscape($region) . "</span></div>";
-    $html .= "<div class="muted">Die Seite aktualisiert sich automatisch über Server-Sent Events. Du siehst laufende Streams nahezu live und kannst Harmonize oder ein einmaliges DISCONTINUITY-Flag steuern.</div></div>";
-    $html .= "<div id="messageBox" class="msg"" . (length($message) ? '' : ' style="display:none"') . ">" . htmlEscape($message) . "</div>";
+    $html .= '<h1>PlutoTV Server Konfiguration</h1>';
+    $html .= '<div class="card"><div><strong>Region:</strong> <span id="regionText">' . htmlEscape($region) . '</span></div>';
+    $html .= '<div class="muted">Die Seite aktualisiert sich automatisch über Server-Sent Events. Du siehst laufende Streams nahezu live und kannst Harmonize oder ein einmaliges DISCONTINUITY-Flag steuern.</div></div>';
+    $html .= '<div id="messageBox" class="msg"' . (length($message) ? '' : ' style="display:none"') . '>' . htmlEscape($message) . '</div>';
 
-    $html .= "<table><thead><tr><th>Sendername</th><th>ID</th><th>Start</th><th>Aktiver Modus</th><th>Harmonize dauerhaft</th><th>Aktionen</th></tr></thead><tbody id="streamsBody"></tbody></table>";
-    $html .= "<div class="card"><h2>Dauerhaft aktivierte Harmonize-Sender</h2><ul id="harmonizeList"></ul><div id="harmonizeEmpty" class="muted" style="display:none">Aktuell keine dauerhaft aktivierten Harmonize-Sender.</div></div>";
+    $html .= '<table><thead><tr><th>Sendername</th><th>ID</th><th>Start</th><th>Aktiver Modus</th><th>Harmonize dauerhaft</th><th>Aktionen</th></tr></thead><tbody id="streamsBody"></tbody></table>';
+    $html .= '<div class="card"><h2>Dauerhaft aktivierte Harmonize-Sender</h2><ul id="harmonizeList"></ul><div id="harmonizeEmpty" class="muted" style="display:none">Aktuell keine dauerhaft aktivierten Harmonize-Sender.</div></div>';
 
     $html .= "<script>
 ";
