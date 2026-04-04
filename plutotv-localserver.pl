@@ -29,7 +29,6 @@ use File::Temp qw(tempdir);
 use POSIX qw(mkfifo WNOHANG);
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
-use IO::Select;
 
 my $hostIp = "127.0.0.1";
 my $port = "9000";
@@ -244,6 +243,21 @@ sub cleanupStaleActiveStreams {
     return $streams;
 }
 
+# Read-only variant: used by the SSE loop so it never writes back to the file.
+# Writing from the SSE loop (every second) would create a race condition with
+# stream processes that call registerActiveStream concurrently, causing their
+# entries to be silently overwritten with an older snapshot.
+sub readActiveStreamsForDisplay {
+    my $streams = loadActiveStreams();
+    my %live;
+    for my $key (keys %$streams) {
+        my $entry = $streams->{$key};
+        my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
+        $live{$key} = $entry if $pid && kill(0, $pid);
+    }
+    return \%live;
+}
+
 
 sub updateActiveStream {
     my ($key, %changes) = @_;
@@ -301,9 +315,11 @@ sub appendRecentLog {
 }
 
 sub buildAdminSnapshot {
-    my ($region) = @_;
+    my ($region, %opts) = @_;
     $region ||= 'DE';
-    my $streams = cleanupStaleActiveStreams();
+    # readonly=1: called from SSE loop (never writes to active_streams.json)
+    # readonly=0: called from admin page load (cleans up stale entries)
+    my $streams = $opts{readonly} ? readActiveStreamsForDisplay() : cleanupStaleActiveStreams();
     my $harmonize = loadHarmonizeOverrides();
     my $logs = loadRecentLogs();
 
@@ -361,14 +377,19 @@ sub sendAdminEvents {
 
     my $last_payload = '';
     for (1..3600) {
-        my $snapshot = buildAdminSnapshot($region);
+        my $snapshot = buildAdminSnapshot($region, readonly => 1);
         my $payload = encode_json($snapshot);
         if ($payload ne $last_payload) {
-            my $ok = eval { $client->write("event: snapshot\n"); $client->write("data: $payload\n\n"); 1 };
+            my $ok = eval {
+                $client->write("event: snapshot\n");
+                $client->write("data: $payload\n\n");
+                $client->flush();
+                1
+            };
             last unless $ok;
             $last_payload = $payload;
         } else {
-            my $ok = eval { $client->write(": keepalive\n\n"); 1 };
+            my $ok = eval { $client->write(": keepalive\n\n"); $client->flush(); 1 };
             last unless $ok;
         }
         sleep 1;
@@ -1651,21 +1672,20 @@ sub streamHlsViaFfmpeg {
         my $restart_due_to_discontinuity = 0;
         my $buffer = '';
         my $last_poll_at = 0;
-        my $sel = IO::Select->new($ffh);
 
         while (1) {
-            # Periodic checks: mode switch + discontinuity detection.
-            # These run even when ffmpeg stalls and sysread would block forever.
+            if (desiredModeByOverride($channelId, $request) eq 'copy') {
+                $mode_switch_requested = 1;
+                last;
+            }
+
             if (time() - $last_poll_at >= 1) {
                 $last_poll_at = time();
-                if (desiredModeByOverride($channelId, $request) eq 'copy') {
-                    $mode_switch_requested = 1;
-                    last;
-                }
                 if ((time() - $last_restart_at) >= $restart_cooldown &&
                     detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq)) {
                     if ($debug) {
-                        printf("Detected playlist discontinuity for %s, restarting ffmpeg\n", $channelId);
+                        printf("Detected playlist discontinuity change for %s, restarting ffmpeg harmonizer
+", $channelId);
                     }
                     appendRecentLog('DISCONTINUITY-Neustart: ' . $channelId);
                     $restart_due_to_discontinuity = 1;
@@ -1673,11 +1693,6 @@ sub streamHlsViaFfmpeg {
                     last;
                 }
             }
-
-            # Non-blocking read: 200ms timeout so the poll above runs every ~1s
-            # regardless of whether ffmpeg is producing data.
-            my @ready = $sel->can_read(0.2);
-            next unless @ready;
 
             my $read = sysread($ffh, $buffer, 1316);
             last unless defined $read && $read > 0;
@@ -1740,19 +1755,9 @@ sub sendDynamicStream {
     );
     appendRecentLog('Stream gestartet: ' . $channelId . ' [' . $mode . ']');
 
-    # Local signal handlers: ensure cleanup even when tvheadend closes the
-    # connection unexpectedly (SIGPIPE) or the process is terminated (SIGTERM).
-    # 'local' restores the previous handler automatically when this sub exits.
-    my $cleanup = sub {
-        unregisterActiveStream($activeStreamKey) if $activeStreamKey;
-        appendRecentLog('Stream unterbrochen: ' . $channelId);
-        exit(0);
-    };
-    local $SIG{PIPE} = $cleanup;
-    local $SIG{TERM} = $cleanup;
-
     if ($debug) {
-        printf("Dynamic stream mode for %s: %s\n", $channelId, $mode);
+        printf("Dynamic stream mode for %s: %s
+", $channelId, $mode);
     }
 
     while (1) {
