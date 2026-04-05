@@ -27,6 +27,7 @@ use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
 use File::Temp qw(tempdir);
 use POSIX qw(mkfifo WNOHANG);
+use IO::Select;
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
 
@@ -243,10 +244,9 @@ sub cleanupStaleActiveStreams {
     return $streams;
 }
 
-# Read-only variant: used by the SSE loop so it never writes back to the file.
-# Writing from the SSE loop (every second) would create a race condition with
-# stream processes that call registerActiveStream concurrently, causing their
-# entries to be silently overwritten with an older snapshot.
+# Read-only view for the SSE loop: filters dead processes but NEVER writes
+# back. Writing every second from the SSE process would overwrite entries
+# registered by stream processes that started after the last read.
 sub readActiveStreamsForDisplay {
     my $streams = loadActiveStreams();
     my %live;
@@ -317,8 +317,6 @@ sub appendRecentLog {
 sub buildAdminSnapshot {
     my ($region, %opts) = @_;
     $region ||= 'DE';
-    # readonly=1: called from SSE loop (never writes to active_streams.json)
-    # readonly=0: called from admin page load (cleans up stale entries)
     my $streams = $opts{readonly} ? readActiveStreamsForDisplay() : cleanupStaleActiveStreams();
     my $harmonize = loadHarmonizeOverrides();
     my $logs = loadRecentLogs();
@@ -1608,24 +1606,22 @@ sub streamHlsViaFfmpeg {
 
     my $maxFailures = 5;
     my $failures = 0;
-    my $ua = createUserAgent();
 
-    my $last_seen_discontinuity_seq;
-    detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq);
-    my $last_restart_at = time();
-    my $restart_cooldown = 8;
+    # Stall timeout: if ffmpeg produces no output for this long, we restart.
+    # This is the correct way to detect DISCONTINUITY problems: let ffmpeg
+    # attempt its own recovery first (-reconnect_streamed, -fflags +discardcorrupt).
+    # Only intervene when it is genuinely stuck.
+    my $stall_timeout = 15;
 
     while ($failures < $maxFailures) {
         updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
 
         if ($failures > 0) {
-            if ($debug) { printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)
-", $channelId, $failures + 1, $maxFailures); }
+            if ($debug) { printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)\n", $channelId, $failures + 1, $maxFailures); }
             sleep(2);
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
-            detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq) unless defined $last_seen_discontinuity_seq;
         }
 
         my @cmd = (
@@ -1658,59 +1654,57 @@ sub streamHlsViaFfmpeg {
             '-metadata', 'service_name=' . ($channelName || $channelId),
             '-f', 'mpegts', 'pipe:1';
 
-        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s
-", $channelId); }
+        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s\n", $channelId); }
 
         my $ffh;
         my $ffpid = open($ffh, '-|', @cmd);
-        unless ($ffpid) { warn "Failed to start ffmpeg HLS harmonizer: $!
-"; $failures++; next; }
+        unless ($ffpid) { warn "Failed to start ffmpeg HLS harmonizer: $!\n"; $failures++; next; }
         binmode($ffh);
 
+        my $sel = IO::Select->new($ffh);
         my $client_alive = 1;
         my $mode_switch_requested = 0;
-        my $restart_due_to_discontinuity = 0;
+        my $stalled = 0;
+        my $last_output_at = time();
         my $buffer = '';
-        my $last_poll_at = 0;
 
         while (1) {
+            # Check mode switch (cheap: reads small JSON file)
             if (desiredModeByOverride($channelId, $request) eq 'copy') {
                 $mode_switch_requested = 1;
                 last;
             }
 
-            if (time() - $last_poll_at >= 1) {
-                $last_poll_at = time();
-                if ((time() - $last_restart_at) >= $restart_cooldown &&
-                    detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq)) {
-                    if ($debug) {
-                        printf("Detected playlist discontinuity change for %s, restarting ffmpeg harmonizer
-", $channelId);
-                    }
-                    appendRecentLog('DISCONTINUITY-Neustart: ' . $channelId);
-                    $restart_due_to_discontinuity = 1;
-                    $last_restart_at = time();
-                    last;
+            # Non-blocking read with 0.5s timeout so mode check runs regularly
+            my @ready = $sel->can_read(0.5);
+            if (@ready) {
+                my $read = sysread($ffh, $buffer, 1316);
+                if (!defined $read || $read == 0) {
+                    last;    # ffmpeg exited (EOF)
                 }
+                $last_output_at = time();
+                my $ok = eval { $client->write($buffer); 1 };
+                unless ($ok) { $client_alive = 0; last; }
+            } elsif (time() - $last_output_at >= $stall_timeout) {
+                # ffmpeg has been silent too long - stuck at a DISCONTINUITY
+                if ($debug) {
+                    printf("ffmpeg stalled >%ds for %s, restarting\n", $stall_timeout, $channelId);
+                }
+                appendRecentLog('ffmpeg-Stall, Neustart: ' . $channelId);
+                $stalled = 1;
+                last;
             }
-
-            my $read = sysread($ffh, $buffer, 1316);
-            last unless defined $read && $read > 0;
-            my $ok = eval { $client->write($buffer); 1 };
-            unless ($ok) { $client_alive = 0; last; }
         }
 
-        if ($mode_switch_requested || $restart_due_to_discontinuity) {
-            kill 'TERM', $ffpid if $ffpid;
-        }
-        close($ffh);
+        kill 'TERM', $ffpid if $ffpid && ($mode_switch_requested || $stalled);
+        close($ffh);    # implicitly waits for ffmpeg to exit
 
         return 'switch' if $mode_switch_requested;
-        if ($restart_due_to_discontinuity) {
+        if ($stalled) {
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
-            next;
+            next;   # restart ffmpeg, same failure counter
         }
 
         last unless $client_alive;
