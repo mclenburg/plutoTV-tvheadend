@@ -27,7 +27,6 @@ use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
 use File::Temp qw(tempdir);
 use POSIX qw(mkfifo WNOHANG);
-use IO::Select;
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
 
@@ -67,6 +66,7 @@ my $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
 my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
 my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
 my $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
+my $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
 my $tempFile;
 
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
@@ -77,6 +77,7 @@ if (defined $tempFile && length $tempFile) {
     $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
     $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
     $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
+    $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
 }
 
 sub parseChannelListArg {
@@ -244,9 +245,28 @@ sub cleanupStaleActiveStreams {
     return $streams;
 }
 
-# Read-only view for the SSE loop: filters dead processes but NEVER writes
-# back. Writing every second from the SSE process would overwrite entries
-# registered by stream processes that started after the last read.
+
+# ── Runtime config ───────────────────────────────────────────────────────────
+sub loadRuntimeConfig {
+    my $parsed = loadJsonFile($runtimeConfigStateFile, {});
+    return {} unless ref($parsed) eq 'HASH';
+    return $parsed;
+}
+
+sub saveRuntimeConfig {
+    my ($hashref) = @_;
+    $hashref ||= {};
+    return saveJsonFile($runtimeConfigStateFile, $hashref);
+}
+
+sub getConfigValue {
+    my ($key, $default) = @_;
+    my $cfg = loadRuntimeConfig();
+    return (defined $cfg->{$key} && length $cfg->{$key}) ? $cfg->{$key} : $default;
+}
+
+# Read-only view for the SSE loop.  NEVER writes back – avoids overwriting
+# entries that stream processes registered between our read and the write.
 sub readActiveStreamsForDisplay {
     my $streams = loadActiveStreams();
     my %live;
@@ -257,7 +277,6 @@ sub readActiveStreamsForDisplay {
     }
     return \%live;
 }
-
 
 sub updateActiveStream {
     my ($key, %changes) = @_;
@@ -310,15 +329,20 @@ sub appendRecentLog {
         ts => time(),
         line => "$message",
     };
-    shift @$logs while @$logs > 5;
+    my $maxLogs = int(getConfigValue('log_depth', 10));
+    $maxLogs = 5 unless $maxLogs >= 5;
+    shift @$logs while @$logs > $maxLogs;
     saveRecentLogs($logs);
 }
 
 sub buildAdminSnapshot {
     my ($region, %opts) = @_;
     $region ||= 'DE';
+    # readonly=1: called from SSE loop (never writes active_streams.json)
+    # readonly=0: called from page load (cleans up stale entries once)
     my $streams = $opts{readonly} ? readActiveStreamsForDisplay() : cleanupStaleActiveStreams();
     my $harmonize = loadHarmonizeOverrides();
+    my $cfg = loadRuntimeConfig();
     my $logs = loadRecentLogs();
 
     my @entries;
@@ -333,6 +357,7 @@ sub buildAdminSnapshot {
             mode => $entry->{mode} || 'copy',
             desiredMode => $entry->{desiredMode} || ($harmonize->{$channelId} ? 'harmonize' : 'copy'),
             started => formatEpochLocal($entry->{startedAt}),
+            pid => $entry->{pid} || 0,
             harmonize => ($harmonize->{$channelId} || 0) ? 1 : 0,
         };
     }
@@ -344,6 +369,7 @@ sub buildAdminSnapshot {
         push @harm, { channelId => $channelId, channelName => $name };
     }
 
+    my $logDepth = int(getConfigValue('log_depth', 10));
     my @recent = map {
         +{
             ts => formatEpochLocal($_->{ts}),
@@ -356,6 +382,11 @@ sub buildAdminSnapshot {
         streams => \@entries,
         harmonizeList => \@harm,
         logs => \@recent,
+        config => {
+            stall_timeout => int(getConfigValue('stall_timeout', 15)),
+            max_failures  => int(getConfigValue('max_failures', 5)),
+            log_depth     => $logDepth,
+        },
     };
 }
 
@@ -1604,24 +1635,22 @@ sub streamHlsViaFfmpeg {
         $$headersSentRef = 1 if $headersSentRef;
     }
 
-    my $maxFailures = 5;
+    my $maxFailures = int(getConfigValue('max_failures', 5));
+    my $stall_timeout = int(getConfigValue('stall_timeout', 15));
     my $failures = 0;
-
-    # Stall timeout: if ffmpeg produces no output for this long, we restart.
-    # This is the correct way to detect DISCONTINUITY problems: let ffmpeg
-    # attempt its own recovery first (-reconnect_streamed, -fflags +discardcorrupt).
-    # Only intervene when it is genuinely stuck.
-    my $stall_timeout = 15;
+    my $ua = createUserAgent();
 
     while ($failures < $maxFailures) {
         updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
 
         if ($failures > 0) {
-            if ($debug) { printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)\n", $channelId, $failures + 1, $maxFailures); }
+            if ($debug) { printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)
+", $channelId, $failures + 1, $maxFailures); }
             sleep(2);
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
+            detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq) unless defined $last_seen_discontinuity_seq;
         }
 
         my @cmd = (
@@ -1654,57 +1683,59 @@ sub streamHlsViaFfmpeg {
             '-metadata', 'service_name=' . ($channelName || $channelId),
             '-f', 'mpegts', 'pipe:1';
 
-        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s\n", $channelId); }
+        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s
+", $channelId); }
 
         my $ffh;
         my $ffpid = open($ffh, '-|', @cmd);
-        unless ($ffpid) { warn "Failed to start ffmpeg HLS harmonizer: $!\n"; $failures++; next; }
+        unless ($ffpid) { warn "Failed to start ffmpeg HLS harmonizer: $!
+"; $failures++; next; }
         binmode($ffh);
 
-        my $sel = IO::Select->new($ffh);
         my $client_alive = 1;
         my $mode_switch_requested = 0;
-        my $stalled = 0;
-        my $last_output_at = time();
+        my $restart_due_to_discontinuity = 0;
         my $buffer = '';
+        my $last_poll_at = 0;
 
         while (1) {
-            # Check mode switch (cheap: reads small JSON file)
             if (desiredModeByOverride($channelId, $request) eq 'copy') {
                 $mode_switch_requested = 1;
                 last;
             }
 
-            # Non-blocking read with 0.5s timeout so mode check runs regularly
-            my @ready = $sel->can_read(0.5);
-            if (@ready) {
-                my $read = sysread($ffh, $buffer, 1316);
-                if (!defined $read || $read == 0) {
-                    last;    # ffmpeg exited (EOF)
+            if (time() - $last_poll_at >= 1) {
+                $last_poll_at = time();
+                if ((time() - $last_restart_at) >= $restart_cooldown &&
+                    detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq)) {
+                    if ($debug) {
+                        printf("Detected playlist discontinuity change for %s, restarting ffmpeg harmonizer
+", $channelId);
+                    }
+                    appendRecentLog('DISCONTINUITY-Neustart: ' . $channelId);
+                    $restart_due_to_discontinuity = 1;
+                    $last_restart_at = time();
+                    last;
                 }
-                $last_output_at = time();
-                my $ok = eval { $client->write($buffer); 1 };
-                unless ($ok) { $client_alive = 0; last; }
-            } elsif (time() - $last_output_at >= $stall_timeout) {
-                # ffmpeg has been silent too long - stuck at a DISCONTINUITY
-                if ($debug) {
-                    printf("ffmpeg stalled >%ds for %s, restarting\n", $stall_timeout, $channelId);
-                }
-                appendRecentLog('ffmpeg-Stall, Neustart: ' . $channelId);
-                $stalled = 1;
-                last;
             }
+
+            my $read = sysread($ffh, $buffer, 1316);
+            last unless defined $read && $read > 0;
+            my $ok = eval { $client->write($buffer); 1 };
+            unless ($ok) { $client_alive = 0; last; }
         }
 
-        kill 'TERM', $ffpid if $ffpid && ($mode_switch_requested || $stalled);
-        close($ffh);    # implicitly waits for ffmpeg to exit
+        if ($mode_switch_requested || $restart_due_to_discontinuity) {
+            kill 'TERM', $ffpid if $ffpid;
+        }
+        close($ffh);
 
         return 'switch' if $mode_switch_requested;
-        if ($stalled) {
+        if ($restart_due_to_discontinuity) {
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
-            next;   # restart ffmpeg, same failure counter
+            next;
         }
 
         last unless $client_alive;
@@ -2406,90 +2437,316 @@ sub findChannelMetaById {
     }
     return undef;
 }
-
+new_admin = r'''
 sub sendAdminPage {
     my ($client, $request) = @_;
     my $region = 'DE';
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-    my $message = $params && $params->{msg} ? $params->{msg} : '';
     my $snapshot = buildAdminSnapshot($region);
     my $snapshotJson = encode_json($snapshot);
+    my $regionsJson = encode_json([ sort keys %regions ]);
 
-    my $html = <<'HTML';
+    my $html = <<"HTML";
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>PlutoTV Server Konfiguration</title>
-    <style>
-        body{font-family:Arial,sans-serif;margin:24px;background:#f5f7fb;color:#1d2733}
-        h1{margin-top:0} table{border-collapse:collapse;width:100%;background:#fff}
-        th,td{border:1px solid #d8dee9;padding:8px 10px;text-align:left;vertical-align:top}
-        th{background:#eef2f7}.msg{padding:10px 12px;background:#dff0d8;border:1px solid #bddbb7;margin-bottom:16px}
-        form{display:inline} button{padding:6px 10px;margin-right:6px}
-        .muted{color:#667085}.card{background:#fff;border:1px solid #d8dee9;padding:16px;margin-bottom:20px}
-        pre{background:#fff;border:1px solid #d8dee9;padding:12px;white-space:pre-wrap}
-        code{font-family:monospace}
-    </style></head><body>
-<h1>PlutoTV Server Konfiguration</h1>
-<div class="card"><div><strong>Region:</strong> <span id="regionText"></span></div>
-    <div class="muted">Die Seite aktualisiert sich automatisch über Server-Sent Events. Endpunkte für tvheadend bleiben unverändert.</div></div>
-<div id="messageBox" class="msg" style="display:none"></div>
-<table><thead><tr><th>Sendername</th><th>ID</th><th>Start</th><th>Aktiver Modus</th><th>Harmonize dauerhaft</th><th>Aktionen</th></tr></thead><tbody id="streamsBody"></tbody></table>
-<div class="card"><h2>Dauerhaft aktivierte Harmonize-Sender</h2><ul id="harmonizeList"></ul><div id="harmonizeEmpty" class="muted" style="display:none">Aktuell keine dauerhaft aktivierten Harmonize-Sender.</div></div>
-<div class="card"><h2>Letzte 5 Script-Einträge</h2><pre id="logBox"></pre></div>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PlutoTV Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,Arial,sans-serif;background:#f0f2f5;color:#1a1d23;font-size:14px}
+header{background:#1a1d23;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:16px}
+header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
+header .sub{opacity:.55;font-size:12px;margin-left:auto}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.badge-copy{background:#e3f0ff;color:#1565c0}
+.badge-harmonize{background:#fdf3cd;color:#8a6000}
+.badge-ok{background:#e6f4ea;color:#1e6e35}
+.badge-warn{background:#fff3e0;color:#8a4500}
+main{padding:24px;max-width:1200px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+.card{background:#fff;border-radius:8px;border:1px solid #e0e4ea;overflow:hidden}
+.card-head{padding:12px 18px;border-bottom:1px solid #e0e4ea;display:flex;align-items:center;gap:10px}
+.card-head h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#667085}
+.card-head .dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
+.card-head .dot-off{background:#d1d5db}
+.card-body{padding:18px}
+table{width:100%;border-collapse:collapse}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#667085;padding:8px 12px;text-align:left;border-bottom:2px solid #e0e4ea;white-space:nowrap}
+td{padding:10px 12px;border-bottom:1px solid #f0f2f5;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#f8f9fb}
+code{font-family:ui-monospace,monospace;font-size:12px;background:#f0f2f5;padding:1px 5px;border-radius:3px}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border:1px solid #d1d5db;border-radius:5px;background:#fff;color:#374151;font-size:12px;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s;white-space:nowrap}
+.btn:hover{background:#f3f4f6;border-color:#9ca3af}
+.btn:active{background:#e5e7eb}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-primary{background:#1a1d23;color:#fff;border-color:#1a1d23}
+.btn-primary:hover{background:#2d3340;border-color:#2d3340}
+.btn-danger{background:#fef2f2;color:#c0392b;border-color:#fca5a5}
+.btn-danger:hover{background:#fee2e2;border-color:#f87171}
+.btn-sm{padding:3px 8px;font-size:11px}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.empty{color:#9ca3af;font-style:italic;padding:20px;text-align:center}
+.cfg-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #f0f2f5}
+.cfg-row:last-child{border-bottom:none}
+.cfg-label{flex:1;font-size:13px;color:#374151}
+.cfg-hint{flex:2;font-size:12px;color:#9ca3af}
+.cfg-input{width:80px;padding:5px 8px;border:1px solid #d1d5db;border-radius:5px;font-size:13px;font-family:inherit;text-align:right}
+.cfg-input:focus{outline:none;border-color:#6366f1}
+.toast{position:fixed;bottom:24px;right:24px;padding:10px 16px;border-radius:7px;font-size:13px;font-weight:500;background:#1a1d23;color:#fff;opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.err{background:#c0392b}
+pre{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;line-height:1.6;color:#374151;max-height:220px;overflow-y:auto}
+.region-select{padding:4px 8px;border:1px solid #444;border-radius:5px;background:#2d3340;color:#fff;font-size:12px;font-family:inherit;cursor:pointer}
+.sse-status{font-size:11px;display:flex;align-items:center;gap:5px}
+.sse-dot{width:6px;height:6px;border-radius:50%;background:#22c55e;transition:background .3s}
+.sse-dot.off{background:#ef4444}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#127916; PlutoTV Admin</h1>
+  <select class="region-select" id="regionSel" onchange="changeRegion(this.value)">__REGION_OPTIONS__</select>
+  <span class="sub">
+    <span class="sse-status"><span class="sse-dot" id="sseDot"></span><span id="sseLabel">Verbinde...</span></span>
+  </span>
+</header>
+<main>
+
+  <div class="card" id="streamsCard">
+    <div class="card-head">
+      <span class="dot dot-off" id="streamsDot"></span>
+      <h2>Aktive Streams</h2>
+      <span id="streamsCount" style="margin-left:auto;font-size:11px;color:#9ca3af"></span>
+    </div>
+    <div id="streamsWrap">
+      <table>
+        <thead><tr>
+          <th>Sender</th><th>ID</th><th>Start</th>
+          <th>Modus</th><th>Harmonize</th><th>Aktionen</th>
+        </tr></thead>
+        <tbody id="streamsBody"><tr><td colspan="6" class="empty">Keine aktiven Streams.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Konfiguration (wirkt ab n&auml;chstem ffmpeg-Start)</h2></div>
+    <div class="card-body">
+      <div class="cfg-row">
+        <span class="cfg-label">Stall-Timeout</span>
+        <span class="cfg-hint">Sekunden ohne ffmpeg-Output bevor Neustart</span>
+        <input class="cfg-input" type="number" id="cfgStall" min="5" max="120" value="15">
+        <span style="font-size:12px;color:#9ca3af">s</span>
+      </div>
+      <div class="cfg-row">
+        <span class="cfg-label">Max. Fehlversuche</span>
+        <span class="cfg-hint">Wie oft ffmpeg neu gestartet wird bevor Stream aufgibt</span>
+        <input class="cfg-input" type="number" id="cfgFail" min="1" max="20" value="5">
+      </div>
+      <div class="cfg-row">
+        <span class="cfg-label">Log-Tiefe</span>
+        <span class="cfg-hint">Anzahl gespeicherter Log-Eintr&auml;ge</span>
+        <input class="cfg-input" type="number" id="cfgLogDepth" min="5" max="100" value="10">
+      </div>
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" onclick="saveConfig()">Speichern</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Dauerhaft Harmonize</h2></div>
+    <div class="card-body">
+      <ul id="harmonizeList" style="padding-left:16px;line-height:1.9"></ul>
+      <p id="harmonizeEmpty" class="empty" style="display:none">Keine dauerhaft aktivierten Harmonize-Sender.</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Letzte Log-Eintr&auml;ge</h2></div>
+    <div class="card-body"><pre id="logBox">Keine Eintr&auml;ge.</pre></div>
+  </div>
+
+</main>
+<div class="toast" id="toast"></div>
 <script>
-    const initialSnapshot = __SNAPSHOT__;
-    const region = "__REGION__";
-    const message = "__MESSAGE__";
-    function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-    function render(snapshot){
-        document.getElementById('regionText').textContent = snapshot.region || region;
-        const body = document.getElementById('streamsBody');
-        const rows = (snapshot.streams||[]).map(entry => {
-            const toggleValue = entry.harmonize ? '0' : '1';
-            const toggleText = entry.harmonize ? 'Harmonize ausschalten' : 'Harmonize einschalten';
-            return '<tr>'
-                + '<td>' + esc(entry.channelName) + '</td>'
-                + '<td><code>' + esc(entry.channelId) + '</code></td>'
-                + '<td>' + esc(entry.started) + '</td>'
-                + '<td>' + esc(entry.mode) + '</td>'
-                + '<td>' + (entry.harmonize ? 'an' : 'aus') + '</td>'
-                + '<td>'
-                + '<form method="post" action="/admin/toggle_harmonize">'
-                + '<input type="hidden" name="channelId" value="' + esc(entry.channelId) + '">'
-                + '<input type="hidden" name="enabled" value="' + toggleValue + '">'
-                + '<input type="hidden" name="region" value="' + esc(snapshot.region || region) + '">'
-                + '<button type="submit">' + toggleText + '</button></form>'
-                + '<form method="post" action="/admin/force_discontinuity">'
-                + '<input type="hidden" name="channelId" value="' + esc(entry.channelId) + '">'
-                + '<input type="hidden" name="region" value="' + esc(snapshot.region || region) + '">'
-                + '<button type="submit">Nächstes m3u8 mit DISCONTINUITY</button></form>'
-                + '</td></tr>';
-        });
-        body.innerHTML = rows.length ? rows.join('') : '<tr><td colspan="6" class="muted">Aktuell sind keine Streams aktiv.</td></tr>';
-        const hlist = document.getElementById('harmonizeList');
-        const items = (snapshot.harmonizeList||[]).map(entry => '<li>' + esc(entry.channelName) + ' (<code>' + esc(entry.channelId) + '</code>)</li>');
-        hlist.innerHTML = items.join('');
-        document.getElementById('harmonizeEmpty').style.display = items.length ? 'none' : 'block';
-        const logs = (snapshot.logs||[]).map(entry => '[' + entry.ts + '] ' + entry.line).join('
-        ');
-        document.getElementById('logBox').textContent = logs || 'Keine Einträge.';
-    }
-    render(initialSnapshot);
-    if (message) {
-        const box = document.getElementById('messageBox');
-        box.textContent = message;
-        box.style.display = 'block';
-    }
-    const es = new EventSource('/admin/events?region=' + encodeURIComponent(region));
-    es.addEventListener('snapshot', ev => {
-        try { render(JSON.parse(ev.data)); } catch(e) {}
+(function(){
+const INIT = __SNAPSHOT__;
+let currentRegion = "__REGION__";
+const ALL_REGIONS = __REGIONS__;
+
+function esc(s){
+    return String(s==null?'':s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function toast(msg, isErr){
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isErr ? ' err' : '');
+    clearTimeout(t._tid);
+    t._tid = setTimeout(() => t.className = 'toast', 2800);
+}
+
+function api(path, params){
+    const body = new URLSearchParams(params);
+    return fetch(path, {method:'POST', body})
+        .then(r => r.json())
+        .then(d => {
+            if(d.ok) toast(d.msg || 'OK');
+            else toast(d.error || 'Fehler', true);
+            return d;
+        })
+        .catch(e => { toast('Netzwerkfehler', true); });
+}
+
+function changeRegion(r){
+    currentRegion = r;
+    location.href = '/admin?region=' + encodeURIComponent(r);
+}
+
+function saveConfig(){
+    api('/admin/set_config', {
+        stall_timeout: document.getElementById('cfgStall').value,
+        max_failures:  document.getElementById('cfgFail').value,
+        log_depth:     document.getElementById('cfgLogDepth').value,
     });
+}
+window.saveConfig = saveConfig;
+window.changeRegion = changeRegion;
+
+function renderStreams(streams){
+    const body = document.getElementById('streamsBody');
+    const dot  = document.getElementById('streamsDot');
+    const cnt  = document.getElementById('streamsCount');
+    cnt.textContent = streams.length ? streams.length + ' aktiv' : '';
+    dot.className   = 'dot' + (streams.length ? '' : ' dot-off');
+    if(!streams.length){
+        body.innerHTML = '<tr><td colspan="6" class="empty">Keine aktiven Streams.</td></tr>';
+        return;
+    }
+    body.innerHTML = streams.map(e => {
+        const harmOn = !!e.harmonize;
+        return '<tr>'
+            + '<td><strong>' + esc(e.channelName) + '</strong></td>'
+            + '<td><code>' + esc(e.channelId) + '</code></td>'
+            + '<td style="white-space:nowrap">' + esc(e.started) + '</td>'
+            + '<td><span class="badge badge-' + esc(e.mode) + '">' + esc(e.mode) + '</span></td>'
+            + '<td>' + (harmOn ? '<span class="badge badge-ok">an</span>' : '<span class="badge badge-warn">aus</span>') + '</td>'
+            + '<td><div class="actions">'
+            + '<button class="btn btn-sm" onclick="toggleHarmonize(' + JSON.stringify(e.channelId) + ',' + (harmOn?'0':'1') + ')">'
+            +   (harmOn ? 'Harmonize aus' : 'Harmonize ein') + '</button>'
+            + '<button class="btn btn-sm" onclick="forceDisc(' + JSON.stringify(e.channelId) + ')">'
+            +   'DISCONTINUITY' + '</button>'
+            + '<button class="btn btn-sm btn-danger" onclick="restartStream(' + JSON.stringify(e.key) + ')">'
+            +   '&#8635; Neustart' + '</button>'
+            + '</div></td>'
+            + '</tr>';
+    }).join('');
+}
+
+function renderHarmonize(list){
+    const ul = document.getElementById('harmonizeList');
+    const em = document.getElementById('harmonizeEmpty');
+    if(!list.length){ ul.innerHTML=''; em.style.display='block'; return; }
+    em.style.display='none';
+    ul.innerHTML = list.map(e =>
+        '<li>' + esc(e.channelName) + ' <code>' + esc(e.channelId) + '</code></li>'
+    ).join('');
+}
+
+function renderLogs(logs){
+    document.getElementById('logBox').textContent =
+        logs.map(l => '[' + l.ts + '] ' + l.line).join('\n') || 'Keine Eintr\u00e4ge.';
+}
+
+function renderConfig(cfg){
+    if(!cfg) return;
+    document.getElementById('cfgStall').value    = cfg.stall_timeout ?? 15;
+    document.getElementById('cfgFail').value     = cfg.max_failures  ?? 5;
+    document.getElementById('cfgLogDepth').value = cfg.log_depth     ?? 10;
+}
+
+function render(snap){
+    renderStreams(snap.streams || []);
+    renderHarmonize(snap.harmonizeList || []);
+    renderLogs(snap.logs || []);
+    renderConfig(snap.config);
+}
+
+// Actions
+function toggleHarmonize(channelId, enabled){
+    api('/admin/toggle_harmonize', {channelId, enabled, region: currentRegion});
+}
+function forceDisc(channelId){
+    api('/admin/force_discontinuity', {channelId, region: currentRegion});
+}
+function restartStream(key){
+    api('/admin/restart_stream', {key});
+}
+window.toggleHarmonize = toggleHarmonize;
+window.forceDisc = forceDisc;
+window.restartStream = restartStream;
+
+// Region selector
+(function(){
+    const sel = document.getElementById('regionSel');
+    ALL_REGIONS.forEach(r => {
+        const o = document.createElement('option');
+        o.value = r; o.textContent = r;
+        if(r === currentRegion) o.selected = true;
+        sel.appendChild(o);
+    });
+})();
+
+// SSE
+let es, sseRetryTimer;
+function connectSSE(){
+    const dot   = document.getElementById('sseDot');
+    const label = document.getElementById('sseLabel');
+    if(es){ try{ es.close(); }catch(e){} }
+    dot.className = 'sse-dot off';
+    label.textContent = 'Verbinde...';
+    es = new EventSource('/admin/events?region=' + encodeURIComponent(currentRegion));
+    es.addEventListener('snapshot', ev => {
+        try{ render(JSON.parse(ev.data)); }catch(e){}
+    });
+    es.onopen = () => {
+        dot.className = 'sse-dot';
+        label.textContent = 'Live';
+        clearTimeout(sseRetryTimer);
+    };
+    es.onerror = () => {
+        dot.className = 'sse-dot off';
+        label.textContent = 'Getrennt';
+        es.close();
+        sseRetryTimer = setTimeout(connectSSE, 3000);
+    };
+}
+connectSSE();
+
+// Initial render from server-side snapshot
+render(INIT);
+
+})();
 </script>
-</body></html>
+</body>
+</html>
 HTML
+    # Build region <option> tags  (no JS needed, renders immediately)
+    my $regionOptions = '';
+    for my $r (sort keys %regions) {
+        my $sel = ($r eq $region) ? ' selected' : '';
+        $regionOptions .= "<option value=\"$r\"$sel>$r</option>";
+    }
     $html =~ s/__SNAPSHOT__/$snapshotJson/;
-    $html =~ s/__REGION__/htmlEscape($region)/e;
-    $html =~ s/__MESSAGE__/htmlEscape($message)/e;
+    $html =~ s/__REGION__/$region/g;
+    $html =~ s/__REGION_OPTIONS__/$regionOptions/;
+    $html =~ s/__REGIONS__/$regionsJson/;
     my $response = HTTP::Response->new();
     $response->header("content-type", "text/html; charset=utf-8");
     $response->code(200);
@@ -2497,6 +2754,12 @@ HTML
     $response->content(encode_utf8($html));
     $client->send_response($response);
 }
+'''
+
+with open('/home/claude/new_admin_page.py', 'w') as f:
+f.write(new_admin)
+
+print("admin page text written")
 
 sub sendRedirect {
     my ($client, $location) = @_;
@@ -2506,46 +2769,100 @@ sub sendRedirect {
     $client->send_response($response);
 }
 
+sub sendJsonOk {
+    my ($client, %extra) = @_;
+    my $response = HTTP::Response->new(200);
+    $response->header('Content-Type' => 'application/json; charset=utf-8');
+    $response->header('Access-Control-Allow-Origin' => '*');
+    $response->content(encode_json({ ok => 1, %extra }));
+    $client->send_response($response);
+}
+
+sub sendJsonError {
+    my ($client, $msg) = @_;
+    my $response = HTTP::Response->new(400);
+    $response->header('Content-Type' => 'application/json; charset=utf-8');
+    $response->content(encode_json({ ok => 0, error => ($msg || 'error') }));
+    $client->send_response($response);
+}
+
+sub handleAdminSetConfig {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $cfg = loadRuntimeConfig();
+    my $changed = 0;
+    for my $key (qw(stall_timeout max_failures log_depth)) {
+        if ($params && defined $params->{$key} && $params->{$key} =~ /^\d+$/) {
+            my $val = int($params->{$key});
+            my %min = (stall_timeout => 5, max_failures => 1, log_depth => 5);
+            my %max = (stall_timeout => 120, max_failures => 20, log_depth => 100);
+            $val = $min{$key} if $val < $min{$key};
+            $val = $max{$key} if $val > $max{$key};
+            $cfg->{$key} = $val;
+            $changed = 1;
+        }
+    }
+    if ($changed) {
+        saveRuntimeConfig($cfg);
+        appendRecentLog(sprintf('Konfiguration gespeichert: stall=%ds fail=%d logs=%d',
+            $cfg->{stall_timeout}||15, $cfg->{max_failures}||5, $cfg->{log_depth}||10));
+        sendJsonOk($client);
+    } else {
+        sendJsonError($client, 'Keine gültigen Parameter');
+    }
+}
+
+sub handleAdminRestartStream {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $key = $params && $params->{key} ? $params->{key} : '';
+    unless ($key) {
+        sendJsonError($client, 'Fehlender key-Parameter');
+        return;
+    }
+    my $streams = loadActiveStreams();
+    my $entry = $streams->{$key};
+    unless (ref($entry) eq 'HASH' && $entry->{pid}) {
+        sendJsonError($client, 'Stream nicht gefunden');
+        return;
+    }
+    my $pid = $entry->{pid};
+    unless (kill(0, $pid)) {
+        sendJsonError($client, 'Prozess nicht mehr aktiv');
+        return;
+    }
+    kill('TERM', $pid);
+    appendRecentLog('Stream-Neustart angefordert: ' . ($entry->{channelId} || $key));
+    sendJsonOk($client);
+}
+
 sub handleAdminToggleHarmonize {
     my ($client, $request) = @_;
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
     my $enabled = $params && defined $params->{enabled} ? $params->{enabled} : 0;
     my $region = $params && $params->{region} ? $params->{region} : 'DE';
-
     unless ($channelId) {
-        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
+        sendJsonError($client, 'Fehlende channelId');
         return;
     }
-
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
     setHarmonizeOverride($channelId, $on);
     appendRecentLog(($on ? 'Harmonize aktiviert: ' : 'Harmonize deaktiviert: ') . $channelId);
-    my $channel = findChannelMetaById($channelId, $region);
-    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
-    my $msg = $on
-        ? "Harmonize für $name aktiviert."
-        : "Harmonize für $name deaktiviert.";
-    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
+    sendJsonOk($client, msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'));
 }
 
 sub handleAdminForceDiscontinuity {
     my ($client, $request) = @_;
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    my $region = $params && $params->{region} ? $params->{region} : 'DE';
-
     unless ($channelId) {
-        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
+        sendJsonError($client, 'Fehlende channelId');
         return;
     }
-
     queueForcedDiscontinuity($channelId);
     appendRecentLog('DISCONTINUITY vorgemerkt: ' . $channelId);
-    my $channel = findChannelMetaById($channelId, $region);
-    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
-    my $msg = "DISCONTINUITY wird beim nächsten m3u8 für $name eingefügt.";
-    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
+    sendJsonOk($client, msg => 'DISCONTINUITY vorgemerkt');
 }
 
 sub processRequest {
@@ -2582,6 +2899,10 @@ sub processRequest {
         handleAdminToggleHarmonize($client, $request);
     } elsif ($path eq "/admin/force_discontinuity") {
         handleAdminForceDiscontinuity($client, $request);
+    } elsif ($path eq "/admin/set_config") {
+        handleAdminSetConfig($client, $request);
+    } elsif ($path eq "/admin/restart_stream") {
+        handleAdminRestartStream($client, $request);
     } elsif ($path eq "/favicon.ico") {
         my $response = HTTP::Response->new(204);
         $client->send_response($response);
