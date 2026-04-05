@@ -27,6 +27,7 @@ use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
 use File::Temp qw(tempdir);
 use POSIX qw(mkfifo WNOHANG);
+use IO::Select;
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
 
@@ -246,7 +247,20 @@ sub cleanupStaleActiveStreams {
 }
 
 
-# ── Runtime config ───────────────────────────────────────────────────────────
+sub readActiveStreamsForDisplay {
+    # Read-only: filters dead PIDs but NEVER writes back.
+    # The SSE loop calls this every second; writing would overwrite entries
+    # that stream processes registered between our read and the next write.
+    my $streams = loadActiveStreams();
+    my %live;
+    for my $key (keys %$streams) {
+        my $entry = $streams->{$key};
+        my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
+        $live{$key} = $entry if $pid && kill(0, $pid);
+    }
+    return \%live;
+}
+
 sub loadRuntimeConfig {
     my $parsed = loadJsonFile($runtimeConfigStateFile, {});
     return {} unless ref($parsed) eq 'HASH';
@@ -262,20 +276,7 @@ sub saveRuntimeConfig {
 sub getConfigValue {
     my ($key, $default) = @_;
     my $cfg = loadRuntimeConfig();
-    return (defined $cfg->{$key} && length $cfg->{$key}) ? $cfg->{$key} : $default;
-}
-
-# Read-only view for the SSE loop.  NEVER writes back – avoids overwriting
-# entries that stream processes registered between our read and the write.
-sub readActiveStreamsForDisplay {
-    my $streams = loadActiveStreams();
-    my %live;
-    for my $key (keys %$streams) {
-        my $entry = $streams->{$key};
-        my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
-        $live{$key} = $entry if $pid && kill(0, $pid);
-    }
-    return \%live;
+    return (defined $cfg->{$key} && length "$cfg->{$key}") ? $cfg->{$key} : $default;
 }
 
 sub updateActiveStream {
@@ -330,7 +331,7 @@ sub appendRecentLog {
         line => "$message",
     };
     my $maxLogs = int(getConfigValue('log_depth', 10));
-    $maxLogs = 5 unless $maxLogs >= 5;
+    $maxLogs = 5 if $maxLogs < 5;
     shift @$logs while @$logs > $maxLogs;
     saveRecentLogs($logs);
 }
@@ -338,11 +339,10 @@ sub appendRecentLog {
 sub buildAdminSnapshot {
     my ($region, %opts) = @_;
     $region ||= 'DE';
-    # readonly=1: called from SSE loop (never writes active_streams.json)
-    # readonly=0: called from page load (cleans up stale entries once)
+    # readonly=1: SSE loop - never writes to active_streams.json
+    # readonly=0: page load  - cleans up stale entries once
     my $streams = $opts{readonly} ? readActiveStreamsForDisplay() : cleanupStaleActiveStreams();
     my $harmonize = loadHarmonizeOverrides();
-    my $cfg = loadRuntimeConfig();
     my $logs = loadRecentLogs();
 
     my @entries;
@@ -351,14 +351,14 @@ sub buildAdminSnapshot {
         next unless ref($entry) eq 'HASH';
         my $channelId = $entry->{channelId} || '';
         push @entries, {
-            key => $key,
-            channelId => $channelId,
+            key         => $key,
+            channelId   => $channelId,
             channelName => $entry->{channelName} || $channelId,
-            mode => $entry->{mode} || 'copy',
+            mode        => $entry->{mode} || 'copy',
             desiredMode => $entry->{desiredMode} || ($harmonize->{$channelId} ? 'harmonize' : 'copy'),
-            started => formatEpochLocal($entry->{startedAt}),
-            pid => $entry->{pid} || 0,
-            harmonize => ($harmonize->{$channelId} || 0) ? 1 : 0,
+            started     => formatEpochLocal($entry->{startedAt}),
+            pid         => $entry->{pid} || 0,
+            harmonize   => ($harmonize->{$channelId} || 0) ? 1 : 0,
         };
     }
 
@@ -369,23 +369,22 @@ sub buildAdminSnapshot {
         push @harm, { channelId => $channelId, channelName => $name };
     }
 
-    my $logDepth = int(getConfigValue('log_depth', 10));
     my @recent = map {
         +{
-            ts => formatEpochLocal($_->{ts}),
+            ts   => formatEpochLocal($_->{ts}),
             line => $_->{line},
         }
     } @$logs;
 
     return {
-        region => $region,
-        streams => \@entries,
+        region        => $region,
+        streams       => \@entries,
         harmonizeList => \@harm,
-        logs => \@recent,
-        config => {
+        logs          => \@recent,
+        config        => {
             stall_timeout => int(getConfigValue('stall_timeout', 15)),
-            max_failures  => int(getConfigValue('max_failures', 5)),
-            log_depth     => $logDepth,
+            max_failures  => int(getConfigValue('max_failures',  5)),
+            log_depth     => int(getConfigValue('log_depth',     10)),
         },
     };
 }
@@ -412,8 +411,7 @@ sub sendAdminEvents {
             my $ok = eval {
                 $client->write("event: snapshot\n");
                 $client->write("data: $payload\n\n");
-                $client->flush();
-                1
+                $client->flush(); 1
             };
             last unless $ok;
             $last_payload = $payload;
@@ -1635,10 +1633,15 @@ sub streamHlsViaFfmpeg {
         $$headersSentRef = 1 if $headersSentRef;
     }
 
-    my $maxFailures = int(getConfigValue('max_failures', 5));
+    my $maxFailures   = int(getConfigValue('max_failures',  5));
     my $stall_timeout = int(getConfigValue('stall_timeout', 15));
     my $failures = 0;
     my $ua = createUserAgent();
+
+    # Variables retained for compatibility; inner loop uses stall-detection.
+    my $last_seen_discontinuity_seq;
+    my $last_restart_at = time();
+    my $restart_cooldown = 8;
 
     while ($failures < $maxFailures) {
         updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
@@ -1692,46 +1695,46 @@ sub streamHlsViaFfmpeg {
 "; $failures++; next; }
         binmode($ffh);
 
-        my $client_alive = 1;
+        my $client_alive          = 1;
         my $mode_switch_requested = 0;
-        my $restart_due_to_discontinuity = 0;
-        my $buffer = '';
-        my $last_poll_at = 0;
+        my $stalled               = 0;
+        my $last_output_at        = time();
+        my $last_mode_check       = 0;
+        my $buffer                = '';
+        my $sel = IO::Select->new($ffh);
 
         while (1) {
-            if (desiredModeByOverride($channelId, $request) eq 'copy') {
-                $mode_switch_requested = 1;
-                last;
-            }
-
-            if (time() - $last_poll_at >= 1) {
-                $last_poll_at = time();
-                if ((time() - $last_restart_at) >= $restart_cooldown &&
-                    detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq)) {
-                    if ($debug) {
-                        printf("Detected playlist discontinuity change for %s, restarting ffmpeg harmonizer
-", $channelId);
-                    }
-                    appendRecentLog('DISCONTINUITY-Neustart: ' . $channelId);
-                    $restart_due_to_discontinuity = 1;
-                    $last_restart_at = time();
+            # Check mode-switch every ~1 s (cheap file read)
+            if (time() - $last_mode_check >= 1) {
+                $last_mode_check = time();
+                if (desiredModeByOverride($channelId, $request) eq 'copy') {
+                    $mode_switch_requested = 1;
                     last;
                 }
             }
 
-            my $read = sysread($ffh, $buffer, 1316);
-            last unless defined $read && $read > 0;
-            my $ok = eval { $client->write($buffer); 1 };
-            unless ($ok) { $client_alive = 0; last; }
+            # Non-blocking read: 0.5 s timeout keeps mode-check responsive
+            # even while ffmpeg is between segments.
+            my @ready = $sel->can_read(0.5);
+            if (@ready) {
+                my $read = sysread($ffh, $buffer, 1316);
+                last unless defined $read && $read > 0;  # ffmpeg EOF
+                $last_output_at = time();
+                my $ok = eval { $client->write($buffer); 1 };
+                unless ($ok) { $client_alive = 0; last; }
+            } elsif (time() - $last_output_at >= $stall_timeout) {
+                if ($debug) { printf("ffmpeg stalled >%ds for %s, restarting\n", $stall_timeout, $channelId); }
+                appendRecentLog('ffmpeg-Stall, Neustart: ' . $channelId);
+                $stalled = 1;
+                last;
+            }
         }
 
-        if ($mode_switch_requested || $restart_due_to_discontinuity) {
-            kill 'TERM', $ffpid if $ffpid;
-        }
+        kill 'TERM', $ffpid if $ffpid && ($mode_switch_requested || $stalled);
         close($ffh);
 
         return 'switch' if $mode_switch_requested;
-        if ($restart_due_to_discontinuity) {
+        if ($stalled) {
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
@@ -1780,9 +1783,18 @@ sub sendDynamicStream {
     );
     appendRecentLog('Stream gestartet: ' . $channelId . ' [' . $mode . ']');
 
+    # Local handlers ensure cleanup even on unexpected disconnect (SIGPIPE)
+    # or admin-triggered restart (SIGTERM via restart_stream endpoint).
+    my $cleanup = sub {
+        unregisterActiveStream($activeStreamKey) if $activeStreamKey;
+        appendRecentLog('Stream unterbrochen: ' . $channelId);
+        exit(0);
+    };
+    local $SIG{PIPE} = $cleanup;
+    local $SIG{TERM} = $cleanup;
+
     if ($debug) {
-        printf("Dynamic stream mode for %s: %s
-", $channelId, $mode);
+        printf("Dynamic stream mode for %s: %s\n", $channelId, $mode);
     }
 
     while (1) {
@@ -2437,329 +2449,315 @@ sub findChannelMetaById {
     }
     return undef;
 }
-new_admin = r'''
+
 sub sendAdminPage {
     my ($client, $request) = @_;
     my $region = 'DE';
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-    my $snapshot = buildAdminSnapshot($region);
+    my $snapshot    = buildAdminSnapshot($region);
     my $snapshotJson = encode_json($snapshot);
-    my $regionsJson = encode_json([ sort keys %regions ]);
+    my $regionsJson  = encode_json([ sort keys %regions ]);
 
-    my $html = <<"HTML";
+    # Build <option> tags server-side so initial render needs no JS
+    my $regionOptions = '';
+    for my $r (sort keys %regions) {
+        my $sel = ($r eq $region) ? ' selected' : '';
+        $regionOptions .= "<option value=\"$r\"$sel>$r</option>\n";
+    }
+
+    # Single-quoted heredoc: NO Perl interpolation inside.
+    # All substitutions happen via s/// below.
+    my $html = <<'HTML';
 <!DOCTYPE html>
 <html lang="de">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PlutoTV Admin</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,Arial,sans-serif;background:#f0f2f5;color:#1a1d23;font-size:14px}
-header{background:#1a1d23;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:16px}
-header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
-header .sub{opacity:.55;font-size:12px;margin-left:auto}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.badge-copy{background:#e3f0ff;color:#1565c0}
-.badge-harmonize{background:#fdf3cd;color:#8a6000}
-.badge-ok{background:#e6f4ea;color:#1e6e35}
-.badge-warn{background:#fff3e0;color:#8a4500}
-main{padding:24px;max-width:1200px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
-.card{background:#fff;border-radius:8px;border:1px solid #e0e4ea;overflow:hidden}
-.card-head{padding:12px 18px;border-bottom:1px solid #e0e4ea;display:flex;align-items:center;gap:10px}
-.card-head h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#667085}
-.card-head .dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
-.card-head .dot-off{background:#d1d5db}
-.card-body{padding:18px}
-table{width:100%;border-collapse:collapse}
-th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#667085;padding:8px 12px;text-align:left;border-bottom:2px solid #e0e4ea;white-space:nowrap}
-td{padding:10px 12px;border-bottom:1px solid #f0f2f5;vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#f8f9fb}
-code{font-family:ui-monospace,monospace;font-size:12px;background:#f0f2f5;padding:1px 5px;border-radius:3px}
-.btn{display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border:1px solid #d1d5db;border-radius:5px;background:#fff;color:#374151;font-size:12px;cursor:pointer;font-family:inherit;transition:background .12s,border-color .12s;white-space:nowrap}
-.btn:hover{background:#f3f4f6;border-color:#9ca3af}
-.btn:active{background:#e5e7eb}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.btn-primary{background:#1a1d23;color:#fff;border-color:#1a1d23}
-.btn-primary:hover{background:#2d3340;border-color:#2d3340}
-.btn-danger{background:#fef2f2;color:#c0392b;border-color:#fca5a5}
-.btn-danger:hover{background:#fee2e2;border-color:#f87171}
-.btn-sm{padding:3px 8px;font-size:11px}
-.actions{display:flex;gap:6px;flex-wrap:wrap}
-.empty{color:#9ca3af;font-style:italic;padding:20px;text-align:center}
-.cfg-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #f0f2f5}
-.cfg-row:last-child{border-bottom:none}
-.cfg-label{flex:1;font-size:13px;color:#374151}
-.cfg-hint{flex:2;font-size:12px;color:#9ca3af}
-.cfg-input{width:80px;padding:5px 8px;border:1px solid #d1d5db;border-radius:5px;font-size:13px;font-family:inherit;text-align:right}
-.cfg-input:focus{outline:none;border-color:#6366f1}
-.toast{position:fixed;bottom:24px;right:24px;padding:10px 16px;border-radius:7px;font-size:13px;font-weight:500;background:#1a1d23;color:#fff;opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
-.toast.show{opacity:1;transform:translateY(0)}
-.toast.err{background:#c0392b}
-pre{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;line-height:1.6;color:#374151;max-height:220px;overflow-y:auto}
-.region-select{padding:4px 8px;border:1px solid #444;border-radius:5px;background:#2d3340;color:#fff;font-size:12px;font-family:inherit;cursor:pointer}
-.sse-status{font-size:11px;display:flex;align-items:center;gap:5px}
-.sse-dot{width:6px;height:6px;border-radius:50%;background:#22c55e;transition:background .3s}
-.sse-dot.off{background:#ef4444}
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>PlutoTV Admin</title>
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:system-ui,Arial,sans-serif;background:#f0f2f5;color:#1a1d23;font-size:14px}
+        header{background:#1a1d23;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:16px}
+        header h1{font-size:16px;font-weight:600}
+        .region-sel{padding:4px 8px;border:1px solid #555;border-radius:5px;background:#2d3340;color:#fff;font-size:12px;cursor:pointer}
+        .sse-wrap{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;opacity:.8}
+        .sse-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;transition:background .3s}
+        .sse-dot.off{background:#ef4444}
+        main{padding:24px;max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+        .card{background:#fff;border-radius:8px;border:1px solid #e0e4ea;overflow:hidden}
+        .card-head{padding:10px 16px;border-bottom:1px solid #e0e4ea;display:flex;align-items:center;gap:8px}
+        .card-head h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#667085}
+        .dot{width:7px;height:7px;border-radius:50%;background:#22c55e;flex-shrink:0}
+        .dot.off{background:#d1d5db}
+        .card-body{padding:16px}
+        table{width:100%;border-collapse:collapse}
+        th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af;padding:7px 10px;text-align:left;border-bottom:2px solid #f0f2f5;white-space:nowrap}
+        td{padding:9px 10px;border-bottom:1px solid #f5f7fa;vertical-align:middle}
+        tr:last-child td{border-bottom:none}
+        tr:hover td{background:#fafbfc}
+        code{font-family:ui-monospace,monospace;font-size:12px;background:#f0f2f5;padding:1px 5px;border-radius:3px}
+        .badge{display:inline-block;padding:2px 7px;border-radius:9px;font-size:11px;font-weight:600}
+        .badge-copy{background:#e3f0ff;color:#1565c0}
+        .badge-harmonize{background:#fff8e1;color:#8a6000}
+        .badge-on{background:#e6f4ea;color:#1e6e35}
+        .badge-off{background:#fef9ee;color:#9c6300}
+        .btns{display:flex;gap:5px;flex-wrap:wrap}
+        .btn{display:inline-flex;align-items:center;padding:4px 10px;border:1px solid #d1d5db;border-radius:5px;background:#fff;color:#374151;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
+        .btn:hover{background:#f3f4f6}
+        .btn:disabled{opacity:.4;cursor:not-allowed}
+        .btn-danger{background:#fef2f2;color:#c0392b;border-color:#fca5a5}
+        .btn-danger:hover{background:#fee2e2}
+        .btn-save{background:#1a1d23;color:#fff;border-color:#1a1d23}
+        .btn-save:hover{background:#2d3340}
+        .empty{color:#9ca3af;font-style:italic;text-align:center;padding:18px}
+        .cfg-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #f5f7fa}
+        .cfg-row:last-child{border-bottom:none}
+        .cfg-label{width:160px;font-size:13px;color:#374151;flex-shrink:0}
+        .cfg-hint{flex:1;font-size:12px;color:#9ca3af}
+        .cfg-num{width:72px;padding:4px 7px;border:1px solid #d1d5db;border-radius:5px;font-size:13px;font-family:inherit;text-align:right}
+        .cfg-num:focus{outline:none;border-color:#6366f1}
+        .cfg-unit{font-size:12px;color:#9ca3af;width:20px}
+        ul.harm-list{padding-left:18px;line-height:2}
+        pre{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;line-height:1.6;color:#374151;max-height:200px;overflow-y:auto}
+        .toast{position:fixed;bottom:22px;right:22px;padding:9px 15px;border-radius:7px;font-size:13px;font-weight:500;background:#1a1d23;color:#fff;opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
+        .toast.show{opacity:1;transform:none}
+        .toast.err{background:#c0392b}
+    </style>
 </head>
 <body>
 <header>
-  <h1>&#127916; PlutoTV Admin</h1>
-  <select class="region-select" id="regionSel" onchange="changeRegion(this.value)">__REGION_OPTIONS__</select>
-  <span class="sub">
-    <span class="sse-status"><span class="sse-dot" id="sseDot"></span><span id="sseLabel">Verbinde...</span></span>
-  </span>
+    <h1>&#127916; PlutoTV Admin</h1>
+    <select class="region-sel" id="regionSel">__REGION_OPTIONS__</select>
+    <div class="sse-wrap">
+        <span class="sse-dot off" id="sseDot"></span>
+        <span id="sseLabel">Verbinde...</span>
+    </div>
 </header>
 <main>
 
-  <div class="card" id="streamsCard">
-    <div class="card-head">
-      <span class="dot dot-off" id="streamsDot"></span>
-      <h2>Aktive Streams</h2>
-      <span id="streamsCount" style="margin-left:auto;font-size:11px;color:#9ca3af"></span>
+    <div class="card">
+        <div class="card-head">
+            <span class="dot off" id="streamsDot"></span>
+            <h2>Aktive Streams</h2>
+            <span id="streamsCnt" style="margin-left:auto;font-size:11px;color:#9ca3af"></span>
+        </div>
+        <table>
+            <thead><tr>
+                <th>Sender</th><th>ID</th><th>Start</th>
+                <th>Modus</th><th>Harmonize</th><th>Aktionen</th>
+            </tr></thead>
+            <tbody id="streamsTbody">
+            <tr><td colspan="6" class="empty">Keine aktiven Streams.</td></tr>
+            </tbody>
+        </table>
     </div>
-    <div id="streamsWrap">
-      <table>
-        <thead><tr>
-          <th>Sender</th><th>ID</th><th>Start</th>
-          <th>Modus</th><th>Harmonize</th><th>Aktionen</th>
-        </tr></thead>
-        <tbody id="streamsBody"><tr><td colspan="6" class="empty">Keine aktiven Streams.</td></tr></tbody>
-      </table>
-    </div>
-  </div>
 
-  <div class="card">
-    <div class="card-head"><h2>Konfiguration (wirkt ab n&auml;chstem ffmpeg-Start)</h2></div>
-    <div class="card-body">
-      <div class="cfg-row">
-        <span class="cfg-label">Stall-Timeout</span>
-        <span class="cfg-hint">Sekunden ohne ffmpeg-Output bevor Neustart</span>
-        <input class="cfg-input" type="number" id="cfgStall" min="5" max="120" value="15">
-        <span style="font-size:12px;color:#9ca3af">s</span>
-      </div>
-      <div class="cfg-row">
-        <span class="cfg-label">Max. Fehlversuche</span>
-        <span class="cfg-hint">Wie oft ffmpeg neu gestartet wird bevor Stream aufgibt</span>
-        <input class="cfg-input" type="number" id="cfgFail" min="1" max="20" value="5">
-      </div>
-      <div class="cfg-row">
-        <span class="cfg-label">Log-Tiefe</span>
-        <span class="cfg-hint">Anzahl gespeicherter Log-Eintr&auml;ge</span>
-        <input class="cfg-input" type="number" id="cfgLogDepth" min="5" max="100" value="10">
-      </div>
-      <div style="margin-top:14px">
-        <button class="btn btn-primary" onclick="saveConfig()">Speichern</button>
-      </div>
+    <div class="card">
+        <div class="card-head"><h2>Konfiguration</h2>
+            <span style="font-size:11px;color:#9ca3af;margin-left:4px">(wirkt ab naechstem ffmpeg-Start)</span>
+        </div>
+        <div class="card-body">
+            <div class="cfg-row">
+                <span class="cfg-label">Stall-Timeout</span>
+                <span class="cfg-hint">Sekunden ohne ffmpeg-Output bis Neustart</span>
+                <input class="cfg-num" type="number" id="cfgStall" min="5" max="120" value="15">
+                <span class="cfg-unit">s</span>
+            </div>
+            <div class="cfg-row">
+                <span class="cfg-label">Max. Fehlversuche</span>
+                <span class="cfg-hint">Wie oft ffmpeg neu startet bevor Stream aufgibt</span>
+                <input class="cfg-num" type="number" id="cfgFail" min="1" max="20" value="5">
+                <span class="cfg-unit"></span>
+            </div>
+            <div class="cfg-row">
+                <span class="cfg-label">Log-Tiefe</span>
+                <span class="cfg-hint">Anzahl gespeicherter Log-Eintraege</span>
+                <input class="cfg-num" type="number" id="cfgLogDepth" min="5" max="100" value="10">
+                <span class="cfg-unit"></span>
+            </div>
+            <div style="margin-top:14px">
+                <button class="btn btn-save" onclick="saveConfig()">Speichern</button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="card-head"><h2>Dauerhaft Harmonize</h2></div>
-    <div class="card-body">
-      <ul id="harmonizeList" style="padding-left:16px;line-height:1.9"></ul>
-      <p id="harmonizeEmpty" class="empty" style="display:none">Keine dauerhaft aktivierten Harmonize-Sender.</p>
+    <div class="card">
+        <div class="card-head"><h2>Dauerhaft Harmonize</h2></div>
+        <div class="card-body">
+            <ul class="harm-list" id="harmList"></ul>
+            <p id="harmEmpty" class="empty" style="display:none">Keine dauerhaft aktivierten Harmonize-Sender.</p>
+        </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="card-head"><h2>Letzte Log-Eintr&auml;ge</h2></div>
-    <div class="card-body"><pre id="logBox">Keine Eintr&auml;ge.</pre></div>
-  </div>
+    <div class="card">
+        <div class="card-head"><h2>Log</h2></div>
+        <div class="card-body"><pre id="logPre">Keine Eintraege.</pre></div>
+    </div>
 
 </main>
 <div class="toast" id="toast"></div>
 <script>
-(function(){
-const INIT = __SNAPSHOT__;
-let currentRegion = "__REGION__";
-const ALL_REGIONS = __REGIONS__;
+    (function(){
+        var snap0 = __SNAPSHOT__;
+        var region0 = '__REGION__';
+        var allRegions = __REGIONS__;
 
-function esc(s){
-    return String(s==null?'':s)
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+    // Region selector: populated server-side via __REGION_OPTIONS__,
+    // just wire the onchange here.
+        document.getElementById('regionSel').onchange = function(){
+            location.href = '/admin?region=' + encodeURIComponent(this.value);
+        };
 
-function toast(msg, isErr){
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'toast show' + (isErr ? ' err' : '');
-    clearTimeout(t._tid);
-    t._tid = setTimeout(() => t.className = 'toast', 2800);
-}
+        function esc(s){
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
 
-function api(path, params){
-    const body = new URLSearchParams(params);
-    return fetch(path, {method:'POST', body})
-        .then(r => r.json())
-        .then(d => {
-            if(d.ok) toast(d.msg || 'OK');
-            else toast(d.error || 'Fehler', true);
-            return d;
-        })
-        .catch(e => { toast('Netzwerkfehler', true); });
-}
+        function toast(msg, isErr) {
+            var t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast show' + (isErr ? ' err' : '');
+            clearTimeout(t._t);
+            t._t = setTimeout(function(){ t.className = 'toast'; }, 2600);
+        }
 
-function changeRegion(r){
-    currentRegion = r;
-    location.href = '/admin?region=' + encodeURIComponent(r);
-}
+        function api(path, params, cb) {
+            var body = [];
+            for (var k in params) {
+                body.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+            }
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', path);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.onload = function(){
+                try {
+                    var d = JSON.parse(xhr.responseText);
+                    if (d.ok) toast(d.msg || 'OK');
+                    else toast(d.error || 'Fehler', true);
+                    if (cb) cb(d);
+                } catch(e) { toast('Fehler', true); }
+            };
+            xhr.onerror = function(){ toast('Netzwerkfehler', true); };
+            xhr.send(body.join('&'));
+        }
 
-function saveConfig(){
-    api('/admin/set_config', {
-        stall_timeout: document.getElementById('cfgStall').value,
-        max_failures:  document.getElementById('cfgFail').value,
-        log_depth:     document.getElementById('cfgLogDepth').value,
-    });
-}
-window.saveConfig = saveConfig;
-window.changeRegion = changeRegion;
+        window.saveConfig = function(){
+            api('/admin/set_config', {
+                stall_timeout: document.getElementById('cfgStall').value,
+                max_failures:  document.getElementById('cfgFail').value,
+                log_depth:     document.getElementById('cfgLogDepth').value
+            });
+        };
 
-function renderStreams(streams){
-    const body = document.getElementById('streamsBody');
-    const dot  = document.getElementById('streamsDot');
-    const cnt  = document.getElementById('streamsCount');
-    cnt.textContent = streams.length ? streams.length + ' aktiv' : '';
-    dot.className   = 'dot' + (streams.length ? '' : ' dot-off');
-    if(!streams.length){
-        body.innerHTML = '<tr><td colspan="6" class="empty">Keine aktiven Streams.</td></tr>';
-        return;
-    }
-    body.innerHTML = streams.map(e => {
-        const harmOn = !!e.harmonize;
-        return '<tr>'
-            + '<td><strong>' + esc(e.channelName) + '</strong></td>'
-            + '<td><code>' + esc(e.channelId) + '</code></td>'
-            + '<td style="white-space:nowrap">' + esc(e.started) + '</td>'
-            + '<td><span class="badge badge-' + esc(e.mode) + '">' + esc(e.mode) + '</span></td>'
-            + '<td>' + (harmOn ? '<span class="badge badge-ok">an</span>' : '<span class="badge badge-warn">aus</span>') + '</td>'
-            + '<td><div class="actions">'
-            + '<button class="btn btn-sm" onclick="toggleHarmonize(' + JSON.stringify(e.channelId) + ',' + (harmOn?'0':'1') + ')">'
-            +   (harmOn ? 'Harmonize aus' : 'Harmonize ein') + '</button>'
-            + '<button class="btn btn-sm" onclick="forceDisc(' + JSON.stringify(e.channelId) + ')">'
-            +   'DISCONTINUITY' + '</button>'
-            + '<button class="btn btn-sm btn-danger" onclick="restartStream(' + JSON.stringify(e.key) + ')">'
-            +   '&#8635; Neustart' + '</button>'
-            + '</div></td>'
-            + '</tr>';
-    }).join('');
-}
+        window.toggleHarmonize = function(channelId, enabled) {
+            api('/admin/toggle_harmonize', {channelId: channelId, enabled: enabled, region: region0});
+        };
+        window.forceDisc = function(channelId) {
+            api('/admin/force_discontinuity', {channelId: channelId, region: region0});
+        };
+        window.restartStream = function(key) {
+            api('/admin/restart_stream', {key: key});
+        };
 
-function renderHarmonize(list){
-    const ul = document.getElementById('harmonizeList');
-    const em = document.getElementById('harmonizeEmpty');
-    if(!list.length){ ul.innerHTML=''; em.style.display='block'; return; }
-    em.style.display='none';
-    ul.innerHTML = list.map(e =>
-        '<li>' + esc(e.channelName) + ' <code>' + esc(e.channelId) + '</code></li>'
-    ).join('');
-}
+        function renderStreams(streams) {
+            var tbody = document.getElementById('streamsTbody');
+            var dot   = document.getElementById('streamsDot');
+            var cnt   = document.getElementById('streamsCnt');
+            dot.className  = 'dot' + (streams.length ? '' : ' off');
+            cnt.textContent = streams.length ? streams.length + ' aktiv' : '';
+            if (!streams.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty">Keine aktiven Streams.</td></tr>';
+                return;
+            }
+            var rows = streams.map(function(e){
+                var hOn  = !!e.harmonize;
+                var harmBtn = '<button class="btn" onclick="toggleHarmonize(' +
+                    JSON.stringify(e.channelId) + ',' + (hOn ? '0' : '1') + ')">' +
+                    (hOn ? 'Harmonize aus' : 'Harmonize ein') + '</button>';
+                var discBtn = '<button class="btn" onclick="forceDisc(' +
+                    JSON.stringify(e.channelId) + ')">DISC</button>';
+                var rstBtn  = '<button class="btn btn-danger" onclick="restartStream(' +
+                    JSON.stringify(e.key) + ')">&#8635; Neustart</button>';
+                return '<tr>' +
+                    '<td><strong>' + esc(e.channelName) + '</strong></td>' +
+                    '<td><code>' + esc(e.channelId) + '</code></td>' +
+                    '<td>' + esc(e.started) + '</td>' +
+                    '<td><span class="badge badge-' + esc(e.mode) + '">' + esc(e.mode) + '</span></td>' +
+                    '<td>' + (hOn
+                        ? '<span class="badge badge-on">an</span>'
+                        : '<span class="badge badge-off">aus</span>') + '</td>' +
+                    '<td><div class="btns">' + harmBtn + discBtn + rstBtn + '</div></td>' +
+                    '</tr>';
+            });
+            tbody.innerHTML = rows.join('');
+        }
 
-function renderLogs(logs){
-    document.getElementById('logBox').textContent =
-        logs.map(l => '[' + l.ts + '] ' + l.line).join('\n') || 'Keine Eintr\u00e4ge.';
-}
+        function renderHarm(list) {
+            var ul = document.getElementById('harmList');
+            var em = document.getElementById('harmEmpty');
+            if (!list.length) { ul.innerHTML = ''; em.style.display = 'block'; return; }
+            em.style.display = 'none';
+            ul.innerHTML = list.map(function(e){
+                return '<li>' + esc(e.channelName) + ' <code>' + esc(e.channelId) + '</code></li>';
+            }).join('');
+        }
 
-function renderConfig(cfg){
-    if(!cfg) return;
-    document.getElementById('cfgStall').value    = cfg.stall_timeout ?? 15;
-    document.getElementById('cfgFail').value     = cfg.max_failures  ?? 5;
-    document.getElementById('cfgLogDepth').value = cfg.log_depth     ?? 10;
-}
+        function renderLogs(logs) {
+            document.getElementById('logPre').textContent =
+                logs.map(function(l){ return '[' + l.ts + '] ' + l.line; }).join('\n') ||
+                'Keine Eintraege.';
+        }
 
-function render(snap){
-    renderStreams(snap.streams || []);
-    renderHarmonize(snap.harmonizeList || []);
-    renderLogs(snap.logs || []);
-    renderConfig(snap.config);
-}
+        function renderConfig(cfg) {
+            if (!cfg) return;
+            if (cfg.stall_timeout != null) document.getElementById('cfgStall').value    = cfg.stall_timeout;
+            if (cfg.max_failures  != null) document.getElementById('cfgFail').value     = cfg.max_failures;
+            if (cfg.log_depth     != null) document.getElementById('cfgLogDepth').value = cfg.log_depth;
+        }
 
-// Actions
-function toggleHarmonize(channelId, enabled){
-    api('/admin/toggle_harmonize', {channelId, enabled, region: currentRegion});
-}
-function forceDisc(channelId){
-    api('/admin/force_discontinuity', {channelId, region: currentRegion});
-}
-function restartStream(key){
-    api('/admin/restart_stream', {key});
-}
-window.toggleHarmonize = toggleHarmonize;
-window.forceDisc = forceDisc;
-window.restartStream = restartStream;
+        function render(s) {
+            renderStreams(s.streams    || []);
+            renderHarm  (s.harmonizeList || []);
+            renderLogs  (s.logs        || []);
+            renderConfig(s.config);
+        }
 
-// Region selector
-(function(){
-    const sel = document.getElementById('regionSel');
-    ALL_REGIONS.forEach(r => {
-        const o = document.createElement('option');
-        o.value = r; o.textContent = r;
-        if(r === currentRegion) o.selected = true;
-        sel.appendChild(o);
-    });
-})();
-
-// SSE
-let es, sseRetryTimer;
-function connectSSE(){
-    const dot   = document.getElementById('sseDot');
-    const label = document.getElementById('sseLabel');
-    if(es){ try{ es.close(); }catch(e){} }
-    dot.className = 'sse-dot off';
-    label.textContent = 'Verbinde...';
-    es = new EventSource('/admin/events?region=' + encodeURIComponent(currentRegion));
-    es.addEventListener('snapshot', ev => {
-        try{ render(JSON.parse(ev.data)); }catch(e){}
-    });
-    es.onopen = () => {
-        dot.className = 'sse-dot';
-        label.textContent = 'Live';
-        clearTimeout(sseRetryTimer);
-    };
-    es.onerror = () => {
-        dot.className = 'sse-dot off';
-        label.textContent = 'Getrennt';
-        es.close();
-        sseRetryTimer = setTimeout(connectSSE, 3000);
-    };
-}
-connectSSE();
-
-// Initial render from server-side snapshot
-render(INIT);
-
-})();
+    // SSE with auto-reconnect
+        var es, retryTimer;
+        function connectSSE() {
+            var dot   = document.getElementById('sseDot');
+            var label = document.getElementById('sseLabel');
+            if (es) { try { es.close(); } catch(e){} }
+            dot.className = 'sse-dot off'; label.textContent = 'Verbinde...';
+            es = new EventSource('/admin/events?region=' + encodeURIComponent(region0));
+            es.addEventListener('snapshot', function(ev){
+                try { render(JSON.parse(ev.data)); } catch(e){}
+            });
+            es.onopen  = function(){ dot.className = 'sse-dot'; label.textContent = 'Live'; clearTimeout(retryTimer); };
+            es.onerror = function(){ dot.className = 'sse-dot off'; label.textContent = 'Getrennt'; es.close(); retryTimer = setTimeout(connectSSE, 3000); };
+        }
+        connectSSE();
+        render(snap0);
+    })();
 </script>
 </body>
 </html>
 HTML
-    # Build region <option> tags  (no JS needed, renders immediately)
-    my $regionOptions = '';
-    for my $r (sort keys %regions) {
-        my $sel = ($r eq $region) ? ' selected' : '';
-        $regionOptions .= "<option value=\"$r\"$sel>$r</option>";
-    }
+
     $html =~ s/__SNAPSHOT__/$snapshotJson/;
     $html =~ s/__REGION__/$region/g;
     $html =~ s/__REGION_OPTIONS__/$regionOptions/;
     $html =~ s/__REGIONS__/$regionsJson/;
+
     my $response = HTTP::Response->new();
-    $response->header("content-type", "text/html; charset=utf-8");
+    $response->header('content-type' => 'text/html; charset=utf-8');
     $response->code(200);
-    $response->message("OK");
+    $response->message('OK');
     $response->content(encode_utf8($html));
     $client->send_response($response);
 }
-'''
-
-with open('/home/claude/new_admin_page.py', 'w') as f:
-f.write(new_admin)
-
-print("admin page text written")
 
 sub sendRedirect {
     my ($client, $location) = @_;
@@ -2769,101 +2767,28 @@ sub sendRedirect {
     $client->send_response($response);
 }
 
-sub sendJsonOk {
-    my ($client, %extra) = @_;
-    my $response = HTTP::Response->new(200);
-    $response->header('Content-Type' => 'application/json; charset=utf-8');
-    $response->header('Access-Control-Allow-Origin' => '*');
-    $response->content(encode_json({ ok => 1, %extra }));
-    $client->send_response($response);
-}
-
-sub sendJsonError {
-    my ($client, $msg) = @_;
-    my $response = HTTP::Response->new(400);
-    $response->header('Content-Type' => 'application/json; charset=utf-8');
-    $response->content(encode_json({ ok => 0, error => ($msg || 'error') }));
-    $client->send_response($response);
-}
-
-sub handleAdminSetConfig {
-    my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $cfg = loadRuntimeConfig();
-    my $changed = 0;
-    for my $key (qw(stall_timeout max_failures log_depth)) {
-        if ($params && defined $params->{$key} && $params->{$key} =~ /^\d+$/) {
-            my $val = int($params->{$key});
-            my %min = (stall_timeout => 5, max_failures => 1, log_depth => 5);
-            my %max = (stall_timeout => 120, max_failures => 20, log_depth => 100);
-            $val = $min{$key} if $val < $min{$key};
-            $val = $max{$key} if $val > $max{$key};
-            $cfg->{$key} = $val;
-            $changed = 1;
-        }
-    }
-    if ($changed) {
-        saveRuntimeConfig($cfg);
-        appendRecentLog(sprintf('Konfiguration gespeichert: stall=%ds fail=%d logs=%d',
-            $cfg->{stall_timeout}||15, $cfg->{max_failures}||5, $cfg->{log_depth}||10));
-        sendJsonOk($client);
-    } else {
-        sendJsonError($client, 'Keine gültigen Parameter');
-    }
-}
-
-sub handleAdminRestartStream {
-    my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $key = $params && $params->{key} ? $params->{key} : '';
-    unless ($key) {
-        sendJsonError($client, 'Fehlender key-Parameter');
-        return;
-    }
-    my $streams = loadActiveStreams();
-    my $entry = $streams->{$key};
-    unless (ref($entry) eq 'HASH' && $entry->{pid}) {
-        sendJsonError($client, 'Stream nicht gefunden');
-        return;
-    }
-    my $pid = $entry->{pid};
-    unless (kill(0, $pid)) {
-        sendJsonError($client, 'Prozess nicht mehr aktiv');
-        return;
-    }
-    kill('TERM', $pid);
-    appendRecentLog('Stream-Neustart angefordert: ' . ($entry->{channelId} || $key));
-    sendJsonOk($client);
-}
-
 sub handleAdminToggleHarmonize {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    my $enabled = $params && defined $params->{enabled} ? $params->{enabled} : 0;
-    my $region = $params && $params->{region} ? $params->{region} : 'DE';
-    unless ($channelId) {
-        sendJsonError($client, 'Fehlende channelId');
-        return;
-    }
+    my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
+    my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
+    unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
     setHarmonizeOverride($channelId, $on);
-    appendRecentLog(($on ? 'Harmonize aktiviert: ' : 'Harmonize deaktiviert: ') . $channelId);
+    appendRecentLog(($on ? 'Harmonize an: ' : 'Harmonize aus: ') . $channelId);
     sendJsonOk($client, msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'));
 }
 
 sub handleAdminForceDiscontinuity {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    unless ($channelId) {
-        sendJsonError($client, 'Fehlende channelId');
-        return;
-    }
+    my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
+    unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     queueForcedDiscontinuity($channelId);
     appendRecentLog('DISCONTINUITY vorgemerkt: ' . $channelId);
     sendJsonOk($client, msg => 'DISCONTINUITY vorgemerkt');
 }
+
 
 sub processRequest {
     my ($client) = @_;
