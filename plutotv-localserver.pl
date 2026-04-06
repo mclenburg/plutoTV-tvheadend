@@ -459,7 +459,7 @@ sub buildAdminSnapshot {
     }
 
     my @channels;
-    for my $channel (sort { (($a->{number} || 0) <=> ($b->{number} || 0)) || lc($a->{name} || '') cmp lc($b->{name} || '') } getChannelJson($region)) {
+    for my $channel (sort { lc($a->{name} || '') cmp lc($b->{name} || '') || (($a->{number} || 0) <=> ($b->{number} || 0)) } getChannelJson($region)) {
         next unless ref($channel) eq 'HASH';
         my $channelId = $channel->{id} || $channel->{_id} || '';
         next unless length $channelId;
@@ -2670,6 +2670,9 @@ sub sendAdminPage {
             <h2>Sender schalten</h2>
             <span id="channelsCnt" style="margin-left:auto;font-size:11px;color:#9ca3af"></span>
         </div>
+        <div class="card-body" style="padding-bottom:0">
+            <input type="search" id="channelFilter" placeholder="Sender suchen..." style="width:100%;max-width:420px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;font-family:inherit">
+        </div>
         <table>
             <thead><tr>
                 <th>Sender</th><th>ID</th><th>Aktiv</th><th>Modus</th><th>Harmonize</th><th>Aktionen</th>
@@ -2729,6 +2732,7 @@ sub sendAdminPage {
         var snap0 = __SNAPSHOT__;
         var region0 = '__REGION__';
         var allRegions = __REGIONS__;
+        var currentSnapshot = snap0;
 
         // Region selector: populated server-side via __REGION_OPTIONS__,
         // just wire the onchange here.
@@ -2779,7 +2783,11 @@ sub sendAdminPage {
         };
 
         window.toggleHarmonize = function(channelId, enabled) {
-            api('/admin/toggle_harmonize', {channelId: channelId, enabled: enabled, region: region0});
+            api('/admin/toggle_harmonize', {channelId: channelId, enabled: enabled, region: region0}, function(d){
+                if (d && d.ok) {
+                    applyHarmonizeLocally(channelId, enabled ? 1 : 0);
+                }
+            });
         };
         window.forceDisc = function(channelId) {
             api('/admin/force_discontinuity', {channelId: channelId, region: region0});
@@ -2787,6 +2795,40 @@ sub sendAdminPage {
         window.restartStream = function(key) {
             api('/admin/restart_stream', {key: key});
         };
+
+
+        function applyHarmonizeLocally(channelId, enabled) {
+            currentSnapshot = currentSnapshot || {};
+            var found = false;
+            currentSnapshot.channels = (currentSnapshot.channels || []).map(function(ch){
+                if (ch.channelId === channelId) {
+                    ch.harmonize = !!enabled;
+                    found = true;
+                }
+                return ch;
+            });
+            currentSnapshot.streams = (currentSnapshot.streams || []).map(function(st){
+                if (st.channelId === channelId) {
+                    st.harmonize = !!enabled;
+                    st.desiredMode = enabled ? 'harmonize' : 'copy';
+                }
+                return st;
+            });
+            var harm = currentSnapshot.harmonizeList || [];
+            if (enabled) {
+                if (!harm.some(function(x){ return x.channelId === channelId; })) {
+                    var ch = (currentSnapshot.channels || []).find(function(x){ return x.channelId === channelId; });
+                    harm.push({channelId: channelId, channelName: ch ? ch.channelName : channelId});
+                }
+            } else {
+                harm = harm.filter(function(x){ return x.channelId !== channelId; });
+            }
+            harm.sort(function(a,b){
+                return String(a.channelName||'').localeCompare(String(b.channelName||''), 'de', {sensitivity:'base'});
+            });
+            currentSnapshot.harmonizeList = harm;
+            render(currentSnapshot);
+        }
 
         function renderStreams(streams) {
             var tbody = document.getElementById('streamsTbody');
@@ -2800,13 +2842,10 @@ sub sendAdminPage {
             }
             var rows = streams.map(function(e){
                 var hOn  = !!e.harmonize;
-                var harmBtn = '<button class="btn" onclick="toggleHarmonize(' +
-                    JSON.stringify(e.channelId) + ',' + (hOn ? '0' : '1') + ')">' +
+                var harmBtn = '<button class="btn" data-action="toggle-harmonize" data-channel-id="' + esc(e.channelId) + '" data-enabled="' + (hOn ? '0' : '1') + '">' +
                     (hOn ? 'Harmonize aus' : 'Harmonize ein') + '</button>';
-                var discBtn = '<button class="btn" onclick="forceDisc(' +
-                    JSON.stringify(e.channelId) + ')">DISC</button>';
-                var rstBtn  = '<button class="btn btn-danger" onclick="restartStream(' +
-                    JSON.stringify(e.key) + ')">&#8635; Neustart</button>';
+                var discBtn = '<button class="btn" data-action="force-disc" data-channel-id="' + esc(e.channelId) + '">DISC</button>';
+                var rstBtn  = '<button class="btn btn-danger" data-action="restart-stream" data-key="' + esc(e.key) + '">&#8635; Neustart</button>';
                 return '<tr>' +
                     '<td><strong>' + esc(e.channelName) + '</strong></td>' +
                     '<td><code>' + esc(e.channelId) + '</code></td>' +
@@ -2845,16 +2884,25 @@ sub sendAdminPage {
         }
 
         function renderChannels(channels) {
+            var filter = (document.getElementById('channelFilter') && document.getElementById('channelFilter').value || '').toLowerCase().trim();
             var tbody = document.getElementById('channelsTbody');
             var dot   = document.getElementById('channelsDot');
             var cnt   = document.getElementById('channelsCnt');
             dot.className = 'dot';
-            cnt.textContent = channels.length ? channels.length + ' Sender' : '';
+            var filteredChannels = channels.filter(function(e){
+                if (!filter) return true;
+                return String(e.channelName || '').toLowerCase().indexOf(filter) >= 0 || String(e.channelId || '').toLowerCase().indexOf(filter) >= 0;
+            });
+            cnt.textContent = filteredChannels.length + ' / ' + channels.length + ' Sender';
+            if (!filteredChannels.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty">Keine passenden Sender.</td></tr>';
+                return;
+            }
             if (!channels.length) {
                 tbody.innerHTML = '<tr><td colspan="6" class="empty">Keine Sender geladen.</td></tr>';
                 return;
             }
-            var rows = channels.map(function(e){
+            var rows = filteredChannels.map(function(e){
                 var hOn = !!e.harmonize;
                 var activeBadge = e.active
                     ? '<span class="badge badge-on">ja</span>'
@@ -2862,12 +2910,11 @@ sub sendAdminPage {
                 var modeBadge = e.activeMode
                     ? '<span class="badge badge-' + esc(e.activeMode) + '">' + esc(e.activeMode) + '</span>'
                     : '<span class="badge badge-off">-</span>';
-                var harmBtn = '<button class="btn" onclick="toggleHarmonize(' +
-                    JSON.stringify(e.channelId) + ',' + (hOn ? '0' : '1') + ')">' +
+                var harmBtn = '<button class="btn" data-action="toggle-harmonize" data-channel-id="' + esc(e.channelId) + '" data-enabled="' + (hOn ? '0' : '1') + '">' +
                     (hOn ? 'Harmonize aus' : 'Harmonize ein') + '</button>';
-                var discBtn = '<button class="btn" onclick="forceDisc(' + JSON.stringify(e.channelId) + ')">DISC</button>';
+                var discBtn = '<button class="btn" data-action="force-disc" data-channel-id="' + esc(e.channelId) + '">DISC</button>';
                 var rstBtn = e.activeKey
-                    ? '<button class="btn btn-danger" onclick="restartStream(' + JSON.stringify(e.activeKey) + ')">&#8635; Neustart</button>'
+                    ? '<button class="btn btn-danger" data-action="restart-stream" data-key="' + esc(e.activeKey) + '">&#8635; Neustart</button>'
                     : '';
                 return '<tr>' +
                     '<td><strong>' + esc(e.channelName) + '</strong></td>' +
@@ -2884,6 +2931,7 @@ sub sendAdminPage {
         }
 
         function render(s) {
+            currentSnapshot = s || {};
             renderStreams(s.streams    || []);
             renderChannels(s.channels  || []);
             renderHarm  (s.harmonizeList || []);
@@ -2904,6 +2952,25 @@ sub sendAdminPage {
             });
             es.onopen  = function(){ dot.className = 'sse-dot'; label.textContent = 'Live'; clearTimeout(retryTimer); };
             es.onerror = function(){ dot.className = 'sse-dot off'; label.textContent = 'Getrennt'; es.close(); retryTimer = setTimeout(connectSSE, 3000); };
+        }
+        document.addEventListener('click', function(ev){
+            var btn = ev.target.closest('button[data-action]');
+            if (!btn) return;
+            var action = btn.getAttribute('data-action');
+            if (action === 'toggle-harmonize') {
+                ev.preventDefault();
+                window.toggleHarmonize(btn.getAttribute('data-channel-id'), btn.getAttribute('data-enabled'));
+            } else if (action === 'force-disc') {
+                ev.preventDefault();
+                window.forceDisc(btn.getAttribute('data-channel-id'));
+            } else if (action === 'restart-stream') {
+                ev.preventDefault();
+                window.restartStream(btn.getAttribute('data-key'));
+            }
+        });
+        var filterInput = document.getElementById('channelFilter');
+        if (filterInput) {
+            filterInput.addEventListener('input', function(){ render(currentSnapshot || snap0); });
         }
         connectSSE();
         render(snap0);
@@ -2932,6 +2999,53 @@ sub sendRedirect {
     $response->header('Location' => $location);
     $response->content('');
     $client->send_response($response);
+}
+
+sub sendJsonResponse {
+    my ($client, $code, $payload) = @_;
+    $payload ||= {};
+    my $response = HTTP::Response->new();
+    $response->header('content-type', 'application/json; charset=utf-8');
+    $response->code($code || 200);
+    $response->message('OK');
+    $response->content(encode_utf8(encode_json($payload)));
+    $client->send_response($response);
+}
+
+sub sendJsonOk {
+    my ($client, %payload) = @_;
+    $payload{ok} = JSON::PP::true;
+    sendJsonResponse($client, 200, \%payload);
+}
+
+sub sendJsonError {
+    my ($client, $message, %payload) = @_;
+    $payload{ok} = JSON::PP::false;
+    $payload{error} = $message || 'Fehler';
+    sendJsonResponse($client, 200, \%payload);
+}
+
+sub handleAdminSetConfig {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $stall_timeout = int($params && defined $params->{stall_timeout} ? $params->{stall_timeout} : getConfigValue('stall_timeout', 15));
+    my $max_failures  = int($params && defined $params->{max_failures}  ? $params->{max_failures}  : getConfigValue('max_failures', 5));
+    my $log_depth     = int($params && defined $params->{log_depth}     ? $params->{log_depth}     : getConfigValue('log_depth', 10));
+
+    $stall_timeout = 5   if $stall_timeout < 5;
+    $stall_timeout = 120 if $stall_timeout > 120;
+    $max_failures  = 1   if $max_failures < 1;
+    $max_failures  = 20  if $max_failures > 20;
+    $log_depth     = 5   if $log_depth < 5;
+    $log_depth     = 100 if $log_depth > 100;
+
+    saveRuntimeConfig({
+        stall_timeout => $stall_timeout,
+        max_failures  => $max_failures,
+        log_depth     => $log_depth,
+    });
+    appendRecentLog('Konfiguration gespeichert');
+    sendJsonOk($client, msg => 'Konfiguration gespeichert');
 }
 
 sub handleAdminToggleHarmonize {
