@@ -2787,45 +2787,26 @@ sub sendRedirect {
 
 sub handleAdminToggleHarmonize {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    my $enabled = $params && defined $params->{enabled} ? $params->{enabled} : 0;
-    my $region = $params && $params->{region} ? $params->{region} : 'DE';
-
-    unless ($channelId) {
-        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
-        return;
-    }
-
+    my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
+    my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
+    unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
     setHarmonizeOverride($channelId, $on);
-    appendRecentLog(($on ? 'Harmonize aktiviert: ' : 'Harmonize deaktiviert: ') . $channelId);
-    my $channel = findChannelMetaById($channelId, $region);
-    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
-    my $msg = $on
-        ? "Harmonize für $name aktiviert."
-        : "Harmonize für $name deaktiviert.";
-    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
+    appendRecentLog(($on ? 'Harmonize an: ' : 'Harmonize aus: ') . $channelId);
+    sendJsonOk($client, msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'));
 }
 
 sub handleAdminForceDiscontinuity {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
-    my $region = $params && $params->{region} ? $params->{region} : 'DE';
-
-    unless ($channelId) {
-        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
-        return;
-    }
-
+    my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
+    unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     queueForcedDiscontinuity($channelId);
     appendRecentLog('DISCONTINUITY vorgemerkt: ' . $channelId);
-    my $channel = findChannelMetaById($channelId, $region);
-    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
-    my $msg = "DISCONTINUITY wird beim nächsten m3u8 für $name eingefügt.";
-    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
+    sendJsonOk($client, msg => 'DISCONTINUITY vorgemerkt');
 }
+
 
 sub processRequest {
     my ($client) = @_;
