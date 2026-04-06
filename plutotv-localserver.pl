@@ -1747,25 +1747,39 @@ sub collectPlaylistWindows {
     my @current;
     my $windowIndex = 0;
 
+    my $pushWindow = sub {
+        my ($segmentsRef, $startsAfterDiscontinuity) = @_;
+        return unless $segmentsRef && ref($segmentsRef) eq 'ARRAY' && @$segmentsRef;
+        my $startSeq = $segmentsRef->[0]->{sequence};
+        my $endSeq   = $segmentsRef->[-1]->{sequence};
+        my $startUrl = $segmentsRef->[0]->{url} || '';
+        my $endUrl   = $segmentsRef->[-1]->{url} || '';
+        my $signature = join('|',
+            defined $startSeq ? $startSeq : '',
+            defined $endSeq   ? $endSeq   : '',
+            $startUrl,
+            $endUrl,
+            scalar(@$segmentsRef),
+        );
+        push @windows, {
+            id => $windowIndex++,
+            signature => $signature,
+            startSequence => $startSeq,
+            endSequence => $endSeq,
+            segments => [ @$segmentsRef ],
+            startsAfterDiscontinuity => $startsAfterDiscontinuity ? 1 : 0,
+        };
+    };
+
     for my $segment (@segments) {
         if ($segment->{isDiscontinuity} && @current) {
-            push @windows, {
-                id => $windowIndex++,
-                segments => [ @current ],
-                startsAfterDiscontinuity => ($windowIndex > 0 ? 1 : 0),
-            };
+            $pushWindow->(\@current, ($windowIndex > 0 ? 1 : 0));
             @current = ();
         }
         push @current, $segment;
     }
 
-    if (@current) {
-        push @windows, {
-            id => $windowIndex++,
-            segments => [ @current ],
-            startsAfterDiscontinuity => ($windowIndex > 0 && @windows ? 1 : 0),
-        };
-    }
+    $pushWindow->(\@current, ($windowIndex > 0 && @windows ? 1 : 0)) if @current;
 
     return \@windows;
 }
@@ -1821,12 +1835,13 @@ sub buildLocalWindowPlaylistFile {
 }
 
 sub findMatchingWindow {
-    my ($windows, $processedWindowIds) = @_;
+    my ($windows, $processedWindowSignatures) = @_;
     return undef unless $windows && ref($windows) eq 'ARRAY';
     for my $window (@$windows) {
         next unless $window && ref($window) eq 'HASH';
         next unless ref($window->{segments}) eq 'ARRAY' && @{ $window->{segments} };
-        next if $processedWindowIds->{$window->{id}};
+        my $signature = $window->{signature} || '';
+        next if length($signature) && $processedWindowSignatures->{$signature};
         return $window;
     }
     return undef;
@@ -2071,6 +2086,7 @@ sub streamHlsViaFfmpeg {
         unless ($videoWindow) {
             $idleLoops++;
             if ($idleLoops % 5 == 0) {
+                appendRecentLog('Keine neues Harmonize-Fenster verfuegbar: ' . $channelId);
                 my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
                 $videoUrl = $freshVideo if $freshVideo;
                 $audioUrl = $freshAudio if $freshAudio;
@@ -2106,8 +2122,8 @@ sub streamHlsViaFfmpeg {
             next;
         }
 
-        $processedVideoWindows{$videoWindow->{id}} = 1;
-        $processedAudioWindows{$audioWindow->{id}} = 1 if $audioWindow;
+        $processedVideoWindows{$videoWindow->{signature} || $videoWindow->{id}} = 1;
+        $processedAudioWindows{$audioWindow->{signature} || $audioWindow->{id}} = 1 if $audioWindow;
         $failures = 0;
     }
 
