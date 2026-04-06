@@ -2847,10 +2847,42 @@ sub sendAdminPage {
                     '<td><code>' + esc(ch.channelId) + '</code></td>' +
                     '<td><span class="badge ' + srcClass + '">' + esc(ch.source) + '</span></td>' +
                     '<td><span class="badge ' + (ch.effectiveHarmonize ? 'badge-on' : 'badge-off') + '">' + (ch.effectiveHarmonize ? 'harmonize' : 'copy') + '</span></td>' +
-                    '<td><label class="switch"><input type="checkbox" ' + (ch.effectiveHarmonize ? 'checked' : '') + ' onchange="setHarmonize(' + JSON.stringify(ch.channelId) + ', this.checked)"><span class="slider"></span></label><div class="muted">' + esc(persistent) + '</div></td>' +
+                    '<td><label class="switch"><input type="checkbox" class="harmonize-toggle" data-channel-id="' + esc(ch.channelId) + '" ' + (ch.effectiveHarmonize ? 'checked' : '') + '><span class="slider"></span></label><div class="muted">' + esc(persistent) + '</div></td>' +
                     '</tr>';
             }).join('');
         }
+
+        document.getElementById('channelsTbody').addEventListener('change', function(ev){
+            const target = ev.target;
+            if (!target || !target.classList || !target.classList.contains('harmonize-toggle')) return;
+            const channelId = target.getAttribute('data-channel-id') || '';
+            const checked = !!target.checked;
+            if (!channelId) {
+                toast('Fehlende channelId', true);
+                return;
+            }
+            target.disabled = true;
+            api('/admin/toggle_harmonize', { channelId: channelId, enabled: checked ? 1 : 0, region: region })
+                .then(function(){
+                    if (Array.isArray(current.channels)) {
+                        current.channels = current.channels.map(function(ch){
+                            if (ch.channelId === channelId) {
+                                ch.persistedHarmonize = checked;
+                                ch.effectiveHarmonize = checked;
+                                ch.source = 'persisted';
+                            }
+                            return ch;
+                        });
+                        renderChannels();
+                    }
+                })
+                .catch(function(){
+                    target.checked = !checked;
+                })
+                .finally(function(){
+                    target.disabled = false;
+                });
+        });
         function renderStreams(){
             const tbody = document.getElementById('streamsTbody');
             const rows = current.streams || [];
