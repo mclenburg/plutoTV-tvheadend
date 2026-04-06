@@ -154,6 +154,33 @@ sub saveJsonFile {
     return 1;
 }
 
+sub modifyJsonFile {
+    my ($path, $default, $callback) = @_;
+    ensureRuntimeStateDir();
+    my $fh;
+    if (-e $path) {
+        open($fh, '+<', $path) or return $default;
+    } else {
+        open($fh, '+>', $path) or return $default;
+    }
+    flock($fh, LOCK_EX);
+    local $/;
+    my $content = <$fh>;
+    my $data = $default;
+    if (defined $content && length $content) {
+        my $parsed = eval { decode_json($content) };
+        if (!$@ && defined $parsed) {
+            $data = $parsed;
+        }
+    }
+    $data = $callback->($data);
+    seek($fh, 0, 0);
+    truncate($fh, 0);
+    print $fh encode_json($data);
+    close($fh);
+    return $data;
+}
+
 sub loadHarmonizeOverrides {
     my $parsed = loadJsonFile($harmonizeStateFile, {});
     return {} unless ref($parsed) eq 'HASH';
