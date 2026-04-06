@@ -1727,20 +1727,24 @@ sub streamHlsViaFfmpeg {
         }
 
         push @cmd,
-            '-c:v', 'copy',
-            '-bsf:v', 'h264_mp4toannexb',
-            '-c:a', 'copy',
+            '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p',
+            '-c:v', 'h264_v4l2m2m',
+            '-b:v', '2500k',
+            '-g', '50',
+            '-c:a', 'aac',
+            '-ar', '48000',
+            '-ac', '2',
+            '-b:a', '128k',
             '-muxdelay', '0', '-muxpreload', '0',
             '-mpegts_flags', '+resend_headers',
             '-avoid_negative_ts', 'make_zero',
             '-max_interleave_delta', '1000000',
             '-flush_packets', '1',
             '-metadata', 'service_provider=PlutoTV',
-            '-metadata', 'service_name=' . ($channelName || $channelId),
+            '-metadata', 'service_name=Harmonized',
             '-f', 'mpegts', 'pipe:1';
 
-        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s
-", $channelId); }
+        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s (720p re-encode via h264_v4l2m2m/AAC)\n", $channelId); }
 
         my $ffh;
         my $ffpid = open($ffh, '-|', @cmd);
