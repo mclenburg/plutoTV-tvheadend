@@ -31,6 +31,7 @@ use IO::Select;
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
 use File::Path qw(make_path);
+use File::Spec;
 
 my $hostIp = "127.0.0.1";
 my $port = "9000";
@@ -63,7 +64,30 @@ my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $debug = 0;
 my %hybrid_harmonize_channels = ();
 
-my $runtimeStateDir = (-d '/dev/shm' ? '/dev/shm/plutotv-localserver' : '/tmp/plutotv-localserver');
+sub defaultRuntimeStateDir {
+    return '/dev/shm/plutotv-localserver' if -d '/dev/shm';
+    return File::Spec->catdir(File::Spec->tmpdir(), 'plutotv-localserver');
+}
+
+sub resolveRuntimeStateDir {
+    my ($value) = @_;
+    return defaultRuntimeStateDir() unless defined $value && length $value;
+
+    require File::Basename;
+    my $candidate;
+    if (-d $value || $value =~ m{[\/]$}) {
+        $candidate = $value;
+    } else {
+        $candidate = File::Basename::dirname($value);
+        # A path like /dev/foo.json is not a writable temp area for our state files.
+        # In that case fall back to the normal temp location.
+        return defaultRuntimeStateDir() if !defined($candidate) || $candidate eq '' || $candidate eq '/' || $candidate eq '/dev';
+    }
+
+    return $candidate;
+}
+
+my $runtimeStateDir = defaultRuntimeStateDir();
 my $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
 my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
 my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
@@ -74,8 +98,7 @@ my $lastStateIoError = '';
 
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
 if (defined $tempFile && length $tempFile) {
-    require File::Basename;
-    $runtimeStateDir = File::Basename::dirname($tempFile);
+    $runtimeStateDir = resolveRuntimeStateDir($tempFile);
     $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
     $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
     $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
