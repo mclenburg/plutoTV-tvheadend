@@ -445,7 +445,7 @@ sub handleAdminSetConfig {
     my ($client, $request) = @_;
     my $params = try { HTTP::Request::Params->new({ req => $request })->params } || {};
     my $stall   = int($params->{stall_timeout}   || 15);
-    my $startup = int($params->{startup_timeout} || 45);
+    my $startup = int($params->{startup_timeout} || 12);
     my $fails   = int($params->{max_failures}    || 5);
     my $depth   = int($params->{log_depth}       || 10);
 
@@ -509,7 +509,7 @@ sub buildAdminSnapshot {
         logs     => \@recent,
         config   => {
             stall_timeout   => int(getConfigValue('stall_timeout', 15)),
-            startup_timeout => int(getConfigValue('startup_timeout', 45)),
+            startup_timeout => int(getConfigValue('startup_timeout', 12)),
             max_failures    => int(getConfigValue('max_failures',  5)),
             log_depth       => int(getConfigValue('log_depth',     10)),
         },
@@ -1966,6 +1966,8 @@ sub buildReencodeFfmpegCommand {
     if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
             '-c:v', 'h264_v4l2m2m',
+            '-num_capture_buffers', '128',
+            '-num_output_buffers', '128',
             '-b:v', '4M',
             '-maxrate', '4M',
             '-bufsize', '8M',
@@ -2077,7 +2079,7 @@ sub streamReencodedWindow {
         my $total_written_bytes = 0;
         my $chunk_count = 0;
         my $stall_timeout = int(getConfigValue('stall_timeout', 15));
-        my $startup_timeout = int(getConfigValue('startup_timeout', 45));
+        my $startup_timeout = int(getConfigValue('startup_timeout', 12));
         $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
         my $firstChunk = 1;
         my $has_output = 0;
@@ -3238,7 +3240,7 @@ sub sendAdminPage {
         function renderConfig(){
             const cfg = current.config || {};
             document.getElementById('cfgStall').value = cfg.stall_timeout || 15;
-            document.getElementById('cfgStartup').value = cfg.startup_timeout || 45;
+            document.getElementById('cfgStartup').value = cfg.startup_timeout || 12;
             document.getElementById('cfgFail').value = cfg.max_failures || 5;
             document.getElementById('cfgLogDepth').value = cfg.log_depth || 10;
         }
