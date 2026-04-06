@@ -2863,10 +2863,11 @@ sub sendAdminPage {
             }
             target.disabled = true;
             api('/admin/toggle_harmonize', { channelId: channelId, enabled: checked ? 1 : 0, region: region })
-                .then(function(){
+                .then(function(data){
                     if (Array.isArray(current.channels)) {
                         current.channels = current.channels.map(function(ch){
                             if (ch.channelId === channelId) {
+                                if (data && data.channel) return data.channel;
                                 ch.persistedHarmonize = checked;
                                 ch.effectiveHarmonize = checked;
                                 ch.source = 'persisted';
@@ -2956,11 +2957,33 @@ sub handleAdminToggleHarmonize {
     my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
     my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
     my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
+    my $region    = ($params && $params->{region} && exists $regions{$params->{region}}) ? $params->{region} : 'DE';
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
+
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
-    setHarmonizeOverride($channelId, $on);
+    my $saved = setHarmonizeOverride($channelId, $on);
+    unless ($saved) {
+        appendRecentLog('Persistentes Harmonize konnte nicht gespeichert werden: ' . $channelId);
+        sendJsonError($client, 'Persistenz fehlgeschlagen', channelId => $channelId);
+        return;
+    }
+
+    my $persisted = getPersistedHarmonizeOverride($channelId);
+    unless (defined $persisted && $persisted == $on) {
+        appendRecentLog('Persistentes Harmonize verifiziert abweichend: ' . $channelId);
+        sendJsonError($client, 'Persistenz konnte nicht verifiziert werden', channelId => $channelId);
+        return;
+    }
+
     appendRecentLog(($on ? 'Persistentes Harmonize an: ' : 'Persistentes Harmonize aus: ') . $channelId);
-    sendJsonOk($client, msg => ($on ? 'Persistentes Harmonize aktiviert' : 'Persistentes Harmonize deaktiviert'));
+
+    my ($channelEntry) = grep { ($_->{channelId} || '') eq $channelId } @{ buildChannelAdminEntries($region) || [] };
+    sendJsonOk(
+        $client,
+        msg       => ($on ? 'Persistentes Harmonize aktiviert' : 'Persistentes Harmonize deaktiviert'),
+        channelId => $channelId,
+        channel   => $channelEntry,
+    );
 }
 
 sub handleAdminForceDiscontinuity {
