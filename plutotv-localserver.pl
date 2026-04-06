@@ -193,11 +193,9 @@ sub setHarmonizeOverride {
     my ($channelId, $enabled) = @_;
     return 0 unless defined $channelId && length $channelId;
     my $overrides = loadHarmonizeOverrides();
-    if ($enabled) {
-        $overrides->{$channelId} = JSON::PP::true;
-    } else {
-        delete $overrides->{$channelId};
-    }
+    # Persist explicit on/off so the Web-UI behaves like a durable channel list
+    # and can also override channels coming from environment/CLI defaults.
+    $overrides->{$channelId} = $enabled ? JSON::PP::true : JSON::PP::false;
     return saveHarmonizeOverrides($overrides);
 }
 
@@ -362,7 +360,9 @@ sub updateActiveStream {
 sub desiredModeByOverride {
     my ($channelId, $request) = @_;
     my $overrides = loadHarmonizeOverrides();
-    return 'harmonize' if $overrides->{$channelId};
+    if (exists $overrides->{$channelId}) {
+        return $overrides->{$channelId} ? 'harmonize' : 'copy';
+    }
     return 'harmonize' if $hybrid_harmonize_channels{$channelId};
 
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
@@ -434,6 +434,7 @@ sub buildAdminSnapshot {
 
     my @harm;
     for my $channelId (sort keys %$harmonize) {
+        next unless $harmonize->{$channelId};
         my $channel = findChannelMetaById($channelId, $region);
         my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
         push @harm, { channelId => $channelId, channelName => $name };
@@ -2785,7 +2786,11 @@ sub sendAdminPage {
         window.toggleHarmonize = function(channelId, enabled) {
             api('/admin/toggle_harmonize', {channelId: channelId, enabled: enabled, region: region0}, function(d){
                 if (d && d.ok) {
-                    applyHarmonizeLocally(channelId, enabled ? 1 : 0);
+                    if (d.snapshot) {
+                        render(d.snapshot);
+                    } else {
+                        applyHarmonizeLocally(channelId, enabled ? 1 : 0);
+                    }
                 }
             });
         };
@@ -3053,11 +3058,37 @@ sub handleAdminToggleHarmonize {
     my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
     my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
     my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
+    my $region    = ($params && $params->{region} && exists $regions{$params->{region}}) ? $params->{region} : 'DE';
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
-    setHarmonizeOverride($channelId, $on);
-    appendRecentLog(($on ? 'Harmonize an: ' : 'Harmonize aus: ') . $channelId);
-    sendJsonOk($client, msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'));
+    my $saved = setHarmonizeOverride($channelId, $on);
+    unless ($saved) {
+        sendJsonError($client, 'Harmonize-Status konnte nicht gespeichert werden');
+        return;
+    }
+
+    my $streams = loadActiveStreams();
+    my @restarted;
+    for my $key (keys %$streams) {
+        my $entry = $streams->{$key};
+        next unless ref($entry) eq 'HASH';
+        next unless ($entry->{channelId} || '') eq $channelId;
+        next if $entry->{is_direct};
+        if ($entry->{pid} && pidIsAlive($entry->{pid})) {
+            updateActiveStream($key, desiredMode => ($on ? 'harmonize' : 'copy'));
+            kill('TERM', $entry->{pid});
+            push @restarted, $entry->{pid};
+        }
+    }
+
+    appendRecentLog(($on ? 'Harmonize an: ' : 'Harmonize aus: ') . $channelId . (@restarted ? ' (aktive Streams neu gestartet)' : ''));
+    my $snapshot = buildAdminSnapshot($region);
+    sendJsonOk(
+        $client,
+        msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'),
+        restarted => scalar(@restarted),
+        snapshot => $snapshot,
+    );
 }
 
 sub handleAdminForceDiscontinuity {
