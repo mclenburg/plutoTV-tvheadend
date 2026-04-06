@@ -1735,19 +1735,40 @@ sub streamMuxedFromLocalChildStreams {
 }
 
 
+
+sub ffmpegSupportsEncoder {
+    my ($encoder) = @_;
+    return 0 unless $ffmpeg && $encoder;
+    state $cache = {};
+    return $cache->{$encoder} if exists $cache->{$encoder};
+
+    my $encoders = qx{$ffmpeg -hide_banner -encoders 2>/dev/null};
+    my $ok = ($encoders =~ /^\s*[A-Z\.]+\s+\Q$encoder\E\s*$/m) ? 1 : 0;
+    $cache->{$encoder} = $ok;
+    return $ok;
+}
+
+sub choosePanzerVideoCodec {
+    return 'h264_v4l2m2m' if ffmpegSupportsEncoder('h264_v4l2m2m');
+    return 'libx264';
+}
+
 sub buildPanzerEncodeCommand {
     my (%args) = @_;
     my $inputSource = $args{inputSource} || 'pipe:0';
     my $channelName = $args{channelName} || $args{channelId} || 'Harmonized';
-    my $videoCodec = $args{videoCodec} || 'h264_v4l2m2m';
+    my $videoCodec = $args{videoCodec} || choosePanzerVideoCodec();
 
-    return (
+    my @cmd = (
         $ffmpeg,
         '-loglevel', 'error',
         '-nostdin',
         '-threads', '1',
         '-thread_queue_size', '512',
-        '-fflags', '+genpts+discardcorrupt',
+        '-fflags', '+genpts+discardcorrupt+nobuffer',
+        '-probesize', '256k',
+        '-analyzeduration', '500k',
+        '-f', 'mpegts',
         '-i', $inputSource,
         '-map', '0:v:0?',
         '-map', '0:a:0?',
@@ -1772,6 +1793,12 @@ sub buildPanzerEncodeCommand {
         '-f', 'mpegts',
         'pipe:1'
     );
+
+    if ($videoCodec eq 'h264_v4l2m2m') {
+        splice(@cmd, 18, 0, ('-pix_fmt', 'yuv420p'));
+    }
+
+    return @cmd;
 }
 
 sub buildSegmentMuxCommand {
@@ -1953,25 +1980,18 @@ sub streamHlsViaFfmpeg {
         );
         close($mux_write);
 
-        my @codec_candidates = ('h264_v4l2m2m', 'libx264');
-        my ($encPid, $codec_used);
-        for my $codec (@codec_candidates) {
-            $encPid = spawnExecProcess(
-                cmd => [ buildPanzerEncodeCommand(
-                    inputSource => 'pipe:0',
-                    channelId => $channelId,
-                    channelName => ($channelName || $channelId),
-                    videoCodec => $codec,
-                ) ],
-                stdin_fh => $mux_read,
-                stdout_fh => $enc_write,
-                stderr_path => $ffmpegErr,
-            );
-            if ($encPid) {
-                $codec_used = $codec;
-                last;
-            }
-        }
+        my $codec_used = choosePanzerVideoCodec();
+        my $encPid = spawnExecProcess(
+            cmd => [ buildPanzerEncodeCommand(
+                inputSource => 'pipe:0',
+                channelId => $channelId,
+                channelName => ($channelName || $channelId),
+                videoCodec => $codec_used,
+            ) ],
+            stdin_fh => $mux_read,
+            stdout_fh => $enc_write,
+            stderr_path => $ffmpegErr,
+        );
         close($mux_read);
         close($enc_write);
 
