@@ -131,6 +131,7 @@ our %channel_timestamps = ();
 our %session_cache = ();
 our %channel_cache = ();
 our %master_url_cache = ();
+our %ffmpeg_encoder_support_cache = ();
 
 
 my $sessionRefreshInterval = 25 * 60;
@@ -1739,12 +1740,11 @@ sub streamMuxedFromLocalChildStreams {
 sub ffmpegSupportsEncoder {
     my ($encoder) = @_;
     return 0 unless $ffmpeg && $encoder;
-    state $cache = {};
-    return $cache->{$encoder} if exists $cache->{$encoder};
+    return $ffmpeg_encoder_support_cache{$encoder} if exists $ffmpeg_encoder_support_cache{$encoder};
 
     my $encoders = qx{$ffmpeg -hide_banner -encoders 2>/dev/null};
     my $ok = ($encoders =~ /^\s*[A-Z\.]+\s+\Q$encoder\E\s*$/m) ? 1 : 0;
-    $cache->{$encoder} = $ok;
+    $ffmpeg_encoder_support_cache{$encoder} = $ok;
     return $ok;
 }
 
