@@ -1932,11 +1932,9 @@ sub buildAudioSegmentSliceForVideoWindow {
 
 sub buildReencodeFfmpegCommand {
     my (%args) = @_;
-    my $encoder          = $args{encoder}          || 'libx264';
-    my $videoPlaylist    = $args{videoPlaylist}    or return;
-    my $audioPlaylist    = $args{audioPlaylist};
-    my $channelName      = $args{channelName}      || 'PlutoTV';
-    my $hasSeparateAudio = $args{hasSeparateAudio} ? 1 : 0;
+    my $encoder       = $args{encoder}       || 'libx264';
+    my $videoPlaylist = $args{videoPlaylist} or return;
+    my $channelName   = $args{channelName}   || 'PlutoTV';
 
     my @cmd = (
         $ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin',
@@ -1945,29 +1943,15 @@ sub buildReencodeFfmpegCommand {
         '-analyzeduration', '1000000',
         '-probesize', '1000000',
         '-i', $videoPlaylist,
+        '-map', '0:v:0',
     );
-
-    if ($hasSeparateAudio) {
-        push @cmd,
-            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-            '-fflags', '+genpts+discardcorrupt',
-            '-analyzeduration', '1000000',
-            '-probesize', '1000000',
-            '-i', $audioPlaylist,
-            '-map', '0:v:0', '-map', '1:a:0';
-    } else {
-        push @cmd,
-            '-map', '0:v:0', '-map', '0:a:0?';
-    }
-
-    push @cmd,
-        '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p';
 
     if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
+            '-vf', 'scale=1280:720,format=nv12',
             '-c:v', 'h264_v4l2m2m',
-            '-num_capture_buffers', '128',
-            '-num_output_buffers', '128',
+            '-num_capture_buffers', '16',
+            '-num_output_buffers', '16',
             '-b:v', '4M',
             '-maxrate', '4M',
             '-bufsize', '8M',
@@ -1975,6 +1959,7 @@ sub buildReencodeFfmpegCommand {
             '-g', '50';
     } else {
         push @cmd,
+            '-vf', 'scale=1280:720,format=yuv420p',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-tune', 'zerolatency',
@@ -1987,10 +1972,7 @@ sub buildReencodeFfmpegCommand {
     }
 
     push @cmd,
-        '-c:a', 'aac',
-        '-ar', '48000',
-        '-b:a', '160k',
-        '-ac', '2',
+        '-an',
         '-muxdelay', '0',
         '-muxpreload', '0',
         '-mpegts_flags', '+resend_headers',
@@ -2021,13 +2003,8 @@ sub streamReencodedWindow {
 
     my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
     my $videoPlaylist = "$tmpdir/video.m3u8";
-    my $audioPlaylist = "$tmpdir/audio.m3u8";
-
     buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
-    debugTrace('Lokale Video-Playlist fuer ' . $channelId . ': ' . $videoPlaylist . ' seg=' . scalar(@{ $window->{videoSegments} || [] }));
-    my $hasSeparateAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
-    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasSeparateAudio;
-    debugTrace('Lokale Audio-Playlist fuer ' . $channelId . ': ' . $audioPlaylist . ' seg=' . scalar(@{ $window->{audioSegments} || [] })) if $hasSeparateAudio;
+    debugTrace('Lokale Video-Playlist fuer ' . $channelId . ': ' . $videoPlaylist . ' seg=' . scalar(@{ $window->{videoSegments} || [] }) . ' [audio-test aus]');
 
     if (!$headersSentRef || !$$headersSentRef) {
         eval {
@@ -2053,8 +2030,6 @@ sub streamReencodedWindow {
         my @cmd = buildReencodeFfmpegCommand(
             encoder       => $encoder,
             videoPlaylist => $videoPlaylist,
-            audioPlaylist => $audioPlaylist,
-            hasSeparateAudio => $hasSeparateAudio,
             channelName   => $channelName,
         );
         my $cmdline = join(' ', map { shellQuote($_) } @cmd);
@@ -2080,6 +2055,7 @@ sub streamReencodedWindow {
         my $chunk_count = 0;
         my $stall_timeout = int(getConfigValue('stall_timeout', 15));
         my $startup_timeout = int(getConfigValue('startup_timeout', 12));
+        $startup_timeout = 30 if $encoder eq 'h264_v4l2m2m' && $startup_timeout < 30;
         $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
         my $firstChunk = 1;
         my $has_output = 0;
