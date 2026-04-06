@@ -137,6 +137,42 @@ my $sessionRefreshInterval = 25 * 60;
 my $sessionRetryCooldown = 30;
 
 
+# -----------------------------------------------------------------------------
+# Request and response helpers
+# -----------------------------------------------------------------------------
+
+sub getRequestParams {
+    my ($request) = @_;
+    return try { HTTP::Request::Params->new({ req => $request })->params } || {};
+}
+
+sub getRequestRegion {
+    my ($request, $params) = @_;
+    $params ||= getRequestParams($request);
+    return ($params->{region} && exists $regions{$params->{region}}) ? $params->{region} : 'DE';
+}
+
+sub isTruthy {
+    my ($value) = @_;
+    return 0 unless defined $value;
+    return $value =~ /^(1|true|yes|on)$/i ? 1 : 0;
+}
+
+sub isFalsy {
+    my ($value) = @_;
+    return 0 unless defined $value;
+    return $value =~ /^(0|false|no|off)$/i ? 1 : 0;
+}
+
+sub sendMpegTsHeaders {
+    my ($client) = @_;
+    $client->write("HTTP/1.1 200 OK\n");
+    $client->write("Content-Type: video/mp2t\n");
+    $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+    $client->write("Connection: close\n\n");
+}
+
+
 sub setLastStateIoError {
     my ($msg) = @_;
     $lastStateIoError = defined $msg ? "$msg" : '';
@@ -156,15 +192,6 @@ sub ensureRuntimeStateDir {
     return 1;
 }
 
-sub htmlEscape {
-    my ($value) = @_;
-    $value = '' unless defined $value;
-    $value =~ s/&/&amp;/g;
-    $value =~ s/</&lt;/g;
-    $value =~ s/>/&gt;/g;
-    $value =~ s/"/&quot;/g;
-    return $value;
-}
 
 sub loadJsonFile {
     my ($path, $default) = @_;
@@ -275,6 +302,10 @@ sub modifyJsonFile {
     return $data;
 }
 
+# -----------------------------------------------------------------------------
+# Persistent runtime state
+# -----------------------------------------------------------------------------
+
 sub loadHarmonizeOverrides {
     my $parsed = loadJsonFile($harmonizeStateFile, {});
     return {} unless ref($parsed) eq 'HASH';
@@ -327,11 +358,6 @@ sub loadActiveStreams {
     return $parsed;
 }
 
-sub saveActiveStreams {
-    my ($hashref) = @_;
-    $hashref ||= {};
-    return saveJsonFile($activeStreamsStateFile, $hashref);
-}
 
 sub registerActiveStream {
     my (%info) = @_;
@@ -463,16 +489,15 @@ sub desiredModeByOverride {
     }
     return 'harmonize' if $hybrid_harmonize_channels{$channelId};
 
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    if ($params && defined $params->{mode}) {
+    my $params = getRequestParams($request);
+    if (defined $params->{mode}) {
         my $mode = lc($params->{mode});
         return 'harmonize' if $mode eq 'harmonize';
         return 'copy' if $mode eq 'copy';
     }
-    if ($params && defined $params->{harmonize}) {
-        my $flag = lc($params->{harmonize});
-        return 'harmonize' if $flag =~ /^(1|true|yes|on)$/;
-        return 'copy' if $flag =~ /^(0|false|no|off)$/;
+    if (defined $params->{harmonize}) {
+        return 'harmonize' if isTruthy($params->{harmonize});
+        return 'copy' if isFalsy($params->{harmonize});
     }
     return 'copy';
 }
@@ -590,9 +615,8 @@ sub buildAdminSnapshot {
 
 sub sendAdminEvents {
     my ($client, $request) = @_;
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my $params = getRequestParams($request);
+    my $region = getRequestRegion($request, $params);
 
     eval {
         $client->write("HTTP/1.1 200 OK\n");
@@ -621,6 +645,10 @@ sub sendAdminEvents {
         sleep 1;
     }
 }
+
+# -----------------------------------------------------------------------------
+# Playlist and discontinuity handling
+# -----------------------------------------------------------------------------
 
 sub getLatestDiscontinuitySeq {
     my ($playlistContent) = @_;
@@ -672,6 +700,10 @@ sub formatEpochLocal {
     return sprintf('%04d-%02d-%02d %02d:%02d:%02d',
         $lt[5] + 1900, $lt[4] + 1, $lt[3], $lt[2], $lt[1], $lt[0]);
 }
+
+# -----------------------------------------------------------------------------
+# Process helpers and Pluto API access
+# -----------------------------------------------------------------------------
 
 sub getArgsValue {
     my ($param) = @_;
@@ -860,17 +892,6 @@ sub getBootFromPluto {
     return undef;
 }
 
-sub parseQueryString {
-    my ($query) = @_;
-    my %pairs;
-    return %pairs unless defined $query && length $query;
-    for my $part (split /&/, $query) {
-        next unless length $part;
-        my ($k, $v) = split /=/, $part, 2;
-        $pairs{$k} = defined $v ? $v : '';
-    }
-    return %pairs;
-}
 
 sub buildQueryString {
     my (%pairs) = @_;
@@ -1008,44 +1029,7 @@ sub resolvePlaylistUrlPreserveQuery {
     return URI->new_abs($value, $baseUrl)->as_string;
 }
 
-sub rewriteManifestAttributeLine {
-    my ($line, $baseUrl) = @_;
-    return $line unless defined $line && defined $baseUrl;
-    $line =~ s{URI="([^"]+)"}{'URI="' . resolvePlaylistUrlPreserveQuery($baseUrl, $1) . '"'}eg;
-    return $line;
-}
 
-sub rewriteManifestForClient {
-    my ($manifest, $sourceUrl) = @_;
-    return $manifest unless defined $manifest && defined $sourceUrl;
-    my @lines = split /
-?
-/, $manifest;
-    my @out;
-    for my $line (@lines) {
-        if ($line =~ /^#EXT-X-(?:KEY|MAP):/) {
-            push @out, rewriteManifestAttributeLine($line, $sourceUrl);
-            next;
-        }
-        if ($line =~ /^#/) {
-            push @out, $line;
-            next;
-        }
-        if (!length $line) {
-            push @out, $line;
-            next;
-        }
-        my $resolved = resolvePlaylistUrlPreserveQuery($sourceUrl, $line);
-        if ($resolved =~ /\.m3u8(?:$|[?#])/i) {
-            push @out, 'http://' . $hostIp . ':' . $port . '/proxy.m3u8?src=' . uri_escape_utf8($resolved);
-        } else {
-            push @out, $resolved;
-        }
-    }
-    return join("
-", @out) . "
-";
-}
 
 sub getChannelJson {
     my ($region, $forceRefresh) = @_;
@@ -1244,7 +1228,7 @@ sub buildM3uDirect {
 
 sub sendMasterAlias {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $params = getRequestParams($request);
     my $channelId = $params && $params->{id} ? $params->{id} : undef;
     unless ($channelId) {
         $client->send_error(RC_BAD_REQUEST, "Missing id parameter");
@@ -1377,11 +1361,14 @@ sub xmlCdata {
     return '<![CDATA[' . $value . ']]>';
 }
 
+# -----------------------------------------------------------------------------
+# Public endpoints: playlist, stream and EPG
+# -----------------------------------------------------------------------------
+
 sub sendXmltvEpgFile {
     my ($client, $request) = @_;
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my $params = getRequestParams($request);
+    my $region = getRequestRegion($request, $params);
 
     my @channels = getChannelJson($region);
     unless (@channels) {
@@ -1446,11 +1433,7 @@ sub sendXmltvEpgFile {
 
 sub sendM3uFile {
     my ($client, $useDirectStreams, $request) = @_;
-    my $region = 'DE';
-    if ($request) {
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-    }
+    my $region = $request ? getRequestRegion($request) : 'DE';
     my @channels = getChannelJson($region);
     unless (@channels) {
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
@@ -1475,9 +1458,8 @@ sub sendDirectStream {
         $client->send_error(RC_BAD_REQUEST, "Invalid stream path");
         return;
     }
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my $params = getRequestParams($request);
+    my $region = getRequestRegion($request, $params);
 
     my $channel = getChannelById($channelId, $region);
     registerActiveStream(
@@ -1504,30 +1486,6 @@ sub sendDirectStream {
     $response->header("pragma", "no-cache");
     $response->header("expires", "0");
     $response->content(encode_utf8($dynamicPlaylist));
-    $client->send_response($response);
-}
-sub sendPlaylistProxy {
-    my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $src = $params && $params->{src} ? $params->{src} : undef;
-    unless ($src) {
-        $client->send_error(RC_BAD_REQUEST, "Missing src parameter");
-        return;
-    }
-    my $content = getFromUrl($src);
-    unless ($content) {
-        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch proxied playlist");
-        return;
-    }
-    my $rewritten = rewriteManifestForClient($content, $src);
-    my $response = HTTP::Response->new();
-    $response->code(200);
-    $response->message("OK");
-    $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
-    $response->header("cache-control", "no-cache, no-store, must-revalidate");
-    $response->header("pragma", "no-cache");
-    $response->header("expires", "0");
-    $response->content(encode_utf8($rewritten));
     $client->send_response($response);
 }
 
@@ -1566,13 +1524,6 @@ sub createDynamicPlaylist {
     return $dynamicPlaylist;
 }
 
-sub buildLocalChildStreamUrl {
-    my ($channelId, $region, $kind) = @_;
-    my $path = ($kind && $kind eq 'audio') ? 'dynamic_audio_stream' : 'dynamic_video_stream';
-    my $url = 'http://' . $hostIp . ':' . $port . '/' . $path . '/' . $channelId . '.ts';
-    $url .= '?region=' . uri_escape_utf8($region) if defined $region && length $region;
-    return $url;
-}
 
 sub streamPlaylistToHandle {
     my ($fh, $channelId, $region, $playlistUrl, $kind) = @_;
@@ -1665,18 +1616,7 @@ sub streamMuxedFromLocalChildStreams {
     return 0 unless $videoUrl && $audioUrl;
 
     if (!$headersSentRef || !$$headersSentRef) {
-        eval {
-            $client->write("HTTP/1.1 200 OK
-");
-            $client->write("Content-Type: video/mp2t
-");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-            $client->write("Connection: close
-");
-            $client->write("
-");
-        };
+        eval { sendMpegTsHeaders($client); };
         if ($@) {
             printf("Failed to send headers - client disconnected: %s
 ", $@);
@@ -1794,26 +1734,6 @@ sub streamMuxedFromLocalChildStreams {
     return 1;
 }
 
-sub sendElementaryDynamicStream {
-    my ($client, $request, $kind) = @_;
-    my $path = $request->uri->path;
-    my ($channelId) = $path =~ m{/dynamic_(?:video|audio)_stream/([^/]+)\.ts$};
-    unless ($channelId) {
-        $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
-        return;
-    }
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-
-    my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
-    my $playlistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
-    unless ($playlistUrl) {
-        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
-        return;
-    }
-    streamWithDiscontinuityRestart($client, $channelId . '-' . ($kind || 'video'), $region, $playlistUrl);
-}
 
 sub streamHlsViaFfmpeg {
     my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName, $headersSentRef, $activeStreamKey, $request) = @_;
@@ -1822,18 +1742,7 @@ sub streamHlsViaFfmpeg {
 
     $client->timeout(5);
     if (!$headersSentRef || !$$headersSentRef) {
-        eval {
-            $client->write("HTTP/1.1 200 OK
-");
-            $client->write("Content-Type: video/mp2t
-");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-            $client->write("Connection: close
-");
-            $client->write("
-");
-        };
+        eval { sendMpegTsHeaders($client); };
         if ($@) {
             if ($debug) { printf("Failed to send headers - client disconnected: %s
 ", $@); }
@@ -1957,11 +1866,6 @@ sub streamHlsViaFfmpeg {
     return 1;
 }
 
-sub shouldUseHlsHarmonizer {
-    my ($channelId, $request) = @_;
-    return 0 unless $ffmpeg;
-    return desiredModeByOverride($channelId, $request) eq 'harmonize' ? 1 : 0;
-}
 
 sub sendDynamicStream {
     my ($client, $request) = @_;
@@ -1972,9 +1876,8 @@ sub sendDynamicStream {
         $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
         return;
     }
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my $params = getRequestParams($request);
+    my $region = getRequestRegion($request, $params);
 
     my (undef, $channel, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
     unless ($videoUrl) {
@@ -2059,18 +1962,7 @@ sub streamWithDiscontinuityRestart {
     my ($client, $channelId, $region, $playlistUrl) = @_;
     $region ||= 'DE';
     $client->timeout(5);
-    eval {
-        $client->write("HTTP/1.1 200 OK
-");
-        $client->write("Content-Type: video/mp2t
-");
-        $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-        $client->write("Connection: close
-");
-        $client->write("
-");
-    };
+    eval { sendMpegTsHeaders($client); };
     if ($@) {
         printf("Failed to send headers - client disconnected: %s
 ", $@);
@@ -2659,11 +2551,14 @@ sub findChannelMetaById {
     return undef;
 }
 
+# -----------------------------------------------------------------------------
+# Admin UI and JSON endpoints
+# -----------------------------------------------------------------------------
+
 sub sendAdminPage {
     my ($client, $request) = @_;
-    my $region = 'DE';
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my $params = getRequestParams($request);
+    my $region = getRequestRegion($request, $params);
     my $snapshot    = buildAdminSnapshot($region);
     my $snapshotJson = encode_json($snapshot);
     my $regionsJson  = encode_json([ sort keys %regions ]);
@@ -3096,13 +2991,6 @@ HTML
     $client->send_response($response);
 }
 
-sub sendRedirect {
-    my ($client, $location) = @_;
-    my $response = HTTP::Response->new(303);
-    $response->header('Location' => $location);
-    $response->content('');
-    $client->send_response($response);
-}
 
 sub sendJsonResponse {
     my ($client, $code, $payload) = @_;
@@ -3130,10 +3018,10 @@ sub sendJsonError {
 
 sub handleAdminSetConfig {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $stall_timeout = int($params && defined $params->{stall_timeout} ? $params->{stall_timeout} : getConfigValue('stall_timeout', 15));
-    my $max_failures  = int($params && defined $params->{max_failures}  ? $params->{max_failures}  : getConfigValue('max_failures', 5));
-    my $log_depth     = int($params && defined $params->{log_depth}     ? $params->{log_depth}     : getConfigValue('log_depth', 10));
+    my $params = getRequestParams($request);
+    my $stall_timeout = int(defined $params->{stall_timeout} ? $params->{stall_timeout} : getConfigValue('stall_timeout', 15));
+    my $max_failures  = int(defined $params->{max_failures} ? $params->{max_failures} : getConfigValue('max_failures', 5));
+    my $log_depth     = int(defined $params->{log_depth} ? $params->{log_depth} : getConfigValue('log_depth', 10));
 
     $stall_timeout = 5   if $stall_timeout < 5;
     $stall_timeout = 120 if $stall_timeout > 120;
@@ -3153,12 +3041,12 @@ sub handleAdminSetConfig {
 
 sub handleAdminToggleHarmonize {
     my ($client, $request) = @_;
-    my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
-    my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
-    my $region    = ($params && $params->{region} && exists $regions{$params->{region}}) ? $params->{region} : 'DE';
+    my $params = getRequestParams($request);
+    my $channelId = $params->{channelId} || '';
+    my $enabled   = defined $params->{enabled} ? $params->{enabled} : 0;
+    my $region = getRequestRegion($request, $params);
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
-    my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
+    my $on = isTruthy($enabled);
     my $saved = setHarmonizeOverride($channelId, $on);
     unless ($saved) {
         my $detail = getLastStateIoError();
@@ -3192,8 +3080,8 @@ sub handleAdminToggleHarmonize {
 
 sub handleAdminForceDiscontinuity {
     my ($client, $request) = @_;
-    my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
+    my $params = getRequestParams($request);
+    my $channelId = $params->{channelId} || '';
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     queueForcedDiscontinuity($channelId);
     appendRecentLog('DISCONTINUITY vorgemerkt: ' . $channelId);
@@ -3203,8 +3091,8 @@ sub handleAdminForceDiscontinuity {
 
 sub handleAdminRestartStream {
     my ($client, $request) = @_;
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    my $key = ($params && $params->{key}) ? $params->{key} : '';
+    my $params = getRequestParams($request);
+    my $key = $params->{key} || '';
     unless ($key) { sendJsonError($client, 'Fehlender key'); return; }
     my $streams = loadActiveStreams();
     my $entry   = $streams->{$key};
@@ -3215,6 +3103,10 @@ sub handleAdminRestartStream {
     appendRecentLog('Neustart: ' . ($entry->{channelId} || $key));
     sendJsonOk($client);
 }
+
+# -----------------------------------------------------------------------------
+# Request routing and server lifecycle
+# -----------------------------------------------------------------------------
 
 sub processRequest {
     my ($client) = @_;
@@ -3230,18 +3122,12 @@ sub processRequest {
         sendM3uFile($client, 1, $request);
     } elsif ($path =~ m{^/stream/}) {
         sendDirectStream($client, $request);
-    } elsif ($path eq "/proxy.m3u8") {
-        sendPlaylistProxy($client, $request);
     } elsif ($path eq "/master3u8") {
         sendMasterAlias($client, $request);
     } elsif ($path eq "/epg") {
         sendXmltvEpgFile($client, $request);
     } elsif ($path =~ m{^/dynamic_stream/}) {
         sendDynamicStream($client, $request);
-    } elsif ($path =~ m{^/dynamic_video_stream/}) {
-        sendElementaryDynamicStream($client, $request, 'video');
-    } elsif ($path =~ m{^/dynamic_audio_stream/}) {
-        sendElementaryDynamicStream($client, $request, 'audio');
     } elsif ($path eq "/admin") {
         sendAdminPage($client, $request);
     } elsif ($path eq "/admin/events") {
