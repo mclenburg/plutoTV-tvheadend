@@ -1832,35 +1832,14 @@ sub findMatchingWindow {
     return undef;
 }
 
-sub streamReencodedWindow {
+sub buildReencodeFfmpegCommand {
     my (%args) = @_;
-    my $client          = $args{client}          or return 0;
-    my $channelId       = $args{channelId}       || 'unknown';
-    my $channelName     = $args{channelName}     || $channelId;
-    my $window          = $args{window}          or return 0;
-    my $headersSentRef  = $args{headersSentRef};
-    my $request         = $args{request};
+    my $encoder       = $args{encoder}       || 'libx264';
+    my $videoPlaylist = $args{videoPlaylist} or return;
+    my $audioPlaylist = $args{audioPlaylist};
+    my $channelName   = $args{channelName}   || 'PlutoTV';
+    my $hasAudio      = $args{hasAudio} ? 1 : 0;
 
-    my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-    my $videoPlaylist = "$tmpdir/video.m3u8";
-    my $audioPlaylist = "$tmpdir/audio.m3u8";
-
-    buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
-    my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
-    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasAudio;
-
-    if (!$headersSentRef || !$$headersSentRef) {
-        eval {
-            $client->write("HTTP/1.1 200 OK\n");
-            $client->write("Content-Type: video/mp2t\n");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-            $client->write("Connection: close\n\n");
-        };
-        return 0 if $@;
-        $$headersSentRef = 1 if $headersSentRef;
-    }
-
-    my $encoder = selectH264Encoder();
     my @cmd = (
         $ffmpeg, '-loglevel', 'error', '-nostdin',
         '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
@@ -1880,6 +1859,7 @@ sub streamReencodedWindow {
 
     push @cmd,
         '-vf', 'scale=1280:720',
+        '-pix_fmt', 'yuv420p',
         '-c:v', $encoder,
         ($encoder eq 'libx264' ? ('-preset', 'veryfast', '-tune', 'zerolatency') : ()),
         '-c:a', 'aac',
@@ -1895,71 +1875,164 @@ sub streamReencodedWindow {
         '-metadata', 'service_name=' . $channelName,
         '-f', 'mpegts', 'pipe:1';
 
-    my $ffh;
-    my $ffpid = open($ffh, '-|', @cmd);
-    return 0 unless $ffpid;
-    binmode($ffh);
+    return @cmd;
+}
 
-    my $client_alive = 1;
-    my $buffer = '';
-    my $sel = IO::Select->new($ffh);
-    my $started_at = time();
-    my $last_output_at = $started_at;
-    my $stall_timeout = int(getConfigValue('stall_timeout', 15));
-    my $startup_timeout = int(getConfigValue('startup_timeout', 45));
-    $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
-    my $firstChunk = 1;
-    my $has_output = 0;
+sub shellQuote {
+    my ($value) = @_;
+    $value = '' unless defined $value;
+    $value =~ s/'/'\\''/g;
+    return "'" . $value . "'";
+}
 
-    while (1) {
-        my $desired = desiredModeByOverride($channelId, $request);
-        if ($desired ne 'harmonize') {
-            kill 'TERM', $ffpid;
-            close($ffh);
-            return 'switch';
-        }
+sub streamReencodedWindow {
+    my (%args) = @_;
+    my $client          = $args{client}          or return 0;
+    my $channelId       = $args{channelId}       || 'unknown';
+    my $channelName     = $args{channelName}     || $channelId;
+    my $window          = $args{window}          or return 0;
+    my $headersSentRef  = $args{headersSentRef};
+    my $request         = $args{request};
 
-        my @ready = $sel->can_read(0.5);
-        if (@ready) {
-            my $read = sysread($ffh, $buffer, 1316);
-            last unless defined $read && $read > 0;
-            $last_output_at = time();
-            $has_output = 1;
-            $buffer = correctMpegTsTimestamps($buffer, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
-            $firstChunk = 0;
-            my $ok = eval { $client->write($buffer); 1 };
-            unless ($ok) {
-                $client_alive = 0;
-                last;
-            }
-            next;
-        }
+    my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my $videoPlaylist = "$tmpdir/video.m3u8";
+    my $audioPlaylist = "$tmpdir/audio.m3u8";
+    my $stderrFile    = "$tmpdir/ffmpeg.stderr.log";
 
-        my $child_done = waitpid($ffpid, WNOHANG);
-        if (defined $child_done && $child_done == $ffpid) {
-            last;
-        }
+    buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
+    my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
+    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasAudio;
 
-        if (!$has_output) {
-            if (time() - $started_at >= $startup_timeout) {
-                appendRecentLog('ffmpeg-Fenster-Starttimeout, Neustart: ' . $channelId);
-                kill 'TERM', $ffpid;
-                close($ffh);
-                return 0;
-            }
-            next;
-        }
+    if (!$headersSentRef || !$$headersSentRef) {
+        eval {
+            $client->write("HTTP/1.1 200 OK
+");
+            $client->write("Content-Type: video/mp2t
+");
+            $client->write("Cache-Control: no-cache, no-store, must-revalidate
+");
+            $client->write("Connection: close
 
-        if (time() - $last_output_at >= $stall_timeout) {
-            appendRecentLog('ffmpeg-Fenster-Stall, Neustart: ' . $channelId);
-            kill 'TERM', $ffpid;
-            close($ffh);
-            return 0;
-        }
+");
+        };
+        return 0 if $@;
+        $$headersSentRef = 1 if $headersSentRef;
     }
 
-    close($ffh);
-    return ($client_alive && $has_output) ? 1 : 0;
+    my @encoders = (selectH264Encoder());
+    push @encoders, 'libx264' if $encoders[0] ne 'libx264';
+
+    ENCODER:
+    for my $encoder (@encoders) {
+        unlink $stderrFile if -e $stderrFile;
+
+        my @cmd = buildReencodeFfmpegCommand(
+            encoder       => $encoder,
+            videoPlaylist => $videoPlaylist,
+            audioPlaylist => $audioPlaylist,
+            hasAudio      => $hasAudio,
+            channelName   => $channelName,
+        );
+        my $cmdline = join(' ', map { shellQuote($_) } @cmd) . ' 2>' . shellQuote($stderrFile);
+
+        my $ffh;
+        my $ffpid = open($ffh, '-|', 'sh', '-c', $cmdline);
+        unless ($ffpid) {
+            appendRecentLog('ffmpeg-Start fehlgeschlagen [' . $encoder . ']: ' . $channelId);
+            next ENCODER;
+        }
+        binmode($ffh);
+
+        my $client_alive = 1;
+        my $buffer = '';
+        my $sel = IO::Select->new($ffh);
+        my $started_at = time();
+        my $last_output_at = $started_at;
+        my $stall_timeout = int(getConfigValue('stall_timeout', 15));
+        my $startup_timeout = int(getConfigValue('startup_timeout', 45));
+        $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
+        my $firstChunk = 1;
+        my $has_output = 0;
+        my $aborted_for_timeout = 0;
+
+        while (1) {
+            my $desired = desiredModeByOverride($channelId, $request);
+            if ($desired ne 'harmonize') {
+                kill 'TERM', $ffpid;
+                close($ffh);
+                return 'switch';
+            }
+
+            my @ready = $sel->can_read(0.5);
+            if (@ready) {
+                my $read = sysread($ffh, $buffer, 1316);
+                last unless defined $read && $read > 0;
+                $last_output_at = time();
+                $has_output = 1;
+                $buffer = correctMpegTsTimestamps($buffer, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
+                $firstChunk = 0;
+                my $ok = eval { $client->write($buffer); 1 };
+                unless ($ok) {
+                    $client_alive = 0;
+                    last;
+                }
+                next;
+            }
+
+            my $child_done = waitpid($ffpid, WNOHANG);
+            if (defined $child_done && $child_done == $ffpid) {
+                last;
+            }
+
+            if (!$has_output) {
+                if (time() - $started_at >= $startup_timeout) {
+                    appendRecentLog('ffmpeg-Fenster-Starttimeout [' . $encoder . '], Neustart: ' . $channelId);
+                    $aborted_for_timeout = 1;
+                    kill 'TERM', $ffpid;
+                    close($ffh);
+                    last;
+                }
+                next;
+            }
+
+            if (time() - $last_output_at >= $stall_timeout) {
+                appendRecentLog('ffmpeg-Fenster-Stall [' . $encoder . '], Neustart: ' . $channelId);
+                $aborted_for_timeout = 1;
+                kill 'TERM', $ffpid;
+                close($ffh);
+                last;
+            }
+        }
+
+        close($ffh);
+
+        if ($client_alive && $has_output) {
+            return 1;
+        }
+
+        my $stderr = '';
+        if (open(my $efh, '<', $stderrFile)) {
+            local $/;
+            $stderr = <$efh> // '';
+            close($efh);
+            $stderr =~ s/\s+/ /g;
+            $stderr = substr($stderr, 0, 240);
+        }
+
+        if (!$has_output && $encoder ne 'libx264') {
+            appendRecentLog('ffmpeg ohne Output [' . $encoder . '], Fallback auf libx264: ' . $channelId . ($stderr ? ' | ' . $stderr : ''));
+            next ENCODER;
+        }
+
+        if ($stderr) {
+            appendRecentLog('ffmpeg-Fehler [' . $encoder . ']: ' . $channelId . ' | ' . $stderr);
+        }
+
+        return 0 if $aborted_for_timeout;
+        return ($client_alive && $has_output) ? 1 : 0;
+    }
+
+    return 0;
 }
 
 sub streamHlsViaFfmpeg {
