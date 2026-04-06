@@ -137,14 +137,16 @@ my $sessionRefreshInterval = 25 * 60;
 my $sessionRetryCooldown = 30;
 
 my %harmonizerProfile = (
-    width         => 1280,
-    height        => 720,
-    video_bitrate => '2500k',
-    audio_bitrate => '128k',
-    audio_rate    => 48000,
-    gop           => 50,
-    hw_encoder    => 'h264_v4l2m2m',
-    sw_encoder    => 'libx264',
+    width          => 1280,
+    height         => 720,
+    output_fps     => 25,
+    video_bitrate  => '1800k',
+    audio_bitrate  => '96k',
+    audio_rate     => 48000,
+    gop            => 50,
+    sws_flags      => 'fast_bilinear',
+    hw_encoder     => 'h264_v4l2m2m',
+    sw_encoder     => 'libx264',
 );
 
 
@@ -1750,6 +1752,7 @@ sub streamMuxedFromLocalChildStreams {
 
 sub buildHarmonizeFilterChain {
     return join(',',
+        'fps=' . $harmonizerProfile{output_fps},
         'scale=' . $harmonizerProfile{width} . ':' . $harmonizerProfile{height} . ':force_original_aspect_ratio=decrease',
         'pad=' . $harmonizerProfile{width} . ':' . $harmonizerProfile{height} . ':(ow-iw)/2:(oh-ih)/2',
         'format=yuv420p',
@@ -1765,6 +1768,9 @@ sub buildHarmonizeFfmpegCommand {
 
     my @cmd = (
         $ffmpeg, '-loglevel', 'warning', '-nostdin',
+        '-threads', '1',
+        '-filter_threads', '1',
+        '-filter_complex_threads', '1',
         '-fflags', '+genpts+discardcorrupt',
         '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
         '-re',
@@ -1783,12 +1789,14 @@ sub buildHarmonizeFfmpegCommand {
     }
 
     push @cmd,
+        '-sws_flags', $harmonizerProfile{sws_flags},
         '-vf', buildHarmonizeFilterChain(),
         '-c:v', $videoEncoder,
         '-b:v', $harmonizerProfile{video_bitrate},
         '-g', $harmonizerProfile{gop},
         '-keyint_min', $harmonizerProfile{gop},
         '-bf', '0',
+        '-r', $harmonizerProfile{output_fps},
         '-c:a', 'aac',
         '-ar', $harmonizerProfile{audio_rate},
         '-ac', '2',
