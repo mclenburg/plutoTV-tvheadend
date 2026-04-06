@@ -591,6 +591,17 @@ sub detectNewPlaylistDiscontinuity {
     }
     return 0;
 }
+
+sub debugTrace {
+    my ($message) = @_;
+    return unless $debug;
+    $message = '' unless defined $message;
+    my @lt = localtime(time());
+    my $ts = sprintf('%04d-%02d-%02d %02d:%02d:%02d', $lt[5]+1900, $lt[4]+1, $lt[3], $lt[2], $lt[1], $lt[0]);
+    print STDERR "[$ts] DEBUG $message
+";
+}
+
 sub formatEpochLocal {
     my ($epoch) = @_;
     return '' unless defined $epoch && $epoch =~ /^\d+$/;
@@ -1992,8 +2003,10 @@ sub streamReencodedWindow {
     my $stderrFile    = "$tmpdir/ffmpeg.stderr.log";
 
     buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
+    debugTrace('Lokale Video-Playlist fuer ' . $channelId . ': ' . $videoPlaylist . ' seg=' . scalar(@{ $window->{videoSegments} || [] }));
     my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
     buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasAudio;
+    debugTrace('Lokale Audio-Playlist fuer ' . $channelId . ': ' . $audioPlaylist . ' seg=' . scalar(@{ $window->{audioSegments} || [] })) if $hasAudio;
 
     if (!$headersSentRef || !$$headersSentRef) {
         eval {
@@ -2028,6 +2041,7 @@ sub streamReencodedWindow {
         my $cmdline = join(' ', map { shellQuote($_) } @cmd)
             . ' 2> >(tee -a ' . shellQuote($stderrFile) . ' >&2)';
 
+        debugTrace('Harmonize ffmpeg cmd [' . $encoder . '] ' . $cmdline);
         my $ffh;
         my $ffpid = open($ffh, '-|', 'bash', '-lc', $cmdline);
         unless ($ffpid) {
@@ -2041,6 +2055,9 @@ sub streamReencodedWindow {
         my $sel = IO::Select->new($ffh);
         my $started_at = time();
         my $last_output_at = $started_at;
+        my $total_read_bytes = 0;
+        my $total_written_bytes = 0;
+        my $chunk_count = 0;
         my $stall_timeout = int(getConfigValue('stall_timeout', 15));
         my $startup_timeout = int(getConfigValue('startup_timeout', 45));
         $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
@@ -2059,26 +2076,44 @@ sub streamReencodedWindow {
             my @ready = $sel->can_read(0.5);
             if (@ready) {
                 my $read = sysread($ffh, $buffer, 1316);
-                last unless defined $read && $read > 0;
+                if (!defined $read) {
+                    debugTrace('Harmonize sysread Fehler fuer ' . $channelId . ': ' . ($! || 'unbekannt'));
+                    last;
+                }
+                if ($read == 0) {
+                    debugTrace('Harmonize EOF von ffmpeg fuer ' . $channelId . ' nach ' . $chunk_count . ' Chunks und ' . $total_read_bytes . ' Bytes');
+                    last;
+                }
                 $last_output_at = time();
                 $has_output = 1;
+                $total_read_bytes += $read;
+                $chunk_count++;
+                debugTrace('Harmonize erster ffmpeg-Chunk fuer ' . $channelId . ': ' . $read . ' Bytes [' . $encoder . ']') if $chunk_count == 1;
+                debugTrace('Harmonize ffmpeg-Output fuer ' . $channelId . ': chunks=' . $chunk_count . ' bytes=' . $total_read_bytes . ' [' . $encoder . ']') if $chunk_count % 50 == 0;
                 $buffer = correctMpegTsTimestamps($buffer, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
                 $firstChunk = 0;
-                my $ok = eval { $client->write($buffer); 1 };
+                my $ok = eval { $client->write($buffer); $client->flush(); 1 };
                 unless ($ok) {
+                    debugTrace('Harmonize Client-Write fehlgeschlagen fuer ' . $channelId . ' nach ' . $chunk_count . ' Chunks / ' . $total_read_bytes . ' Bytes: ' . ($@ || 'unbekannt'));
                     $client_alive = 0;
                     last;
                 }
+                $total_written_bytes += length($buffer);
+                debugTrace('Harmonize erster Client-Write fuer ' . $channelId . ': ' . length($buffer) . ' Bytes [' . $encoder . ']') if $chunk_count == 1;
                 next;
             }
 
             my $child_done = waitpid($ffpid, WNOHANG);
             if (defined $child_done && $child_done == $ffpid) {
+                my $exit_code = $? >> 8;
+                my $signal = $? & 127;
+                debugTrace('Harmonize ffmpeg beendet fuer ' . $channelId . ' [' . $encoder . '] exit=' . $exit_code . ' signal=' . $signal . ' read=' . $total_read_bytes . ' written=' . $total_written_bytes);
                 last;
             }
 
             if (!$has_output) {
                 if (time() - $started_at >= $startup_timeout) {
+                    debugTrace('Harmonize Starttimeout fuer ' . $channelId . ' [' . $encoder . '] ohne Output nach ' . (time() - $started_at) . 's');
                     appendRecentLog('ffmpeg-Fenster-Starttimeout [' . $encoder . '], Neustart: ' . $channelId);
                     $aborted_for_timeout = 1;
                     kill 'TERM', $ffpid;
@@ -2089,6 +2124,7 @@ sub streamReencodedWindow {
             }
 
             if (time() - $last_output_at >= $stall_timeout) {
+                debugTrace('Harmonize Stall fuer ' . $channelId . ' [' . $encoder . '] letzte Ausgabe vor ' . (time() - $last_output_at) . 's, read=' . $total_read_bytes . ' written=' . $total_written_bytes);
                 appendRecentLog('ffmpeg-Fenster-Stall [' . $encoder . '], Neustart: ' . $channelId);
                 $aborted_for_timeout = 1;
                 kill 'TERM', $ffpid;
@@ -2098,6 +2134,7 @@ sub streamReencodedWindow {
         }
 
         close($ffh);
+        debugTrace('Harmonize Fensterende fuer ' . $channelId . ' [' . $encoder . '] has_output=' . ($has_output ? 1 : 0) . ' client_alive=' . ($client_alive ? 1 : 0) . ' read=' . $total_read_bytes . ' written=' . $total_written_bytes);
 
         if ($client_alive && $has_output) {
             return 1;
@@ -2145,6 +2182,7 @@ sub streamHlsViaFfmpeg {
 
         my $videoResponse = getResponseFromUrl($videoUrl, ua => $ua);
         my $audioResponse = $audioUrl ? getResponseFromUrl($audioUrl, ua => $ua) : undef;
+        debugTrace('Harmonize Playlist-HTTP ' . $channelId . ' video=' . ($videoResponse ? $videoResponse->status_line : 'no response') . ($audioUrl ? ' audio=' . ($audioResponse ? $audioResponse->status_line : 'no response') : ' audio=embedded-or-none'));
         my $videoContent = $videoResponse && $videoResponse->is_success ? $videoResponse->decoded_content : undef;
         my $audioContent = $audioResponse && $audioResponse->is_success ? $audioResponse->decoded_content : undef;
 
