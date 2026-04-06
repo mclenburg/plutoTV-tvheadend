@@ -446,9 +446,39 @@ sub buildAdminSnapshot {
         }
     } @$logs;
 
+    my %activeByChannel;
+    for my $entry (@entries) {
+        my $cid = $entry->{channelId} || next;
+        if (!$activeByChannel{$cid}) {
+            $activeByChannel{$cid} = $entry;
+            next;
+        }
+        if (($entry->{isDirect} || 0) < ($activeByChannel{$cid}->{isDirect} || 0)) {
+            $activeByChannel{$cid} = $entry;
+        }
+    }
+
+    my @channels;
+    for my $channel (sort { (($a->{number} || 0) <=> ($b->{number} || 0)) || lc($a->{name} || '') cmp lc($b->{name} || '') } getChannelJson($region)) {
+        next unless ref($channel) eq 'HASH';
+        my $channelId = $channel->{id} || $channel->{_id} || '';
+        next unless length $channelId;
+        my $active = $activeByChannel{$channelId};
+        push @channels, {
+            channelId   => $channelId,
+            channelName => $channel->{name} || $channelId,
+            active      => $active ? JSON::PP::true : JSON::PP::false,
+            activeKey   => $active ? ($active->{key} || '') : '',
+            activeMode  => $active ? ($active->{mode} || '') : '',
+            started     => $active ? ($active->{started} || '') : '',
+            harmonize   => ($harmonize->{$channelId} || 0) ? 1 : 0,
+        };
+    }
+
     return {
         region        => $region,
         streams       => \@entries,
+        channels      => \@channels,
         harmonizeList => \@harm,
         logs          => \@recent,
         config        => {
@@ -2635,6 +2665,22 @@ sub sendAdminPage {
     </div>
 
     <div class="card">
+        <div class="card-head">
+            <span class="dot" id="channelsDot"></span>
+            <h2>Sender schalten</h2>
+            <span id="channelsCnt" style="margin-left:auto;font-size:11px;color:#9ca3af"></span>
+        </div>
+        <table>
+            <thead><tr>
+                <th>Sender</th><th>ID</th><th>Aktiv</th><th>Modus</th><th>Harmonize</th><th>Aktionen</th>
+            </tr></thead>
+            <tbody id="channelsTbody">
+            <tr><td colspan="6" class="empty">Keine Sender geladen.</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
         <div class="card-head"><h2>Konfiguration</h2>
             <span style="font-size:11px;color:#9ca3af;margin-left:4px">(wirkt ab naechstem ffmpeg-Start)</span>
         </div>
@@ -2798,8 +2844,48 @@ sub sendAdminPage {
             if (cfg.log_depth     != null) document.getElementById('cfgLogDepth').value = cfg.log_depth;
         }
 
+        function renderChannels(channels) {
+            var tbody = document.getElementById('channelsTbody');
+            var dot   = document.getElementById('channelsDot');
+            var cnt   = document.getElementById('channelsCnt');
+            dot.className = 'dot';
+            cnt.textContent = channels.length ? channels.length + ' Sender' : '';
+            if (!channels.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty">Keine Sender geladen.</td></tr>';
+                return;
+            }
+            var rows = channels.map(function(e){
+                var hOn = !!e.harmonize;
+                var activeBadge = e.active
+                    ? '<span class="badge badge-on">ja</span>'
+                    : '<span class="badge badge-off">nein</span>';
+                var modeBadge = e.activeMode
+                    ? '<span class="badge badge-' + esc(e.activeMode) + '">' + esc(e.activeMode) + '</span>'
+                    : '<span class="badge badge-off">-</span>';
+                var harmBtn = '<button class="btn" onclick="toggleHarmonize(' +
+                    JSON.stringify(e.channelId) + ',' + (hOn ? '0' : '1') + ')">' +
+                    (hOn ? 'Harmonize aus' : 'Harmonize ein') + '</button>';
+                var discBtn = '<button class="btn" onclick="forceDisc(' + JSON.stringify(e.channelId) + ')">DISC</button>';
+                var rstBtn = e.activeKey
+                    ? '<button class="btn btn-danger" onclick="restartStream(' + JSON.stringify(e.activeKey) + ')">&#8635; Neustart</button>'
+                    : '';
+                return '<tr>' +
+                    '<td><strong>' + esc(e.channelName) + '</strong></td>' +
+                    '<td><code>' + esc(e.channelId) + '</code></td>' +
+                    '<td>' + activeBadge + '</td>' +
+                    '<td>' + modeBadge + '</td>' +
+                    '<td>' + (hOn
+                        ? '<span class="badge badge-on">an</span>'
+                        : '<span class="badge badge-off">aus</span>') + '</td>' +
+                    '<td><div class="btns">' + harmBtn + discBtn + rstBtn + '</div></td>' +
+                    '</tr>';
+            });
+            tbody.innerHTML = rows.join('');
+        }
+
         function render(s) {
             renderStreams(s.streams    || []);
+            renderChannels(s.channels  || []);
             renderHarm  (s.harmonizeList || []);
             renderLogs  (s.logs        || []);
             renderConfig(s.config);
