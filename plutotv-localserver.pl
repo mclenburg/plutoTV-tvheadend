@@ -30,6 +30,7 @@ use POSIX qw(mkfifo WNOHANG);
 use IO::Select;
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
+use File::Path qw(make_path);
 
 my $hostIp = "127.0.0.1";
 my $port = "9000";
@@ -69,6 +70,7 @@ my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json'
 my $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
 my $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
 my $tempFile;
+my $lastStateIoError = '';
 
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
 if (defined $tempFile && length $tempFile) {
@@ -97,8 +99,9 @@ sub parseChannelListArg {
     parseChannelListArg(getArgsValue("--harmonizechannels")),
 );
 
-for my $id (keys %{ loadHarmonizeOverrides() }) {
-    $hybrid_harmonize_channels{$id} = 1;
+my $startup_overrides = loadHarmonizeOverrides();
+for my $id (keys %{$startup_overrides}) {
+    $hybrid_harmonize_channels{$id} = 1 if $startup_overrides->{$id};
 }
 
 our %channel_timestamps = ();
@@ -111,9 +114,23 @@ my $sessionRefreshInterval = 25 * 60;
 my $sessionRetryCooldown = 30;
 
 
+sub setLastStateIoError {
+    my ($msg) = @_;
+    $lastStateIoError = defined $msg ? "$msg" : '';
+}
+
+sub getLastStateIoError {
+    return $lastStateIoError || '';
+}
+
 sub ensureRuntimeStateDir {
-    return if -d $runtimeStateDir;
-    mkdir $runtimeStateDir;
+    return 1 if -d $runtimeStateDir;
+    eval { make_path($runtimeStateDir) };
+    if ($@ || !-d $runtimeStateDir) {
+        setLastStateIoError('Konnte Runtime-Verzeichnis nicht anlegen: ' . $runtimeStateDir . ($! ? ' (' . $! . ')' : ''));
+        return 0;
+    }
+    return 1;
 }
 
 sub htmlEscape {
@@ -128,38 +145,79 @@ sub htmlEscape {
 
 sub loadJsonFile {
     my ($path, $default) = @_;
-    ensureRuntimeStateDir();
+    return $default unless ensureRuntimeStateDir();
     return $default unless -e $path;
-    open(my $fh, '<', $path) or return $default;
+    open(my $fh, '<', $path) or do {
+        setLastStateIoError('Konnte Datei nicht lesen: ' . $path . ' (' . $! . ')');
+        return $default;
+    };
     flock($fh, LOCK_SH);
     local $/;
     my $content = <$fh>;
     close($fh);
     return $default unless defined $content && length $content;
     my $parsed = eval { decode_json($content) };
+    if ($@) {
+        setLastStateIoError('Ungueltiges JSON in ' . $path . ': ' . $@);
+        return $default;
+    }
+    setLastStateIoError('');
     return defined $parsed ? $parsed : $default;
 }
 
 sub saveJsonFile {
     my ($path, $data) = @_;
-    ensureRuntimeStateDir();
+    return 0 unless ensureRuntimeStateDir();
     my $tmp = $path . '.tmp.' . $$;
-    open(my $fh, '>', $tmp) or return 0;
+    open(my $fh, '>', $tmp) or do {
+        setLastStateIoError('Konnte Temp-Datei nicht schreiben: ' . $tmp . ' (' . $! . ')');
+        return 0;
+    };
     flock($fh, LOCK_EX);
-    print $fh encode_json($data);
-    close($fh);
-    rename($tmp, $path) or return 0;
+    my $json = eval { encode_json($data) };
+    if ($@) {
+        close($fh);
+        unlink $tmp;
+        setLastStateIoError('Konnte JSON nicht serialisieren: ' . $@);
+        return 0;
+    }
+    print $fh $json or do {
+        my $err = $!;
+        close($fh);
+        unlink $tmp;
+        setLastStateIoError('Konnte Temp-Datei nicht schreiben: ' . $tmp . ' (' . $err . ')');
+        return 0;
+    };
+    close($fh) or do {
+        my $err = $!;
+        unlink $tmp;
+        setLastStateIoError('Konnte Temp-Datei nicht schliessen: ' . $tmp . ' (' . $err . ')');
+        return 0;
+    };
+    rename($tmp, $path) or do {
+        my $err = $!;
+        unlink $tmp;
+        setLastStateIoError('Konnte Datei nicht ersetzen: ' . $path . ' (' . $err . ')');
+        return 0;
+    };
+    setLastStateIoError('');
     return 1;
 }
 
 sub modifyJsonFile {
     my ($path, $default, $callback) = @_;
-    ensureRuntimeStateDir();
+    return $default unless ensureRuntimeStateDir();
     my $fh;
     if (-e $path) {
-        open($fh, '+<', $path) or return $default;
+        open($fh, '+<', $path) or do {
+            setLastStateIoError('Konnte Datei nicht zum Schreiben oeffnen: ' . $path . ' (' . $! . ')');
+            return $default;
+        };
     } else {
-        open($fh, '+>', $path) or return $default;
+        open($fh, '+>', $path) or do {
+            setLastStateIoError('Konnte Datei nicht anlegen: ' . $path . ' (' . $! . ')');
+            return $default;
+        };
     }
     flock($fh, LOCK_EX);
     local $/;
@@ -167,13 +225,30 @@ sub modifyJsonFile {
     my $data = $default;
     if (defined $content && length $content) {
         my $parsed = eval { decode_json($content) };
+        if ($@) {
+            close($fh);
+            setLastStateIoError('Ungueltiges JSON in ' . $path . ': ' . $@);
+            return $default;
+        }
         $data = defined $parsed ? $parsed : $default;
     }
     $data = $callback->($data);
+    my $json = eval { encode_json($data) };
+    if ($@) {
+        close($fh);
+        setLastStateIoError('Konnte JSON nicht serialisieren: ' . $@);
+        return $default;
+    }
     seek($fh, 0, 0);
     truncate($fh, 0);
-    print $fh encode_json($data);
+    print $fh $json or do {
+        my $err = $!;
+        close($fh);
+        setLastStateIoError('Konnte Datei nicht schreiben: ' . $path . ' (' . $err . ')');
+        return $default;
+    };
     close($fh);
+    setLastStateIoError('');
     return $data;
 }
 
@@ -3063,7 +3138,8 @@ sub handleAdminToggleHarmonize {
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
     my $saved = setHarmonizeOverride($channelId, $on);
     unless ($saved) {
-        sendJsonError($client, 'Harmonize-Status konnte nicht gespeichert werden');
+        my $detail = getLastStateIoError();
+        sendJsonError($client, 'Harmonize-Status konnte nicht gespeichert werden' . (length $detail ? ': ' . $detail : ''));
         return;
     }
 
