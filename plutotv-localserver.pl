@@ -231,13 +231,25 @@ sub unregisterActiveStream {
     saveActiveStreams($streams);
 }
 
+# Reliable cross-platform process liveness check.
+# kill(0,$pid) is unreliable for double-forked orphan processes on Linux
+# when SIG{CHLD}='IGNORE': the process is alive but kill(0) returns 0
+# from sibling processes in some RPi/systemd configurations.
+# /proc/$pid is authoritative and permission-independent on Linux.
+sub pidIsAlive {
+    my ($pid) = @_;
+    return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    return (-d "/proc/$pid") ? 1 : 0 if -d '/proc';
+    return kill(0, $pid) ? 1 : 0;  # non-Linux fallback
+}
+
 sub cleanupStaleActiveStreams {
     my $streams = loadActiveStreams();
     my $changed = 0;
     for my $key (keys %$streams) {
         my $entry = $streams->{$key};
         my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
-        if (!$pid || !kill(0, $pid)) {
+        if (!$pid || !pidIsAlive($pid)) {
             delete $streams->{$key};
             $changed = 1;
         }
@@ -246,19 +258,13 @@ sub cleanupStaleActiveStreams {
     return $streams;
 }
 
-
 sub readActiveStreamsForDisplay {
-    # Read-only: filters dead PIDs but NEVER writes back.
-    # The SSE loop calls this every second; writing would overwrite entries
-    # that stream processes registered between our read and the next write.
-    my $streams = loadActiveStreams();
-    my %live;
-    for my $key (keys %$streams) {
-        my $entry = $streams->{$key};
-        my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
-        $live{$key} = $entry if $pid && kill(0, $pid);
-    }
-    return \%live;
+    # Read-only: show all registered entries, NEVER write back.
+    # No liveness filter here: stale entries are removed by
+    # unregisterActiveStream (on stream exit) and cleanupStaleActiveStreams
+    # (on admin page load). Filtering here with kill(0,$pid) was the
+    # root cause - it silently dropped live orphan processes.
+    return loadActiveStreams();
 }
 
 sub loadRuntimeConfig {
@@ -2789,6 +2795,21 @@ sub handleAdminForceDiscontinuity {
     sendJsonOk($client, msg => 'DISCONTINUITY vorgemerkt');
 }
 
+
+sub handleAdminRestartStream {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $key = ($params && $params->{key}) ? $params->{key} : '';
+    unless ($key) { sendJsonError($client, 'Fehlender key'); return; }
+    my $streams = loadActiveStreams();
+    my $entry   = $streams->{$key};
+    unless (ref($entry) eq 'HASH' && $entry->{pid}) {
+        sendJsonError($client, 'Stream nicht gefunden'); return;
+    }
+    kill('TERM', $entry->{pid});
+    appendRecentLog('Neustart: ' . ($entry->{channelId} || $key));
+    sendJsonOk($client);
+}
 
 sub processRequest {
     my ($client) = @_;
