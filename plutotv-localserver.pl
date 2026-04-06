@@ -23,13 +23,16 @@ use Try::Tiny;
 use Getopt::Long qw(:config no_ignore_case);
 use Crypt::CBC;
 use IPC::Run qw(run);
-use IPC::Open3 qw(open3);
-use Symbol qw(gensym);
 use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
-use File::Temp qw(tempdir);
+use File::Temp qw(tempdir tmpnam);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use File::Spec;
 use POSIX qw(mkfifo WNOHANG);
 use IO::Select;
+use IPC::Open3;
+use Symbol qw(gensym);
 use JSON::PP qw(encode_json decode_json);
 use Fcntl qw(:flock);
 
@@ -64,24 +67,52 @@ my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $debug = 0;
 my %hybrid_harmonize_channels = ();
 
-my $runtimeStateDir = '/tmp/plutotv-localserver';
-my $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
-my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
-my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
-my $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
-my $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
+my $runtimeStateDir;
+my $harmonizeStateFile;
+my $activeStreamsStateFile;
+my $forceDiscontinuityStateFile;
+my $recentLogStateFile;
+my $runtimeConfigStateFile;
 my $tempFile;
+my $preserveFirstHarmonizeInput = 1;
+my $preservedHarmonizeInputPath = '';
+
+sub detectWritableTempBaseDir {
+    for my $candidate (grep { defined $_ && length $_ } ($ENV{TMPDIR}, '/tmp', File::Spec->tmpdir())) {
+        next unless -d $candidate;
+        next unless -w $candidate;
+        return $candidate;
+    }
+    return File::Spec->tmpdir();
+}
+
+sub resolveRuntimeStateDir {
+    my ($tempArg) = @_;
+    my $baseDir;
+
+    if (defined $tempArg && length $tempArg) {
+        if (-d $tempArg) {
+            $baseDir = $tempArg;
+        } else {
+            $baseDir = dirname($tempArg);
+        }
+    }
+
+    $baseDir ||= detectWritableTempBaseDir();
+    return File::Spec->catdir($baseDir, 'plutotv-localserver');
+}
+
+sub refreshRuntimeStatePaths {
+    $harmonizeStateFile          = File::Spec->catfile($runtimeStateDir, 'harmonize_channels.json');
+    $activeStreamsStateFile      = File::Spec->catfile($runtimeStateDir, 'active_streams.json');
+    $forceDiscontinuityStateFile = File::Spec->catfile($runtimeStateDir, 'force_discontinuity.json');
+    $recentLogStateFile          = File::Spec->catfile($runtimeStateDir, 'recent_logs.json');
+    $runtimeConfigStateFile      = File::Spec->catfile($runtimeStateDir, 'runtime_config.json');
+}
 
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
-if (defined $tempFile && length $tempFile) {
-    require File::Basename;
-    $runtimeStateDir = File::Basename::dirname($tempFile);
-    $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
-    $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
-    $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
-    $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
-    $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
-}
+$runtimeStateDir = resolveRuntimeStateDir($tempFile);
+refreshRuntimeStatePaths();
 
 sub parseChannelListArg {
     my ($value) = @_;
@@ -114,8 +145,10 @@ my $sessionRetryCooldown = 30;
 
 
 sub ensureRuntimeStateDir {
-    return if -d $runtimeStateDir;
-    mkdir $runtimeStateDir;
+    return 1 if -d $runtimeStateDir;
+    eval { make_path($runtimeStateDir) };
+    return 0 if $@ || !-d $runtimeStateDir || !-w $runtimeStateDir;
+    return 1;
 }
 
 sub htmlEscape {
@@ -130,7 +163,7 @@ sub htmlEscape {
 
 sub loadJsonFile {
     my ($path, $default) = @_;
-    ensureRuntimeStateDir();
+    ensureRuntimeStateDir() or return $default;
     return $default unless -e $path;
     open(my $fh, '<', $path) or return $default;
     flock($fh, LOCK_SH);
@@ -144,7 +177,7 @@ sub loadJsonFile {
 
 sub saveJsonFile {
     my ($path, $data) = @_;
-    ensureRuntimeStateDir();
+    ensureRuntimeStateDir() or return 0;
     my $tmp = $path . '.tmp.' . $$;
     open(my $fh, '>', $tmp) or return 0;
     flock($fh, LOCK_EX);
@@ -472,9 +505,10 @@ sub buildAdminSnapshot {
         channels => $channels,
         logs     => \@recent,
         config   => {
-            stall_timeout => int(getConfigValue('stall_timeout', 15)),
-            max_failures  => int(getConfigValue('max_failures',  5)),
-            log_depth     => int(getConfigValue('log_depth',     10)),
+            stall_timeout   => int(getConfigValue('stall_timeout', 15)),
+            startup_timeout => int(getConfigValue('startup_timeout', 45)),
+            max_failures    => int(getConfigValue('max_failures',  5)),
+            log_depth       => int(getConfigValue('log_depth',     10)),
         },
     };
 }
@@ -1717,25 +1751,39 @@ sub collectPlaylistWindows {
     my @current;
     my $windowIndex = 0;
 
+    my $pushWindow = sub {
+        my ($segmentsRef, $startsAfterDiscontinuity) = @_;
+        return unless $segmentsRef && ref($segmentsRef) eq 'ARRAY' && @$segmentsRef;
+        my $startSeq = $segmentsRef->[0]->{sequence};
+        my $endSeq   = $segmentsRef->[-1]->{sequence};
+        my $startUrl = $segmentsRef->[0]->{url} || '';
+        my $endUrl   = $segmentsRef->[-1]->{url} || '';
+        my $signature = join('|',
+            defined $startSeq ? $startSeq : '',
+            defined $endSeq   ? $endSeq   : '',
+            $startUrl,
+            $endUrl,
+            scalar(@$segmentsRef),
+        );
+        push @windows, {
+            id => $windowIndex++,
+            signature => $signature,
+            startSequence => $startSeq,
+            endSequence => $endSeq,
+            segments => [ @$segmentsRef ],
+            startsAfterDiscontinuity => $startsAfterDiscontinuity ? 1 : 0,
+        };
+    };
+
     for my $segment (@segments) {
         if ($segment->{isDiscontinuity} && @current) {
-            push @windows, {
-                id => $windowIndex++,
-                segments => [ @current ],
-                startsAfterDiscontinuity => ($windowIndex > 0 ? 1 : 0),
-            };
+            $pushWindow->(\@current, ($windowIndex > 0 ? 1 : 0));
             @current = ();
         }
         push @current, $segment;
     }
 
-    if (@current) {
-        push @windows, {
-            id => $windowIndex++,
-            segments => [ @current ],
-            startsAfterDiscontinuity => ($windowIndex > 0 && @windows ? 1 : 0),
-        };
-    }
+    $pushWindow->(\@current, ($windowIndex > 0 && @windows ? 1 : 0)) if @current;
 
     return \@windows;
 }
@@ -1786,60 +1834,34 @@ sub buildLocalWindowPlaylistFile {
     }
 
     print {$fh} "#EXT-X-ENDLIST\n";
-    close($fh);
-    return 1;
+    $fh->flush if $fh->can('flush');
+    close($fh) or return 0;
+    return (-s $path) ? 1 : 0;
 }
 
 sub findMatchingWindow {
-    my ($windows, $processedWindowIds) = @_;
+    my ($windows, $processedWindowSignatures) = @_;
     return undef unless $windows && ref($windows) eq 'ARRAY';
     for my $window (@$windows) {
         next unless $window && ref($window) eq 'HASH';
         next unless ref($window->{segments}) eq 'ARRAY' && @{ $window->{segments} };
-        next if $processedWindowIds->{$window->{id}};
+        my $signature = $window->{signature} || '';
+        next if length($signature) && $processedWindowSignatures->{$signature};
         return $window;
     }
     return undef;
 }
 
-sub streamReencodedWindow {
+sub buildReencodeFfmpegCommand {
     my (%args) = @_;
-    my $client          = $args{client}          or return 0;
-    my $channelId       = $args{channelId}       || 'unknown';
-    my $channelName     = $args{channelName}     || $channelId;
-    my $window          = $args{window}          or return 0;
-    my $headersSentRef  = $args{headersSentRef};
-    my $request         = $args{request};
+    my $encoder       = $args{encoder}       || 'libx264';
+    my $videoPlaylist = $args{videoPlaylist} or return;
+    my $audioPlaylist = $args{audioPlaylist};
+    my $channelName   = $args{channelName}   || 'PlutoTV';
+    my $hasAudio      = $args{hasAudio} ? 1 : 0;
 
-    my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-    my $videoPlaylist = "$tmpdir/video.m3u8";
-    my $audioPlaylist = "$tmpdir/audio.m3u8";
-
-    buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
-    my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
-    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasAudio;
-
-    appendRecentLog('DEBUG Harmonize lokale Video-Playlist fertig geschrieben: ' . $videoPlaylist);
-    print STDERR '[' . formatEpochLocal(time()) . "] DEBUG Harmonize lokale Video-Playlist fertig geschrieben: $videoPlaylist\n";
-    if ($hasAudio) {
-        appendRecentLog('DEBUG Harmonize lokale Audio-Playlist fertig geschrieben: ' . $audioPlaylist);
-        print STDERR '[' . formatEpochLocal(time()) . "] DEBUG Harmonize lokale Audio-Playlist fertig geschrieben: $audioPlaylist\n";
-    }
-
-    if (!$headersSentRef || !$$headersSentRef) {
-        eval {
-            $client->write("HTTP/1.1 200 OK\n");
-            $client->write("Content-Type: video/mp2t\n");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-            $client->write("Connection: close\n\n");
-        };
-        return 0 if $@;
-        $$headersSentRef = 1 if $headersSentRef;
-    }
-
-    my $encoder = selectH264Encoder();
     my @cmd = (
-        $ffmpeg, '-hide_banner', '-loglevel', 'info', '-nostdin',
+        $ffmpeg, '-loglevel', 'error', '-nostdin',
         '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
         '-fflags', '+genpts+discardcorrupt',
         '-i', $videoPlaylist,
@@ -1856,160 +1878,245 @@ sub streamReencodedWindow {
     }
 
     push @cmd,
-        '-vf', 'scale=1280:720,format=nv12',
+        '-vf', 'scale=1280:720',
+        '-pix_fmt', 'yuv420p',
         '-c:v', $encoder,
-        ($encoder eq 'h264_v4l2m2m' ? ('-num_capture_buffers', '16', '-num_output_buffers', '16') : ()),
         ($encoder eq 'libx264' ? ('-preset', 'veryfast', '-tune', 'zerolatency') : ()),
-        '-b:v', '3M',
-        '-g', '50',
         '-c:a', 'aac',
+        '-ar', '48000',
+        '-b:a', '160k',
+        '-ac', '2',
+        '-muxdelay', '0',
+        '-muxpreload', '0',
+        '-mpegts_flags', '+resend_headers',
+        '-avoid_negative_ts', 'make_zero',
+        '-flush_packets', '1',
+        '-metadata', 'service_provider=PlutoTV',
+        '-metadata', 'service_name=' . $channelName,
         '-f', 'mpegts', 'pipe:1';
 
-    my $cmd_str = join(' ', map {
-        my $v = defined $_ ? $_ : '';
-        $v =~ s/'/'\\''/g;
-        "'$v'";
-    } @cmd);
-    appendRecentLog("DEBUG Harmonize ffmpeg cmd [$encoder]: $cmd_str");
-    print STDERR '[' . formatEpochLocal(time()) . "] DEBUG Harmonize ffmpeg cmd [$encoder]: $cmd_str\n";
+    return @cmd;
+}
 
-    my $stderr_fh = gensym();
-    my $stdout_fh;
-    my $ffpid = eval { open3(undef, $stdout_fh, $stderr_fh, @cmd) };
-    if (!$ffpid) {
-        my $msg = $@ || $! || 'open3 failed';
-        appendRecentLog("DEBUG Harmonize ffmpeg start failed [$encoder]: $msg");
-        print STDERR '[' . formatEpochLocal(time()) . "] DEBUG Harmonize ffmpeg start failed [$encoder]: $msg\n";
-        return 0;
+sub shellQuote {
+    my ($value) = @_;
+    $value = '' unless defined $value;
+    $value =~ s/'/'\\''/g;
+    return "'" . $value . "'";
+}
+
+sub streamReencodedWindow {
+    my (%args) = @_;
+    my $client          = $args{client}          or return 0;
+    my $channelId       = $args{channelId}       || 'unknown';
+    my $channelName     = $args{channelName}     || $channelId;
+    my $window          = $args{window}          or return 0;
+    my $headersSentRef  = $args{headersSentRef};
+    my $request         = $args{request};
+
+    my $tmpdir;
+    if ($preserveFirstHarmonizeInput && !$preservedHarmonizeInputPath) {
+        $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 0);
+    } else {
+        $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    }
+    my $videoPlaylist = "$tmpdir/video.m3u8";
+    my $audioPlaylist = "$tmpdir/audio.m3u8";
+
+    buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
+    my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
+    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) or return 0 if $hasAudio;
+
+    appendRecentLog('DEBUG Lokale Video-Playlist fertig fuer ' . $channelId . ': ' . $videoPlaylist . ' bytes=' . ((-s $videoPlaylist) || 0));
+    print STDERR "[HARMONIZE][$channelId] video playlist ready: $videoPlaylist (" . ((-s $videoPlaylist) || 0) . " bytes)
+";
+    if ($hasAudio) {
+        appendRecentLog('DEBUG Lokale Audio-Playlist fertig fuer ' . $channelId . ': ' . $audioPlaylist . ' bytes=' . ((-s $audioPlaylist) || 0));
+        print STDERR "[HARMONIZE][$channelId] audio playlist ready: $audioPlaylist (" . ((-s $audioPlaylist) || 0) . " bytes)
+";
+    }
+    if ($preserveFirstHarmonizeInput && !$preservedHarmonizeInputPath) {
+        $preservedHarmonizeInputPath = $videoPlaylist;
+        appendRecentLog('Erste Harmonize-FFmpeg-Playlist bleibt erhalten fuer manuellen Test: ' . $videoPlaylist);
+        print STDERR "[HARMONIZE][$channelId] preserved first ffmpeg playlist: $videoPlaylist
+";
     }
 
-    binmode($stdout_fh);
-    binmode($stderr_fh);
+    if (!$headersSentRef || !$$headersSentRef) {
+        eval {
+            $client->write("HTTP/1.1 200 OK
+");
+            $client->write("Content-Type: video/mp2t
+");
+            $client->write("Cache-Control: no-cache, no-store, must-revalidate
+");
+            $client->write("Connection: close
 
-    my $sel = IO::Select->new($stdout_fh, $stderr_fh);
-    my $client_alive = 1;
-    my $stdout_open = 1;
-    my $stderr_open = 1;
-    my $buffer = '';
-    my $last_output_at = time();
-    my $startup_at = time();
-    my $startup_timeout = int(getConfigValue('startup_timeout', 30));
-    my $stall_timeout = int(getConfigValue('stall_timeout', 15));
-    my $firstChunk = 1;
-    my $chunk_count = 0;
-    my $bytes_read = 0;
-    my $bytes_written = 0;
-    my $stderr_announced = 0;
-
-    while ($stdout_open || $stderr_open) {
-        my $desired = desiredModeByOverride($channelId, $request);
-        if ($desired ne 'harmonize') {
-            kill 'TERM', $ffpid;
-            close($stdout_fh) if $stdout_open;
-            close($stderr_fh) if $stderr_open;
-            return 'switch';
-        }
-
-        my @ready = $sel->can_read(0.5);
-        if (!@ready) {
-            if ($chunk_count == 0 && (time() - $startup_at) >= $startup_timeout) {
-                my $msg = "DEBUG Harmonize Starttimeout fuer $channelId [$encoder] ohne Output nach ${startup_timeout}s";
-                appendRecentLog($msg);
-                print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                kill 'TERM', $ffpid;
-                last;
-            }
-            if ($chunk_count > 0 && (time() - $last_output_at) >= $stall_timeout) {
-                my $msg = "DEBUG Harmonize Stall fuer $channelId [$encoder] ohne Output nach ${stall_timeout}s";
-                appendRecentLog($msg);
-                print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                kill 'TERM', $ffpid;
-                last;
-            }
-            next;
-        }
-
-        for my $fh (@ready) {
-            my $n = sysread($fh, $buffer, 8192);
-            if (!defined $n) {
-                my $msg = "DEBUG Harmonize read error fuer $channelId [$encoder]: $!";
-                appendRecentLog($msg);
-                print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                next;
-            }
-            if ($n == 0) {
-                if ($fh == $stdout_fh) {
-                    $stdout_open = 0;
-                    $sel->remove($stdout_fh);
-                    my $msg = "DEBUG Harmonize EOF von ffmpeg-stdout fuer $channelId nach $chunk_count Chunks und $bytes_read Bytes [$encoder]";
-                    appendRecentLog($msg);
-                    print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                } else {
-                    $stderr_open = 0;
-                    $sel->remove($stderr_fh);
-                    my $msg = "DEBUG Harmonize EOF von ffmpeg-stderr fuer $channelId [$encoder]";
-                    appendRecentLog($msg);
-                    print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                }
-                next;
-            }
-
-            if ($fh == $stderr_fh) {
-                my $txt = $buffer;
-                $txt =~ s/[\r\n]+$//;
-                if (length $txt) {
-                    if (!$stderr_announced) {
-                        my $short = substr($txt, 0, 600);
-                        appendRecentLog("DEBUG Harmonize erster ffmpeg-stderr fuer $channelId [$encoder]: $short");
-                        $stderr_announced = 1;
-                    }
-                    for my $line (split /\r?\n/, $txt) {
-                        next unless length $line;
-                        print STDERR "[FFMPEG][$channelId][$encoder] $line\n";
-                    }
-                }
-                next;
-            }
-
-            $bytes_read += $n;
-            $chunk_count++;
-            $last_output_at = time();
-            if ($chunk_count == 1) {
-                my $msg = "DEBUG Harmonize erster ffmpeg-Chunk fuer $channelId: $n Bytes [$encoder]";
-                appendRecentLog($msg);
-                print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-            }
-            my $out = correctMpegTsTimestamps($buffer, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
-            $firstChunk = 0;
-            my $ok = eval { $client->write($out); $client->flush(); 1 };
-            if ($ok) {
-                $bytes_written += length($out);
-                if ($chunk_count == 1) {
-                    my $msg = "DEBUG Harmonize erster Client-Write fuer $channelId: " . length($out) . " Bytes [$encoder]";
-                    appendRecentLog($msg);
-                    print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                }
-            } else {
-                my $msg = "DEBUG Harmonize Client-Write fehlgeschlagen fuer $channelId [$encoder]: $@";
-                appendRecentLog($msg);
-                print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
-                $client_alive = 0;
-                kill 'TERM', $ffpid;
-                $stdout_open = 0;
-                $stderr_open = 0;
-                last;
-            }
-        }
+");
+        };
+        return 0 if $@;
+        $$headersSentRef = 1 if $headersSentRef;
     }
 
-    waitpid($ffpid, 0);
-    my $exit = $? >> 8;
-    my $signal = $? & 127;
-    my $msg = "DEBUG Harmonize ffmpeg beendet fuer $channelId [$encoder] exit=$exit signal=$signal read=$bytes_read written=$bytes_written";
-    appendRecentLog($msg);
-    print STDERR '[' . formatEpochLocal(time()) . "] $msg\n";
+    my @encoders = (selectH264Encoder());
+    push @encoders, 'libx264' if $encoders[0] ne 'libx264';
 
-    return $client_alive && $bytes_read > 0 ? 1 : 0;
+    ENCODER:
+    for my $encoder (@encoders) {
+        my @cmd = buildReencodeFfmpegCommand(
+            encoder       => $encoder,
+            videoPlaylist => $videoPlaylist,
+            audioPlaylist => $audioPlaylist,
+            hasAudio      => $hasAudio,
+            channelName   => $channelName,
+        );
+        my $cmdline = join(' ', map { shellQuote($_) } @cmd);
+        appendRecentLog('DEBUG Harmonize ffmpeg cmd [' . $encoder . '] ' . $cmdline);
+        print STDERR "[FFMPEG][$channelId][$encoder] CMD $cmdline
+";
+
+        my $err = gensym();
+        my $ffpid = eval { open3(undef, my $ffh, $err, @cmd) };
+        if (!$ffpid) {
+            appendRecentLog('ffmpeg-Start fehlgeschlagen [' . $encoder . ']: ' . $channelId . ' | ' . ($@ || $!));
+            print STDERR "[FFMPEG][$channelId][$encoder] start failed: " . ($@ || $!) . "
+";
+            next ENCODER;
+        }
+        binmode($ffh);
+        binmode($err);
+
+        my $client_alive = 1;
+        my $stdout_open = 1;
+        my $stderr_open = 1;
+        my $buffer = '';
+        my $sel = IO::Select->new($ffh, $err);
+        my $started_at = time();
+        my $last_output_at = $started_at;
+        my $stall_timeout = int(getConfigValue('stall_timeout', 15));
+        my $startup_timeout = int(getConfigValue('startup_timeout', 45));
+        $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
+        my $firstChunk = 1;
+        my $has_output = 0;
+        my $aborted_for_timeout = 0;
+        my $stdout_chunks = 0;
+        my $stdout_bytes = 0;
+
+        while (1) {
+            my $desired = desiredModeByOverride($channelId, $request);
+            if ($desired ne 'harmonize') {
+                kill 'TERM', $ffpid;
+                close($ffh) if $stdout_open;
+                close($err) if $stderr_open;
+                return 'switch';
+            }
+
+            my @ready = $sel->can_read(0.5);
+            for my $fh (@ready) {
+                my $read = sysread($fh, my $chunk, 8192);
+                if (!defined $read) {
+                    next;
+                }
+                if ($read == 0) {
+                    $sel->remove($fh);
+                    if ($fh == $ffh) {
+                        $stdout_open = 0;
+                        appendRecentLog('DEBUG Harmonize EOF von ffmpeg-stdout fuer ' . $channelId . ' nach ' . $stdout_chunks . ' Chunks und ' . $stdout_bytes . ' Bytes');
+                        print STDERR "[FFMPEG][$channelId][$encoder] EOF stdout after $stdout_chunks chunks / $stdout_bytes bytes
+";
+                        close($ffh);
+                    } else {
+                        $stderr_open = 0;
+                        appendRecentLog('DEBUG Harmonize EOF von ffmpeg-stderr fuer ' . $channelId);
+                        print STDERR "[FFMPEG][$channelId][$encoder] EOF stderr
+";
+                        close($err);
+                    }
+                    next;
+                }
+
+                if ($fh == $err) {
+                    my @lines = split /
+?
+/, $chunk, -1;
+                    for my $line (@lines) {
+                        next unless defined $line && length $line;
+                        print STDERR "[FFMPEG][$channelId][$encoder] $line
+";
+                    }
+                    next;
+                }
+
+                $last_output_at = time();
+                $has_output = 1;
+                $stdout_chunks++;
+                $stdout_bytes += $read;
+                if ($stdout_chunks == 1) {
+                    appendRecentLog('DEBUG Harmonize erster ffmpeg-Chunk fuer ' . $channelId . ': ' . $read . ' Bytes [' . $encoder . ']');
+                }
+                $chunk = correctMpegTsTimestamps($chunk, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
+                $firstChunk = 0;
+                my $ok = eval { $client->write($chunk); $client->flush(); 1 };
+                unless ($ok) {
+                    $client_alive = 0;
+                    print STDERR "[HARMONIZE][$channelId][$encoder] client write failed: $@
+";
+                    last;
+                }
+                if ($stdout_chunks == 1) {
+                    appendRecentLog('DEBUG Harmonize erster Client-Write fuer ' . $channelId . ': ' . length($chunk) . ' Bytes [' . $encoder . ']');
+                }
+            }
+            last unless $client_alive;
+
+            my $child_done = waitpid($ffpid, WNOHANG);
+            if (defined $child_done && $child_done == $ffpid && !$stdout_open && !$stderr_open) {
+                last;
+            }
+
+            if (!$has_output) {
+                if (time() - $started_at >= $startup_timeout) {
+                    appendRecentLog('ffmpeg-Fenster-Starttimeout [' . $encoder . '], Neustart: ' . $channelId);
+                    print STDERR "[HARMONIZE][$channelId][$encoder] startup timeout after ${startup_timeout}s without output
+";
+                    $aborted_for_timeout = 1;
+                    kill 'TERM', $ffpid;
+                    last;
+                }
+                next;
+            }
+
+            if (time() - $last_output_at >= $stall_timeout) {
+                appendRecentLog('ffmpeg-Fenster-Stall [' . $encoder . '], Neustart: ' . $channelId);
+                print STDERR "[HARMONIZE][$channelId][$encoder] stall timeout after ${stall_timeout}s
+";
+                $aborted_for_timeout = 1;
+                kill 'TERM', $ffpid;
+                last;
+            }
+        }
+
+        waitpid($ffpid, 0);
+        my $exit = $? >> 8;
+        my $signal = $? & 127;
+        appendRecentLog('DEBUG Harmonize ffmpeg beendet fuer ' . $channelId . ' [' . $encoder . '] exit=' . $exit . ' signal=' . $signal . ' read=' . $stdout_bytes . ' written=' . $stdout_bytes);
+        print STDERR "[FFMPEG][$channelId][$encoder] exit=$exit signal=$signal read=$stdout_bytes bytes
+";
+
+        if ($client_alive && $has_output) {
+            return 1;
+        }
+
+        if (!$has_output && $encoder ne 'libx264') {
+            appendRecentLog('ffmpeg ohne Output [' . $encoder . '], Fallback auf libx264: ' . $channelId);
+            next ENCODER;
+        }
+
+        return 0 if $aborted_for_timeout;
+        return ($client_alive && $has_output) ? 1 : 0;
+    }
+
+    return 0;
 }
 
 sub streamHlsViaFfmpeg {
@@ -2048,6 +2155,7 @@ sub streamHlsViaFfmpeg {
         unless ($videoWindow) {
             $idleLoops++;
             if ($idleLoops % 5 == 0) {
+                appendRecentLog('Keine neues Harmonize-Fenster verfuegbar: ' . $channelId);
                 my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
                 $videoUrl = $freshVideo if $freshVideo;
                 $audioUrl = $freshAudio if $freshAudio;
@@ -2083,8 +2191,8 @@ sub streamHlsViaFfmpeg {
             next;
         }
 
-        $processedVideoWindows{$videoWindow->{id}} = 1;
-        $processedAudioWindows{$audioWindow->{id}} = 1 if $audioWindow;
+        $processedVideoWindows{$videoWindow->{signature} || $videoWindow->{id}} = 1;
+        $processedAudioWindows{$audioWindow->{signature} || $audioWindow->{id}} = 1 if $audioWindow;
         $failures = 0;
     }
 
@@ -2928,6 +3036,7 @@ sub sendAdminPage {
         window.saveConfig = function(){
             api('/admin/set_config', {
                 stall_timeout: document.getElementById('cfgStall').value,
+                startup_timeout: document.getElementById('cfgStartup').value,
                 max_failures: document.getElementById('cfgFail').value,
                 log_depth: document.getElementById('cfgLogDepth').value
             }).catch(()=>{});
@@ -2952,10 +3061,43 @@ sub sendAdminPage {
                     '<td><code>' + esc(ch.channelId) + '</code></td>' +
                     '<td><span class="badge ' + srcClass + '">' + esc(ch.source) + '</span></td>' +
                     '<td><span class="badge ' + (ch.effectiveHarmonize ? 'badge-on' : 'badge-off') + '">' + (ch.effectiveHarmonize ? 'harmonize' : 'copy') + '</span></td>' +
-                    '<td><label class="switch"><input type="checkbox" ' + (ch.effectiveHarmonize ? 'checked' : '') + ' onchange="setHarmonize(' + JSON.stringify(ch.channelId) + ', this.checked)"><span class="slider"></span></label><div class="muted">' + esc(persistent) + '</div></td>' +
+                    '<td><label class="switch"><input type="checkbox" class="harmonize-toggle" data-channel-id="' + esc(ch.channelId) + '" ' + (ch.effectiveHarmonize ? 'checked' : '') + '><span class="slider"></span></label><div class="muted">' + esc(persistent) + '</div></td>' +
                     '</tr>';
             }).join('');
         }
+
+        document.getElementById('channelsTbody').addEventListener('change', function(ev){
+            const target = ev.target;
+            if (!target || !target.classList || !target.classList.contains('harmonize-toggle')) return;
+            const channelId = target.getAttribute('data-channel-id') || '';
+            const checked = !!target.checked;
+            if (!channelId) {
+                toast('Fehlende channelId', true);
+                return;
+            }
+            target.disabled = true;
+            api('/admin/toggle_harmonize', { channelId: channelId, enabled: checked ? 1 : 0, region: region })
+                .then(function(data){
+                    if (Array.isArray(current.channels)) {
+                        current.channels = current.channels.map(function(ch){
+                            if (ch.channelId === channelId) {
+                                if (data && data.channel) return data.channel;
+                                ch.persistedHarmonize = checked;
+                                ch.effectiveHarmonize = checked;
+                                ch.source = 'persisted';
+                            }
+                            return ch;
+                        });
+                        renderChannels();
+                    }
+                })
+                .catch(function(){
+                    target.checked = !checked;
+                })
+                .finally(function(){
+                    target.disabled = false;
+                });
+        });
         function renderStreams(){
             const tbody = document.getElementById('streamsTbody');
             const rows = current.streams || [];
@@ -2975,6 +3117,7 @@ sub sendAdminPage {
         function renderConfig(){
             const cfg = current.config || {};
             document.getElementById('cfgStall').value = cfg.stall_timeout || 15;
+            document.getElementById('cfgStartup').value = cfg.startup_timeout || 45;
             document.getElementById('cfgFail').value = cfg.max_failures || 5;
             document.getElementById('cfgLogDepth').value = cfg.log_depth || 10;
         }
@@ -3029,11 +3172,39 @@ sub handleAdminToggleHarmonize {
     my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
     my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
     my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
+    my $region    = ($params && $params->{region} && exists $regions{$params->{region}}) ? $params->{region} : 'DE';
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
+
+    unless (ensureRuntimeStateDir()) {
+        appendRecentLog('Runtime-State-Verzeichnis nicht beschreibbar: ' . ($runtimeStateDir || 'unbekannt'));
+        sendJsonError($client, 'Temp-Verzeichnis nicht beschreibbar', runtimeStateDir => $runtimeStateDir);
+        return;
+    }
+
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
-    setHarmonizeOverride($channelId, $on);
+    my $saved = setHarmonizeOverride($channelId, $on);
+    unless ($saved) {
+        appendRecentLog('Persistentes Harmonize konnte nicht gespeichert werden: ' . $channelId);
+        sendJsonError($client, 'Persistenz fehlgeschlagen', channelId => $channelId);
+        return;
+    }
+
+    my $persisted = getPersistedHarmonizeOverride($channelId);
+    unless (defined $persisted && $persisted == $on) {
+        appendRecentLog('Persistentes Harmonize verifiziert abweichend: ' . $channelId);
+        sendJsonError($client, 'Persistenz konnte nicht verifiziert werden', channelId => $channelId);
+        return;
+    }
+
     appendRecentLog(($on ? 'Persistentes Harmonize an: ' : 'Persistentes Harmonize aus: ') . $channelId);
-    sendJsonOk($client, msg => ($on ? 'Persistentes Harmonize aktiviert' : 'Persistentes Harmonize deaktiviert'));
+
+    my ($channelEntry) = grep { ($_->{channelId} || '') eq $channelId } @{ buildChannelAdminEntries($region) || [] };
+    sendJsonOk(
+        $client,
+        msg       => ($on ? 'Persistentes Harmonize aktiviert' : 'Persistentes Harmonize deaktiviert'),
+        channelId => $channelId,
+        channel   => $channelEntry,
+    );
 }
 
 sub handleAdminForceDiscontinuity {
