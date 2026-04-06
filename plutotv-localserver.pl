@@ -62,7 +62,7 @@ my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $debug = 0;
 my %hybrid_harmonize_channels = ();
 
-my $runtimeStateDir = '/tmp/plutotv-localserver';
+my $runtimeStateDir = (-d '/dev/shm' ? '/dev/shm/plutotv-localserver' : '/tmp/plutotv-localserver');
 my $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
 my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
 my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
@@ -212,36 +212,67 @@ sub saveActiveStreams {
     return saveJsonFile($activeStreamsStateFile, $hashref);
 }
 
+sub withActiveStreamsLocked {
+    my ($callback) = @_;
+    ensureRuntimeStateDir();
+    open(my $fh, '+>>', $activeStreamsStateFile) or return;
+    flock($fh, LOCK_EX) or do { close($fh); return; };
+    seek($fh, 0, 0);
+    local $/;
+    my $content = <$fh>;
+    my $streams = {};
+    if (defined $content && length $content) {
+        my $parsed = eval { decode_json($content) };
+        $streams = $parsed if ref($parsed) eq 'HASH';
+    }
+    my @result = $callback->($streams);
+    seek($fh, 0, 0);
+    truncate($fh, 0);
+    print $fh encode_json($streams);
+    close($fh);
+    return wantarray ? @result : $result[0];
+}
+
 sub registerActiveStream {
     my (%info) = @_;
-    my $streams = loadActiveStreams();
-    my $key = $$ . '-' . int(time() * 1000) . '-' . int(rand(100000));
+    my $startedAt = $info{startedAt} || time();
+    my $key = (defined $info{channelId} && length $info{channelId} ? $info{channelId} : 'stream')
+        . '_' . (defined $info{pid} ? $info{pid} : $$)
+        . '_' . int($startedAt * 1000)
+        . '_' . int(rand(100000));
     $info{pid} = defined $info{pid} ? $info{pid} : $$;
-    $info{startedAt} ||= time();
+    $info{startedAt} ||= $startedAt;
     $info{lastSeenAt} ||= $info{startedAt};
-    $streams->{$key} = \%info;
-    saveActiveStreams($streams);
+    withActiveStreamsLocked(sub {
+        my ($streams) = @_;
+        $streams->{$key} = { %info };
+        return $key;
+    });
     return $key;
 }
 
 sub unregisterActiveStream {
     my ($key) = @_;
     return unless defined $key && length $key;
-    my $streams = loadActiveStreams();
-    delete $streams->{$key};
-    saveActiveStreams($streams);
+    withActiveStreamsLocked(sub {
+        my ($streams) = @_;
+        delete $streams->{$key};
+        return 1;
+    });
 }
 
 sub touchActiveStream {
     my ($key, %changes) = @_;
     return unless defined $key && length $key;
-    my $streams = loadActiveStreams();
-    return unless ref($streams->{$key}) eq 'HASH';
-    $streams->{$key}->{lastSeenAt} = time();
-    for my $k (keys %changes) {
-        $streams->{$key}->{$k} = $changes{$k};
-    }
-    saveActiveStreams($streams);
+    withActiveStreamsLocked(sub {
+        my ($streams) = @_;
+        return unless ref($streams->{$key}) eq 'HASH';
+        $streams->{$key}->{lastSeenAt} = time();
+        for my $k (keys %changes) {
+            $streams->{$key}->{$k} = $changes{$k};
+        }
+        return 1;
+    });
 }
 
 sub directStreamDisplayTtl {
@@ -321,13 +352,7 @@ sub getConfigValue {
 sub updateActiveStream {
     my ($key, %changes) = @_;
     return unless defined $key && length $key;
-    my $streams = loadActiveStreams();
-    return unless ref($streams->{$key}) eq 'HASH';
-    $streams->{$key}->{lastSeenAt} = time();
-    for my $k (keys %changes) {
-        $streams->{$key}->{$k} = $changes{$k};
-    }
-    saveActiveStreams($streams);
+    return touchActiveStream($key, %changes);
 }
 
 sub desiredModeByOverride {
