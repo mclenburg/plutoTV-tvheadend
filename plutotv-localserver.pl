@@ -23,6 +23,8 @@ use Try::Tiny;
 use Getopt::Long qw(:config no_ignore_case);
 use Crypt::CBC;
 use IPC::Run qw(run);
+use IPC::Open3;
+use Symbol qw(gensym);
 use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
 use File::Temp qw(tempdir tmpnam);
@@ -1940,8 +1942,8 @@ sub buildReencodeFfmpegCommand {
         $ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin',
         '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
         '-fflags', '+genpts+discardcorrupt',
-        '-analyzeduration', '2000000',
-        '-probesize', '2000000',
+        '-analyzeduration', '1000000',
+        '-probesize', '1000000',
         '-i', $videoPlaylist,
     );
 
@@ -1949,10 +1951,10 @@ sub buildReencodeFfmpegCommand {
         push @cmd,
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
             '-fflags', '+genpts+discardcorrupt',
-            '-analyzeduration', '2000000',
-            '-probesize', '2000000',
+            '-analyzeduration', '1000000',
+            '-probesize', '1000000',
             '-i', $audioPlaylist,
-            '-map', '0:v:0', '-map', '1:a:0?';
+            '-map', '0:v:0', '-map', '1:a:0';
     } else {
         push @cmd,
             '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
@@ -1960,10 +1962,31 @@ sub buildReencodeFfmpegCommand {
     }
 
     push @cmd,
-        '-vf', 'scale=1280:720',
-        '-pix_fmt', 'yuv420p',
-        '-c:v', $encoder,
-        ($encoder eq 'libx264' ? ('-preset', 'veryfast', '-tune', 'zerolatency') : ()),
+        '-vf', 'scale=1280:720,format=yuv420p';
+
+    if ($encoder eq 'h264_v4l2m2m') {
+        push @cmd,
+            '-c:v', 'h264_v4l2m2m',
+            '-b:v', '4M',
+            '-maxrate', '4M',
+            '-bufsize', '8M',
+            '-profile:v', 'high',
+            '-bf', '0',
+            '-g', '50';
+    } else {
+        push @cmd,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-tune', 'zerolatency',
+            '-profile:v', 'high',
+            '-bf', '0',
+            '-g', '50',
+            '-b:v', '4M',
+            '-maxrate', '4M',
+            '-bufsize', '8M';
+    }
+
+    push @cmd,
         '-c:a', 'aac',
         '-ar', '48000',
         '-b:a', '160k',
@@ -2000,7 +2023,6 @@ sub streamReencodedWindow {
     my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
     my $videoPlaylist = "$tmpdir/video.m3u8";
     my $audioPlaylist = "$tmpdir/audio.m3u8";
-    my $stderrFile    = "$tmpdir/ffmpeg.stderr.log";
 
     buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
     debugTrace('Lokale Video-Playlist fuer ' . $channelId . ': ' . $videoPlaylist . ' seg=' . scalar(@{ $window->{videoSegments} || [] }));
@@ -2029,8 +2051,6 @@ sub streamReencodedWindow {
 
     ENCODER:
     for my $encoder (@encoders) {
-        unlink $stderrFile if -e $stderrFile;
-
         my @cmd = buildReencodeFfmpegCommand(
             encoder       => $encoder,
             videoPlaylist => $videoPlaylist,
@@ -2038,21 +2058,22 @@ sub streamReencodedWindow {
             hasAudio      => $hasAudio,
             channelName   => $channelName,
         );
-        my $cmdline = join(' ', map { shellQuote($_) } @cmd)
-            . ' 2> >(tee -a ' . shellQuote($stderrFile) . ' >&2)';
+        my $cmdline = join(' ', map { shellQuote($_) } @cmd);
 
         debugTrace('Harmonize ffmpeg cmd [' . $encoder . '] ' . $cmdline);
         my $ffh;
-        my $ffpid = open($ffh, '-|', 'bash', '-lc', $cmdline);
+        my $errh = gensym();
+        my $ffpid = eval { open3(undef, $ffh, $errh, @cmd) };
         unless ($ffpid) {
             appendRecentLog('ffmpeg-Start fehlgeschlagen [' . $encoder . ']: ' . $channelId);
             next ENCODER;
         }
         binmode($ffh);
+        binmode($errh);
 
         my $client_alive = 1;
         my $buffer = '';
-        my $sel = IO::Select->new($ffh);
+        my $sel = IO::Select->new($ffh, $errh);
         my $started_at = time();
         my $last_output_at = $started_at;
         my $total_read_bytes = 0;
@@ -2065,25 +2086,59 @@ sub streamReencodedWindow {
         my $has_output = 0;
         my $aborted_for_timeout = 0;
 
+        my $stderr_capture = '';
+        my $first_stderr_logged = 0;
+        my $stderr_open = 1;
+        my $stdout_open = 1;
+
         while (1) {
             my $desired = desiredModeByOverride($channelId, $request);
             if ($desired ne 'harmonize') {
                 kill 'TERM', $ffpid;
                 close($ffh);
+                close($errh) if $stderr_open;
                 return 'switch';
             }
 
             my @ready = $sel->can_read(0.5);
-            if (@ready) {
-                my $read = sysread($ffh, $buffer, 1316);
+            for my $fh (@ready) {
+                my $read = sysread($fh, $buffer, 8192);
                 if (!defined $read) {
-                    debugTrace('Harmonize sysread Fehler fuer ' . $channelId . ': ' . ($! || 'unbekannt'));
-                    last;
+                    if ($fh == $ffh) {
+                        debugTrace('Harmonize sysread Fehler stdout fuer ' . $channelId . ': ' . ($! || 'unbekannt'));
+                        $stdout_open = 0;
+                    } else {
+                        debugTrace('Harmonize sysread Fehler stderr fuer ' . $channelId . ': ' . ($! || 'unbekannt'));
+                        $stderr_open = 0;
+                    }
+                    $sel->remove($fh);
+                    next;
                 }
                 if ($read == 0) {
-                    debugTrace('Harmonize EOF von ffmpeg fuer ' . $channelId . ' nach ' . $chunk_count . ' Chunks und ' . $total_read_bytes . ' Bytes');
-                    last;
+                    if ($fh == $ffh) {
+                        debugTrace('Harmonize EOF von ffmpeg-stdout fuer ' . $channelId . ' nach ' . $chunk_count . ' Chunks und ' . $total_read_bytes . ' Bytes');
+                        $stdout_open = 0;
+                    } else {
+                        debugTrace('Harmonize EOF von ffmpeg-stderr fuer ' . $channelId);
+                        $stderr_open = 0;
+                    }
+                    $sel->remove($fh);
+                    next;
                 }
+
+                if ($fh == $errh) {
+                    $stderr_capture .= $buffer;
+                    print STDERR $buffer;
+                    if (!$first_stderr_logged) {
+                        my $sample = $buffer;
+                        $sample =~ s/\s+/ /g;
+                        $sample = substr($sample, 0, 240);
+                        debugTrace('Harmonize erster ffmpeg-stderr fuer ' . $channelId . ' [' . $encoder . ']: ' . $sample);
+                        $first_stderr_logged = 1;
+                    }
+                    next;
+                }
+
                 $last_output_at = time();
                 $has_output = 1;
                 $total_read_bytes += $read;
@@ -2100,11 +2155,11 @@ sub streamReencodedWindow {
                 }
                 $total_written_bytes += length($buffer);
                 debugTrace('Harmonize erster Client-Write fuer ' . $channelId . ': ' . length($buffer) . ' Bytes [' . $encoder . ']') if $chunk_count == 1;
-                next;
             }
+            last unless $client_alive;
 
             my $child_done = waitpid($ffpid, WNOHANG);
-            if (defined $child_done && $child_done == $ffpid) {
+            if ((!$stdout_open && !$stderr_open) || (defined $child_done && $child_done == $ffpid)) {
                 my $exit_code = $? >> 8;
                 my $signal = $? & 127;
                 debugTrace('Harmonize ffmpeg beendet fuer ' . $channelId . ' [' . $encoder . '] exit=' . $exit_code . ' signal=' . $signal . ' read=' . $total_read_bytes . ' written=' . $total_written_bytes);
@@ -2117,7 +2172,6 @@ sub streamReencodedWindow {
                     appendRecentLog('ffmpeg-Fenster-Starttimeout [' . $encoder . '], Neustart: ' . $channelId);
                     $aborted_for_timeout = 1;
                     kill 'TERM', $ffpid;
-                    close($ffh);
                     last;
                 }
                 next;
@@ -2128,26 +2182,21 @@ sub streamReencodedWindow {
                 appendRecentLog('ffmpeg-Fenster-Stall [' . $encoder . '], Neustart: ' . $channelId);
                 $aborted_for_timeout = 1;
                 kill 'TERM', $ffpid;
-                close($ffh);
                 last;
             }
         }
 
-        close($ffh);
+        close($ffh) if $stdout_open;
+        close($errh) if $stderr_open;
         debugTrace('Harmonize Fensterende fuer ' . $channelId . ' [' . $encoder . '] has_output=' . ($has_output ? 1 : 0) . ' client_alive=' . ($client_alive ? 1 : 0) . ' read=' . $total_read_bytes . ' written=' . $total_written_bytes);
 
         if ($client_alive && $has_output) {
             return 1;
         }
 
-        my $stderr = '';
-        if (open(my $efh, '<', $stderrFile)) {
-            local $/;
-            $stderr = <$efh> // '';
-            close($efh);
-            $stderr =~ s/\s+/ /g;
-            $stderr = substr($stderr, 0, 240);
-        }
+        my $stderr = $stderr_capture // '';
+        $stderr =~ s/\s+/ /g;
+        $stderr = substr($stderr, 0, 240);
 
         if (!$has_output && $encoder ne 'libx264') {
             appendRecentLog('ffmpeg ohne Output [' . $encoder . '], Fallback auf libx264: ' . $channelId . ($stderr ? ' | ' . $stderr : ''));
