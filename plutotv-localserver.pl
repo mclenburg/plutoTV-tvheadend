@@ -1932,11 +1932,11 @@ sub buildAudioSegmentSliceForVideoWindow {
 
 sub buildReencodeFfmpegCommand {
     my (%args) = @_;
-    my $encoder       = $args{encoder}       || 'libx264';
-    my $videoPlaylist = $args{videoPlaylist} or return;
-    my $audioPlaylist = $args{audioPlaylist};
-    my $channelName   = $args{channelName}   || 'PlutoTV';
-    my $hasAudio      = $args{hasAudio} ? 1 : 0;
+    my $encoder          = $args{encoder}          || 'libx264';
+    my $videoPlaylist    = $args{videoPlaylist}    or return;
+    my $audioPlaylist    = $args{audioPlaylist};
+    my $channelName      = $args{channelName}      || 'PlutoTV';
+    my $hasSeparateAudio = $args{hasSeparateAudio} ? 1 : 0;
 
     my @cmd = (
         $ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin',
@@ -1947,7 +1947,7 @@ sub buildReencodeFfmpegCommand {
         '-i', $videoPlaylist,
     );
 
-    if ($hasAudio) {
+    if ($hasSeparateAudio) {
         push @cmd,
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
             '-fflags', '+genpts+discardcorrupt',
@@ -1957,12 +1957,11 @@ sub buildReencodeFfmpegCommand {
             '-map', '0:v:0', '-map', '1:a:0';
     } else {
         push @cmd,
-            '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
-            '-map', '0:v:0', '-map', '1:a:0';
+            '-map', '0:v:0', '-map', '0:a:0?';
     }
 
     push @cmd,
-        '-vf', 'scale=1280:720,format=yuv420p';
+        '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p';
 
     if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
@@ -1970,7 +1969,6 @@ sub buildReencodeFfmpegCommand {
             '-b:v', '4M',
             '-maxrate', '4M',
             '-bufsize', '8M',
-            '-profile:v', 'high',
             '-bf', '0',
             '-g', '50';
     } else {
@@ -1991,7 +1989,6 @@ sub buildReencodeFfmpegCommand {
         '-ar', '48000',
         '-b:a', '160k',
         '-ac', '2',
-        '-shortest',
         '-muxdelay', '0',
         '-muxpreload', '0',
         '-mpegts_flags', '+resend_headers',
@@ -2026,9 +2023,9 @@ sub streamReencodedWindow {
 
     buildLocalWindowPlaylistFile($window->{videoSegments}, $videoPlaylist) or return 0;
     debugTrace('Lokale Video-Playlist fuer ' . $channelId . ': ' . $videoPlaylist . ' seg=' . scalar(@{ $window->{videoSegments} || [] }));
-    my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
-    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasAudio;
-    debugTrace('Lokale Audio-Playlist fuer ' . $channelId . ': ' . $audioPlaylist . ' seg=' . scalar(@{ $window->{audioSegments} || [] })) if $hasAudio;
+    my $hasSeparateAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
+    buildLocalWindowPlaylistFile($window->{audioSegments}, $audioPlaylist) if $hasSeparateAudio;
+    debugTrace('Lokale Audio-Playlist fuer ' . $channelId . ': ' . $audioPlaylist . ' seg=' . scalar(@{ $window->{audioSegments} || [] })) if $hasSeparateAudio;
 
     if (!$headersSentRef || !$$headersSentRef) {
         eval {
@@ -2055,7 +2052,7 @@ sub streamReencodedWindow {
             encoder       => $encoder,
             videoPlaylist => $videoPlaylist,
             audioPlaylist => $audioPlaylist,
-            hasAudio      => $hasAudio,
+            hasSeparateAudio => $hasSeparateAudio,
             channelName   => $channelName,
         );
         my $cmdline = join(' ', map { shellQuote($_) } @cmd);
@@ -2268,7 +2265,7 @@ sub streamHlsViaFfmpeg {
 
         my $audioWindow = $audioContent ? findBestAudioWindowForVideoWindow($audioWindows, $videoWindow, \%processedAudioWindows) : undef;
         my $audioSegments = [];
-        my $audioLogLabel = ' audio=silent-fallback';
+        my $audioLogLabel = $audioUrl ? ' audio=separate-unavailable' : ' audio=embedded';
         if ($audioWindow && ref($audioWindow->{segments}) eq 'ARRAY' && @{ $audioWindow->{segments} }) {
             $audioSegments = $audioWindow->{segments};
             $audioLogLabel = ' a=' . ($audioWindow->{startSequence}//'?') . '-' . ($audioWindow->{endSequence}//'?')
@@ -2278,6 +2275,8 @@ sub streamHlsViaFfmpeg {
             $audioSegments = buildAudioSegmentSliceForVideoWindow($audioContent, $audioUrl, $videoWindow);
             if ($audioSegments && ref($audioSegments) eq 'ARRAY' && @$audioSegments) {
                 $audioLogLabel = ' aseg=' . scalar(@$audioSegments) . ' av-sync=slice';
+            } else {
+                $audioLogLabel = ' audio=embedded';
             }
         }
         appendRecentLog('Harmonize-Fenster: ' . $channelId
