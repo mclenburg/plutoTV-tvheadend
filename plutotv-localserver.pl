@@ -26,7 +26,6 @@ use IPC::Run qw(run);
 use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
 use File::Temp qw(tempdir);
-use File::Path qw(make_path);
 use POSIX qw(mkfifo WNOHANG);
 use IO::Select;
 use JSON::PP qw(encode_json decode_json);
@@ -74,7 +73,7 @@ my $tempFile;
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
 if (defined $tempFile && length $tempFile) {
     require File::Basename;
-    $runtimeStateDir = (-d $tempFile) ? $tempFile : File::Basename::dirname($tempFile);
+    $runtimeStateDir = File::Basename::dirname($tempFile);
     $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
     $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
     $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
@@ -113,19 +112,8 @@ my $sessionRetryCooldown = 30;
 
 
 sub ensureRuntimeStateDir {
-    return 1 if -d $runtimeStateDir;
-    eval { make_path($runtimeStateDir) };
-    return 0 if $@;
-    return -d $runtimeStateDir ? 1 : 0;
-}
-
-sub normalizeBoolean {
-    my ($value, $default) = @_;
-    return $default unless defined $value;
-    return $value ? 1 : 0 if ref($value) eq 'JSON::PP::Boolean';
-    return 1 if $value =~ /^(1|true|yes|on)$/i;
-    return 0 if $value =~ /^(0|false|no|off)$/i;
-    return $default;
+    return if -d $runtimeStateDir;
+    mkdir $runtimeStateDir;
 }
 
 sub htmlEscape {
@@ -140,7 +128,7 @@ sub htmlEscape {
 
 sub loadJsonFile {
     my ($path, $default) = @_;
-    ensureRuntimeStateDir() or return $default;
+    ensureRuntimeStateDir();
     return $default unless -e $path;
     open(my $fh, '<', $path) or return $default;
     flock($fh, LOCK_SH);
@@ -154,7 +142,7 @@ sub loadJsonFile {
 
 sub saveJsonFile {
     my ($path, $data) = @_;
-    ensureRuntimeStateDir() or return 0;
+    ensureRuntimeStateDir();
     my $tmp = $path . '.tmp.' . $$;
     open(my $fh, '>', $tmp) or return 0;
     flock($fh, LOCK_EX);
@@ -167,37 +155,25 @@ sub saveJsonFile {
 sub loadHarmonizeOverrides {
     my $parsed = loadJsonFile($harmonizeStateFile, {});
     return {} unless ref($parsed) eq 'HASH';
-    my %normalized;
-    for my $channelId (keys %$parsed) {
-        $normalized{$channelId} = normalizeBoolean($parsed->{$channelId}, 0) ? JSON::PP::true : JSON::PP::false;
-    }
-    return \%normalized;
+    return $parsed;
 }
 
 sub saveHarmonizeOverrides {
     my ($hashref) = @_;
     $hashref ||= {};
-    my %normalized;
-    for my $channelId (keys %$hashref) {
-        $normalized{$channelId} = normalizeBoolean($hashref->{$channelId}, 0) ? JSON::PP::true : JSON::PP::false;
-    }
-    return saveJsonFile($harmonizeStateFile, \%normalized);
+    return saveJsonFile($harmonizeStateFile, $hashref);
 }
 
 sub setHarmonizeOverride {
     my ($channelId, $enabled) = @_;
     return 0 unless defined $channelId && length $channelId;
     my $overrides = loadHarmonizeOverrides();
-    $overrides->{$channelId} = normalizeBoolean($enabled, 0) ? JSON::PP::true : JSON::PP::false;
+    if ($enabled) {
+        $overrides->{$channelId} = JSON::PP::true;
+    } else {
+        delete $overrides->{$channelId};
+    }
     return saveHarmonizeOverrides($overrides);
-}
-
-sub getPersistedHarmonizeOverride {
-    my ($channelId) = @_;
-    return undef unless defined $channelId && length $channelId;
-    my $overrides = loadHarmonizeOverrides();
-    return undef unless exists $overrides->{$channelId};
-    return normalizeBoolean($overrides->{$channelId}, 0) ? 1 : 0;
 }
 
 sub loadForceDiscontinuityMap {
@@ -255,6 +231,8 @@ sub unregisterActiveStream {
     saveActiveStreams($streams);
 }
 
+# On Linux/RPi, /proc/$pid is the only reliable liveness check for
+# double-forked orphan processes when SIG{CHLD}='IGNORE'.
 sub pidIsAlive {
     my ($pid) = @_;
     return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
@@ -277,22 +255,21 @@ sub cleanupStaleActiveStreams {
     return $streams;
 }
 
+# SSE-only read: no write-back, avoids race with stream processes.
 sub readActiveStreamsForDisplay {
     return loadActiveStreams();
 }
+
 
 sub loadRuntimeConfig {
     my $parsed = loadJsonFile($runtimeConfigStateFile, {});
     return {} unless ref($parsed) eq 'HASH';
     return $parsed;
 }
-
 sub saveRuntimeConfig {
     my ($hashref) = @_;
-    $hashref ||= {};
-    return saveJsonFile($runtimeConfigStateFile, $hashref);
+    return saveJsonFile($runtimeConfigStateFile, $hashref || {});
 }
-
 sub getConfigValue {
     my ($key, $default) = @_;
     my $cfg = loadRuntimeConfig();
@@ -310,2541 +287,2626 @@ sub updateActiveStream {
     saveActiveStreams($streams);
 }
 
-sub desiredModeByOverride {
-    my ($channelId, $request) = @_;
-    my $persisted = getPersistedHarmonizeOverride($channelId);
-    return $persisted ? 'harmonize' : 'copy' if defined $persisted;
-    return 'harmonize' if $hybrid_harmonize_channels{$channelId};
-
-    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-    if ($params && defined $params->{mode}) {
-        my $mode = lc($params->{mode});
-        return 'harmonize' if $mode eq 'harmonize';
-        return 'copy' if $mode eq 'copy';
-    }
-    if ($params && defined $params->{harmonize}) {
-        my $flag = lc($params->{harmonize});
-        return 'harmonize' if $flag =~ /^(1|true|yes|on)$/;
-        return 'copy' if $flag =~ /^(0|false|no|off)$/;
-    }
-    return 'copy';
+sub loadRecentLogs {
+    my $parsed = loadJsonFile($recentLogStateFile, []);
+    return [] unless ref($parsed) eq 'ARRAY';
+    return $parsed;
 }
 
-sub loadRecentLogs {
-    sub loadRecentLogs {
-        my $parsed = loadJsonFile($recentLogStateFile, []);
-        return [] unless ref($parsed) eq 'ARRAY';
-        return $parsed;
-    }
+sub saveRecentLogs {
+    my ($arr) = @_;
+    $arr ||= [];
+    return saveJsonFile($recentLogStateFile, $arr);
+}
 
-    sub saveRecentLogs {
-        my ($arr) = @_;
-        $arr ||= [];
-        return saveJsonFile($recentLogStateFile, $arr);
-    }
+sub appendRecentLog {
+    my ($message) = @_;
+    return unless defined $message && length $message;
+    my $logs = loadRecentLogs();
+    push @$logs, {
+        ts => time(),
+        line => "$message",
+    };
+    my $ml = int(getConfigValue('log_depth', 10)); $ml = 5 if $ml < 5;
+    shift @$logs while @$logs > $ml;
+    saveRecentLogs($logs);
+}
 
-    sub appendRecentLog {
-        my ($message) = @_;
-        return unless defined $message && length $message;
-        my $logs = loadRecentLogs();
-        push @$logs, { ts => time(), line => "$message", };
-        my $maxLogs = int(getConfigValue('log_depth', 10));
-        $maxLogs = 5 if $maxLogs < 5;
-        shift @$logs while @$logs > $maxLogs;
-        saveRecentLogs($logs);
-    }
+sub buildAdminSnapshot {
+    my ($region, %opts) = @_;
+    $region ||= 'DE';
+    my $streams = $opts{readonly} ? readActiveStreamsForDisplay() : cleanupStaleActiveStreams();
+    my $harmonize = loadHarmonizeOverrides();
+    my $logs = loadRecentLogs();
 
-    sub jsonResponse {
-        my ($client, $code, $payload) = @_;
-        my $response = HTTP::Response->new($code);
-        $response->header('content-type' => 'application/json; charset=utf-8');
-        $response->content(encode_utf8(encode_json($payload || {})));
-        $client->send_response($response);
-    }
-    sub sendJsonOk { my ($client, %extra) = @_; jsonResponse($client, 200, { ok => JSON::PP::true, %extra }); }
-    sub sendJsonError { my ($client, $message, %extra) = @_; jsonResponse($client, 400, { ok => JSON::PP::false, error => ($message || 'Fehler'), %extra }); }
-
-    sub buildChannelAdminEntries {
-        my ($region) = @_;
-        $region ||= 'DE';
-        my @entries;
-        for my $channel (getChannelJson($region)) {
-            next unless $channel && ($channel->{id} || '');
-            my $channelId = $channel->{id} || $channel->{_id};
-            my $persisted = getPersistedHarmonizeOverride($channelId);
-            my $effective = desiredModeByOverride($channelId, undef) eq 'harmonize' ? 1 : 0;
-            my $source = defined $persisted ? 'persisted' : ($hybrid_harmonize_channels{$channelId} ? 'env/arg' : 'default');
-            push @entries, {
-                channelId => $channelId,
-                channelName => $channel->{name} || $channelId,
-                number => $channel->{number} || 0,
-                effectiveHarmonize => $effective ? 1 : 0,
-                persistedHarmonize => defined $persisted ? ($persisted ? 1 : 0) : undef,
-                source => $source,
-            };
-        }
-        @entries = sort { lc($a->{channelName} || '') cmp lc($b->{channelName} || '') || ($a->{number}||0) <=> ($b->{number}||0) } @entries;
-        return \@entries;
-    }
-
-    sub handleAdminSetConfig {
-        my ($client, $request) = @_;
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params } || {};
-        my $stall = int($params->{stall_timeout} || 15);
-        my $startup = int($params->{startup_timeout} || 30);
-        my $fails = int($params->{max_failures} || 5);
-        my $depth = int($params->{log_depth} || 10);
-        $stall = 5 if $stall < 5; $stall = 120 if $stall > 120;
-        $startup = 5 if $startup < 5; $startup = 120 if $startup > 120;
-        $fails = 1 if $fails < 1; $fails = 20 if $fails > 20;
-        $depth = 5 if $depth < 5; $depth = 100 if $depth > 100;
-        saveRuntimeConfig({ stall_timeout=>$stall, startup_timeout=>$startup, max_failures=>$fails, log_depth=>$depth });
-        appendRecentLog("Konfiguration gespeichert: stall=${stall}s startup=${startup}s fail=${fails} log=${depth}");
-        sendJsonOk($client, msg=>'Konfiguration gespeichert');
-    }
-
-    sub buildAdminSnapshot {
-        my ($region, %opts) = @_;
-        $region ||= 'DE';
-        my $streams = $opts{readonly} ? readActiveStreamsForDisplay() : cleanupStaleActiveStreams();
-        my $logs = loadRecentLogs();
-        my @entries;
-        for my $key (sort keys %$streams) {
-            my $entry = $streams->{$key};
-            next unless ref($entry) eq 'HASH';
-            my $channelId = $entry->{channelId} || '';
-            my $effectiveMode = desiredModeByOverride($channelId, undef);
-            push @entries, {
-                key => $key, channelId => $channelId, channelName => $entry->{channelName} || $channelId,
-                mode => $entry->{mode} || 'copy', desiredMode => $effectiveMode,
-                started => formatEpochLocal($entry->{startedAt}), pid => $entry->{pid} || 0,
-                harmonize => $effectiveMode eq 'harmonize' ? 1 : 0,
-            };
-        }
-        my @recent = map { +{ ts => formatEpochLocal($_->{ts}), line => $_->{line}, } } @$logs;
-        return { region => $region, streams => \@entries, channels => buildChannelAdminEntries($region), logs => \@recent,
-            config => { stall_timeout=>int(getConfigValue('stall_timeout',15)), startup_timeout=>int(getConfigValue('startup_timeout',30)), max_failures=>int(getConfigValue('max_failures',5)), log_depth=>int(getConfigValue('log_depth',10)) } };
-    }
-
-    sub sendAdminEvents {
-        my ($client, $request) = @_;
-        my $region = 'DE';
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-
-        eval {
-            $client->write("HTTP/1.1 200 OK\n");
-            $client->write("Content-Type: text/event-stream; charset=utf-8\n");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-            $client->write("Connection: close\n\n");
+    my @entries;
+    for my $key (sort keys %$streams) {
+        my $entry = $streams->{$key};
+        next unless ref($entry) eq 'HASH';
+        my $channelId = $entry->{channelId} || '';
+        push @entries, {
+            key => $key,
+            channelId => $channelId,
+            channelName => $entry->{channelName} || $channelId,
+            mode => $entry->{mode} || 'copy',
+            desiredMode => $entry->{desiredMode} || ($harmonize->{$channelId} ? 'harmonize' : 'copy'),
+            started   => formatEpochLocal($entry->{startedAt}),
+            pid       => $entry->{pid} || 0,
+            harmonize => ($harmonize->{$channelId} || 0) ? 1 : 0,
         };
-        return if $@;
-
-        my $last_payload = '';
-        for (1..3600) {
-            my $snapshot = buildAdminSnapshot($region, readonly => 1);
-            my $payload = encode_json($snapshot);
-            if ($payload ne $last_payload) {
-                my $ok = eval {
-                    $client->write("event: snapshot\n");
-                    $client->write("data: $payload\n\n");
-                    $client->flush(); 1
-                };
-                last unless $ok;
-                $last_payload = $payload;
-            } else {
-                my $ok = eval { $client->write(": keepalive\n\n"); $client->flush(); 1 };
-                last unless $ok;
-            }
-            sleep 1;
-        }
     }
 
-    sub getLatestDiscontinuitySeq {
-        my ($playlistContent) = @_;
-        return undef unless defined $playlistContent && length $playlistContent;
-        my @lines = split /\r?\n/, $playlistContent;
-        my $mediaSequence = 0;
-        my $segmentIndex = 0;
-        my $pendingDisc = 0;
-        my $latest;
-        for my $line (@lines) {
-            if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
-                $mediaSequence = $1;
-            } elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-                $pendingDisc = 1;
-            } elsif ($line !~ /^#/ && length $line) {
-                if ($pendingDisc) {
-                    $latest = $mediaSequence + $segmentIndex;
-                    $pendingDisc = 0;
-                }
-                $segmentIndex++;
-            }
-        }
-        return $latest;
+    my @harm;
+    for my $channelId (sort keys %$harmonize) {
+        my $channel = findChannelMetaById($channelId, $region);
+        my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
+        push @harm, { channelId => $channelId, channelName => $name };
     }
 
-    sub detectNewPlaylistDiscontinuity {
-        my ($ua, $videoUrl, $audioUrl, $lastSeenRef) = @_;
-        my $latest;
-        for my $url (grep { defined $_ && length $_ } ($videoUrl, $audioUrl)) {
-            my $resp = getResponseFromUrl($url, ua => $ua);
-            next unless $resp && $resp->is_success;
-            my $seq = getLatestDiscontinuitySeq($resp->decoded_content);
-            $latest = $seq if defined $seq && (!defined($latest) || $seq > $latest);
+    my @recent = map {
+        +{
+            ts => formatEpochLocal($_->{ts}),
+            line => $_->{line},
         }
-        if (!defined $$lastSeenRef) {
-            $$lastSeenRef = $latest;
-            return 0;
+    } @$logs;
+
+    return {
+        region        => $region,
+        streams       => \@entries,
+        harmonizeList => \@harm,
+        logs          => \@recent,
+        config        => {
+            stall_timeout => int(getConfigValue('stall_timeout', 30)),
+            max_failures  => int(getConfigValue('max_failures',  5)),
+            log_depth     => int(getConfigValue('log_depth',     10)),
+        },
+    };
+}
+
+sub sendAdminEvents {
+    my ($client, $request) = @_;
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+
+    eval {
+        $client->write("HTTP/1.1 200 OK\n");
+        $client->write("Content-Type: text/event-stream; charset=utf-8\n");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+        $client->write("Connection: close\n\n");
+    };
+    return if $@;
+
+    my $last_payload = '';
+    for (1..3600) {
+        my $snapshot = buildAdminSnapshot($region, readonly => 1);
+        my $payload = encode_json($snapshot);
+        if ($payload ne $last_payload) {
+            my $ok = eval {
+                $client->write("event: snapshot\n");
+                $client->write("data: $payload\n\n");
+                $client->flush(); 1
+            };
+            last unless $ok;
+            $last_payload = $payload;
+        } else {
+            my $ok = eval { $client->write(": keepalive\n\n"); $client->flush(); 1 };
+            last unless $ok;
         }
-        if (defined $latest && $latest > $$lastSeenRef) {
-            $$lastSeenRef = $latest;
+        sleep 1;
+    }
+}
+sub formatEpochLocal {
+    my ($epoch) = @_;
+    return '' unless defined $epoch && $epoch =~ /^\d+$/;
+    my @lt = localtime($epoch);
+    return sprintf('%04d-%02d-%02d %02d:%02d:%02d',
+        $lt[5] + 1900, $lt[4] + 1, $lt[3], $lt[2], $lt[1], $lt[0]);
+}
+
+sub getArgsValue {
+    my ($param) = @_;
+    for my $argnum (0 .. $#ARGV) {
+        return $ARGV[$argnum+1] if $ARGV[$argnum] eq $param;
+    }
+    return undef;
+}
+
+sub forkProcess {
+    my $pid = fork;
+    if ($pid) {
+        waitpid $pid, 0;
+    } else {
+        my $pid2 = fork;
+        if ($pid2) {
+            exit(0);
+        } else {
             return 1;
         }
-        return 0;
     }
-    sub formatEpochLocal {
-        my ($epoch) = @_;
-        return '' unless defined $epoch && $epoch =~ /^\d+$/;
-        my @lt = localtime($epoch);
-        return sprintf('%04d-%02d-%02d %02d:%02d:%02d',
-            $lt[5] + 1900, $lt[4] + 1, $lt[3], $lt[2], $lt[1], $lt[0]);
-    }
+    return 0;
+}
 
-    sub getArgsValue {
-        my ($param) = @_;
-        for my $argnum (0 .. $#ARGV) {
-            return $ARGV[$argnum+1] if $ARGV[$argnum] eq $param;
-        }
-        return undef;
-    }
+sub sortByRunningNumber {
+    my @array = @_;
+    my @sortedArray = sort { $a->{running} <=> $b->{running} } @array;
+    return @sortedArray;
+}
 
-    sub forkProcess {
-        my $pid = fork;
-        if ($pid) {
-            waitpid $pid, 0;
-        } else {
-            my $pid2 = fork;
-            if ($pid2) {
-                exit(0);
-            } else {
-                return 1;
+sub createUserAgent {
+    my (%opts) = @_;
+    my $ua = LWP::UserAgent->new(keep_alive => 1, timeout => 20);
+    $ua->agent('Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0');
+    my $headers = HTTP::Headers->new;
+    $headers->header('Cache-Control'   => 'no-cache');
+    $headers->header('Pragma'          => 'no-cache');
+    $headers->header('Accept'          => '*/*');
+    $headers->header('Accept-Language' => 'de,en-US;q=0.9,en;q=0.8');
+    $headers->header('Referer'         => 'https://pluto.tv/');
+    $headers->header('Origin'          => 'https://pluto.tv');
+    $headers->header('DNT'             => '1');
+    $headers->header('Sec-GPC'         => '1');
+    $headers->header('Connection'      => 'keep-alive');
+    $headers->header('Sec-Fetch-Dest'  => 'empty');
+    $headers->header('Sec-Fetch-Mode'  => 'cors');
+    $headers->header('Sec-Fetch-Site'  => 'same-site');
+    if ($opts{token}) {
+        $headers->header('Authorization' => 'Bearer ' . $opts{token});
+    }
+    $ua->default_headers($headers);
+    return $ua;
+}
+
+sub getFromUrl {
+    my ($url, %opts) = @_;
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = $opts{ua} || createUserAgent(%opts);
+    my $response = $ua->request($request);
+    return $response->is_success ? $response->decoded_content : undef;
+}
+
+sub getResponseFromUrl {
+    my ($url, %opts) = @_;
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = $opts{ua} || createUserAgent(%opts);
+    return $ua->request($request);
+}
+
+sub pickLogoUrl {
+    my ($channel) = @_;
+    return undef unless $channel;
+    if (ref($channel->{logo}) eq 'HASH' && $channel->{logo}->{path}) {
+        return $channel->{logo}->{path};
+    }
+    my @preferred = qw(logo colorLogoPNG solidLogoPNG colorLogoSVG solidLogoSVG featuredImage hero tileColor tileGrayscale);
+    my %imagesByType = map { ($_->{type} || '') => ($_->{url} || '') } @{ $channel->{images} || [] };
+    for my $type (@preferred) {
+        return $imagesByType{$type} if $imagesByType{$type};
+    }
+    for my $image (@{ $channel->{images} || [] }) {
+        return $image->{url} if $image->{url};
+    }
+    return undef;
+}
+
+sub normalizeChannel {
+    my ($channel) = @_;
+    return undef unless $channel && ref($channel) eq 'HASH';
+    my $id = $channel->{id} || $channel->{_id};
+    return undef unless $id;
+
+    my $stitchedPath;
+    if (ref($channel->{stitched}) eq 'HASH' && ref($channel->{stitched}->{paths}) eq 'ARRAY') {
+        for my $path (@{ $channel->{stitched}->{paths} }) {
+            next unless ref($path) eq 'HASH';
+            if (($path->{type} || '') eq 'hls' && $path->{path}) {
+                $stitchedPath = $path->{path};
+                last;
             }
         }
-        return 0;
-    }
-
-    sub sortByRunningNumber {
-        my @array = @_;
-        my @sortedArray = sort { $a->{running} <=> $b->{running} } @array;
-        return @sortedArray;
-    }
-
-    sub createUserAgent {
-        my (%opts) = @_;
-        my $ua = LWP::UserAgent->new(keep_alive => 1, timeout => 20);
-        $ua->agent('Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0');
-        my $headers = HTTP::Headers->new;
-        $headers->header('Cache-Control'   => 'no-cache');
-        $headers->header('Pragma'          => 'no-cache');
-        $headers->header('Accept'          => '*/*');
-        $headers->header('Accept-Language' => 'de,en-US;q=0.9,en;q=0.8');
-        $headers->header('Referer'         => 'https://pluto.tv/');
-        $headers->header('Origin'          => 'https://pluto.tv');
-        $headers->header('DNT'             => '1');
-        $headers->header('Sec-GPC'         => '1');
-        $headers->header('Connection'      => 'keep-alive');
-        $headers->header('Sec-Fetch-Dest'  => 'empty');
-        $headers->header('Sec-Fetch-Mode'  => 'cors');
-        $headers->header('Sec-Fetch-Site'  => 'same-site');
-        if ($opts{token}) {
-            $headers->header('Authorization' => 'Bearer ' . $opts{token});
-        }
-        $ua->default_headers($headers);
-        return $ua;
-    }
-
-    sub getFromUrl {
-        my ($url, %opts) = @_;
-        my $request = HTTP::Request->new(GET => $url);
-        my $ua = $opts{ua} || createUserAgent(%opts);
-        my $response = $ua->request($request);
-        return $response->is_success ? $response->decoded_content : undef;
-    }
-
-    sub getResponseFromUrl {
-        my ($url, %opts) = @_;
-        my $request = HTTP::Request->new(GET => $url);
-        my $ua = $opts{ua} || createUserAgent(%opts);
-        return $ua->request($request);
-    }
-
-    sub pickLogoUrl {
-        my ($channel) = @_;
-        return undef unless $channel;
-        if (ref($channel->{logo}) eq 'HASH' && $channel->{logo}->{path}) {
-            return $channel->{logo}->{path};
-        }
-        my @preferred = qw(logo colorLogoPNG solidLogoPNG colorLogoSVG solidLogoSVG featuredImage hero tileColor tileGrayscale);
-        my %imagesByType = map { ($_->{type} || '') => ($_->{url} || '') } @{ $channel->{images} || [] };
-        for my $type (@preferred) {
-            return $imagesByType{$type} if $imagesByType{$type};
-        }
-        for my $image (@{ $channel->{images} || [] }) {
-            return $image->{url} if $image->{url};
-        }
-        return undef;
-    }
-
-    sub normalizeChannel {
-        my ($channel) = @_;
-        return undef unless $channel && ref($channel) eq 'HASH';
-        my $id = $channel->{id} || $channel->{_id};
-        return undef unless $id;
-
-        my $stitchedPath;
-        if (ref($channel->{stitched}) eq 'HASH' && ref($channel->{stitched}->{paths}) eq 'ARRAY') {
+        unless ($stitchedPath) {
             for my $path (@{ $channel->{stitched}->{paths} }) {
                 next unless ref($path) eq 'HASH';
-                if (($path->{type} || '') eq 'hls' && $path->{path}) {
+                if ($path->{path}) {
                     $stitchedPath = $path->{path};
                     last;
                 }
             }
-            unless ($stitchedPath) {
-                for my $path (@{ $channel->{stitched}->{paths} }) {
-                    next unless ref($path) eq 'HASH';
-                    if ($path->{path}) {
-                        $stitchedPath = $path->{path};
-                        last;
-                    }
-                }
-            }
         }
-
-        return {
-            %{$channel},
-            id           => $id,
-            _id          => $id,
-            name         => $channel->{name} || '',
-            slug         => $channel->{slug} || '',
-            number       => $channel->{number} || 0,
-            logo_url     => pickLogoUrl($channel),
-            stitchedPath => $stitchedPath,
-        };
     }
 
-    sub getBootQueryString {
-        my ($region) = @_;
-        $region ||= 'DE';
-        my $regionData = $regions{$region} || $regions{'DE'};
-        my $now = DateTime->now(time_zone => 'UTC');
-        my $launchTime = $now->strftime('%Y-%m-%dT%H:%M:%S.000Z');
-        my $clientTime = $now->strftime('%Y-%m-%dT%H:%M:%S.001Z');
-        return join('&',
-            "appName=$appName",
-            "appVersion=$appVersion",
-            "deviceVersion=$deviceVersion",
-            "deviceModel=$deviceModel",
-            "deviceMake=$deviceMake",
-            "deviceType=$deviceType",
-            "clientID=$deviceId",
-            "clientModelNumber=$clientModelNumber",
-            'serverSideAds=false',
-            'drmCapabilities=widevine%3AL3',
-            'blockingMode=',
-            'notificationVersion=1',
-            'appLaunchCount=0',
-            'lastAppLaunchDate=' . uri_escape_utf8($launchTime),
-            'clientTime=' . uri_escape_utf8($clientTime),
-            'deviceLat=' . $regionData->{lat},
-            'deviceLon=' . $regionData->{lon}
-        );
+    return {
+        %{$channel},
+        id           => $id,
+        _id          => $id,
+        name         => $channel->{name} || '',
+        slug         => $channel->{slug} || '',
+        number       => $channel->{number} || 0,
+        logo_url     => pickLogoUrl($channel),
+        stitchedPath => $stitchedPath,
+    };
+}
+
+sub getBootQueryString {
+    my ($region) = @_;
+    $region ||= 'DE';
+    my $regionData = $regions{$region} || $regions{'DE'};
+    my $now = DateTime->now(time_zone => 'UTC');
+    my $launchTime = $now->strftime('%Y-%m-%dT%H:%M:%S.000Z');
+    my $clientTime = $now->strftime('%Y-%m-%dT%H:%M:%S.001Z');
+    return join('&',
+        "appName=$appName",
+        "appVersion=$appVersion",
+        "deviceVersion=$deviceVersion",
+        "deviceModel=$deviceModel",
+        "deviceMake=$deviceMake",
+        "deviceType=$deviceType",
+        "clientID=$deviceId",
+        "clientModelNumber=$clientModelNumber",
+        'serverSideAds=false',
+        'drmCapabilities=widevine%3AL3',
+        'blockingMode=',
+        'notificationVersion=1',
+        'appLaunchCount=0',
+        'lastAppLaunchDate=' . uri_escape_utf8($launchTime),
+        'clientTime=' . uri_escape_utf8($clientTime),
+        'deviceLat=' . $regionData->{lat},
+        'deviceLon=' . $regionData->{lon}
+    );
+}
+
+sub getBootFromPlutoRaw {
+    my ($region) = @_;
+    $region ||= 'DE';
+    my $url = 'https://boot.pluto.tv/v4/start?' . getBootQueryString($region);
+    my $content = getFromUrl($url);
+    return unless $content;
+    my $parsed = try { parse_json($content) };
+    return unless $parsed && ref($parsed) eq 'HASH';
+    $parsed->{_fetchedAt} = time();
+    return $parsed;
+}
+
+sub sessionNeedsRefresh {
+    my ($session) = @_;
+    return 1 unless $session && ref($session) eq 'HASH';
+    return 1 unless $session->{sessionToken};
+    my $fetchedAt = $session->{_fetchedAt} || 0;
+    return 1 if (time() - $fetchedAt) >= $sessionRefreshInterval;
+    return 0;
+}
+
+sub getBootFromPluto {
+    my ($region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    if (!$forceRefresh && exists $session_cache{$region} && !sessionNeedsRefresh($session_cache{$region})) {
+        return $session_cache{$region};
     }
-
-    sub getBootFromPlutoRaw {
-        my ($region) = @_;
-        $region ||= 'DE';
-        my $url = 'https://boot.pluto.tv/v4/start?' . getBootQueryString($region);
-        my $content = getFromUrl($url);
-        return unless $content;
-        my $parsed = try { parse_json($content) };
-        return unless $parsed && ref($parsed) eq 'HASH';
-        $parsed->{_fetchedAt} = time();
-        return $parsed;
+    my $fresh = getBootFromPlutoRaw($region);
+    if ($fresh && $fresh->{sessionToken}) {
+        $session_cache{$region} = $fresh;
+        return $fresh;
     }
+    return $session_cache{$region} if exists $session_cache{$region};
+    return undef;
+}
 
-    sub sessionNeedsRefresh {
-        my ($session) = @_;
-        return 1 unless $session && ref($session) eq 'HASH';
-        return 1 unless $session->{sessionToken};
-        my $fetchedAt = $session->{_fetchedAt} || 0;
-        return 1 if (time() - $fetchedAt) >= $sessionRefreshInterval;
-        return 0;
+sub parseQueryString {
+    my ($query) = @_;
+    my %pairs;
+    return %pairs unless defined $query && length $query;
+    for my $part (split /&/, $query) {
+        next unless length $part;
+        my ($k, $v) = split /=/, $part, 2;
+        $pairs{$k} = defined $v ? $v : '';
     }
+    return %pairs;
+}
 
-    sub getBootFromPluto {
-        my ($region, $forceRefresh) = @_;
-        $region ||= 'DE';
-        if (!$forceRefresh && exists $session_cache{$region} && !sessionNeedsRefresh($session_cache{$region})) {
-            return $session_cache{$region};
-        }
-        my $fresh = getBootFromPlutoRaw($region);
-        if ($fresh && $fresh->{sessionToken}) {
-            $session_cache{$region} = $fresh;
-            return $fresh;
-        }
-        return $session_cache{$region} if exists $session_cache{$region};
-        return undef;
+sub buildQueryString {
+    my (%pairs) = @_;
+    return join('&', map { $_ . '=' . (defined $pairs{$_} ? $pairs{$_} : '') } grep { defined $_ && length $_ && defined $pairs{$_} } sort keys %pairs);
+}
+
+sub upgradeStitchedPathToV2 {
+    my ($path) = @_;
+    return undef unless defined $path && length $path;
+    $path =~ s{^/stitch/}{/v2/stitch/};
+    return $path;
+}
+
+sub extractSessionId {
+    my ($bootJson) = @_;
+    return undef unless $bootJson;
+    return $bootJson->{session}->{sessionID}
+        || $bootJson->{sessionID}
+        || $bootJson->{sessionId}
+        || $bootJson->{sid};
+}
+
+sub buildStitchQuery {
+    my ($bootJson, $region) = @_;
+    $region ||= 'DE';
+    return '' unless $bootJson;
+
+    my $regionData = $regions{$region} || $regions{'DE'};
+    my $sid = extractSessionId($bootJson) || '';
+    my $jwt = $bootJson->{sessionToken} || '';
+
+    my %pairs = (
+        advertisingId         => '',
+        appName               => $appName,
+        appVersion            => $appVersion,
+        app_name              => $appName,
+        clientDeviceType      => 0,
+        clientID              => $deviceId,
+        clientModelNumber     => $clientModelNumber,
+        country               => $region,
+        deviceDNT             => 'false',
+        deviceId              => $deviceId,
+        deviceLat             => $regionData->{lat},
+        deviceLon             => $regionData->{lon},
+        deviceMake            => $deviceMake,
+        deviceModel           => $deviceModel,
+        deviceType            => $deviceType,
+        deviceVersion         => $deviceVersion,
+        marketingRegion       => $region,
+        serverSideAds         => 'false',
+        sessionID             => $sid,
+        sid                   => $sid,
+        userId                => '',
+        jwt                   => $jwt,
+        masterJWTPassthrough  => 'true',
+        includeExtendedEvents => 'true',
+        eventVOD              => 'false',
+        profilesFromStream    => 'true',
+    );
+
+    return buildQueryString(%pairs);
+}
+
+sub parseAttributeList {
+    my ($attrString) = @_;
+    my %attrs;
+    return %attrs unless defined $attrString;
+    while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
+        my ($k, $v) = ($1, $2);
+        $v =~ s/^"//;
+        $v =~ s/"$//;
+        $attrs{$k} = $v;
     }
+    return %attrs;
+}
 
-    sub parseQueryString {
-        my ($query) = @_;
-        my %pairs;
-        return %pairs unless defined $query && length $query;
-        for my $part (split /&/, $query) {
-            next unless length $part;
-            my ($k, $v) = split /=/, $part, 2;
-            $pairs{$k} = defined $v ? $v : '';
-        }
-        return %pairs;
-    }
-
-    sub buildQueryString {
-        my (%pairs) = @_;
-        return join('&', map { $_ . '=' . (defined $pairs{$_} ? $pairs{$_} : '') } grep { defined $_ && length $_ && defined $pairs{$_} } sort keys %pairs);
-    }
-
-    sub upgradeStitchedPathToV2 {
-        my ($path) = @_;
-        return undef unless defined $path && length $path;
-        $path =~ s{^/stitch/}{/v2/stitch/};
-        return $path;
-    }
-
-    sub extractSessionId {
-        my ($bootJson) = @_;
-        return undef unless $bootJson;
-        return $bootJson->{session}->{sessionID}
-            || $bootJson->{sessionID}
-            || $bootJson->{sessionId}
-            || $bootJson->{sid};
-    }
-
-    sub buildStitchQuery {
-        my ($bootJson, $region) = @_;
-        $region ||= 'DE';
-        return '' unless $bootJson;
-
-        my $regionData = $regions{$region} || $regions{'DE'};
-        my $sid = extractSessionId($bootJson) || '';
-        my $jwt = $bootJson->{sessionToken} || '';
-
-        my %pairs = (
-            advertisingId         => '',
-            appName               => $appName,
-            appVersion            => $appVersion,
-            app_name              => $appName,
-            clientDeviceType      => 0,
-            clientID              => $deviceId,
-            clientModelNumber     => $clientModelNumber,
-            country               => $region,
-            deviceDNT             => 'false',
-            deviceId              => $deviceId,
-            deviceLat             => $regionData->{lat},
-            deviceLon             => $regionData->{lon},
-            deviceMake            => $deviceMake,
-            deviceModel           => $deviceModel,
-            deviceType            => $deviceType,
-            deviceVersion         => $deviceVersion,
-            marketingRegion       => $region,
-            serverSideAds         => 'false',
-            sessionID             => $sid,
-            sid                   => $sid,
-            userId                => '',
-            jwt                   => $jwt,
-            masterJWTPassthrough  => 'true',
-            includeExtendedEvents => 'true',
-            eventVOD              => 'false',
-            profilesFromStream    => 'true',
-        );
-
-        return buildQueryString(%pairs);
-    }
-
-    sub parseAttributeList {
-        my ($attrString) = @_;
-        my %attrs;
-        return %attrs unless defined $attrString;
-        while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
-            my ($k, $v) = ($1, $2);
-            $v =~ s/^"//;
-            $v =~ s/"$//;
-            $attrs{$k} = $v;
-        }
-        return %attrs;
-    }
-
-    sub extractPlaybackUrls {
-        my ($masterPlaylist, $masterUrl) = @_;
-        my @lines = split /
+sub extractPlaybackUrls {
+    my ($masterPlaylist, $masterUrl) = @_;
+    my @lines = split /
 ?
 /, ($masterPlaylist || '');
-        my %audioGroups;
-        my $bestBandwidth = -1;
-        my ($bestVideoUrl, $bestAudioGroup);
+    my %audioGroups;
+    my $bestBandwidth = -1;
+    my ($bestVideoUrl, $bestAudioGroup);
 
-        for my $i (0 .. $#lines) {
-            my $line = $lines[$i];
-            if ($line =~ /^#EXT-X-MEDIA:(.+)$/i) {
-                my %attrs = parseAttributeList($1);
-                next unless (($attrs{'TYPE'} || '') eq 'AUDIO');
-                my $group = $attrs{'GROUP-ID'} || next;
-                my $uri = $attrs{'URI'} || next;
-                my $isDefault = (($attrs{'DEFAULT'} || '') =~ /^YES$/i) ? 1 : 0;
-                my $name = $attrs{'NAME'} || '';
-                my $lang = $attrs{'LANGUAGE'} || '';
-                $audioGroups{$group} ||= [];
-                push @{$audioGroups{$group}}, {
-                    uri => resolvePlaylistUrlPreserveQuery($masterUrl, $uri),
-                    default => $isDefault,
-                    name => $name,
-                    language => $lang,
-                };
-            }
-        }
-
-        for my $i (0 .. $#lines) {
-            my $line = $lines[$i];
-            next unless $line =~ /^#EXT-X-STREAM-INF:(.+)$/i;
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-MEDIA:(.+)$/i) {
             my %attrs = parseAttributeList($1);
-            my $bandwidth = int($attrs{'BANDWIDTH'} || 0);
-            next unless $i + 1 <= $#lines;
-            my $urlLine = $lines[$i + 1];
-            next if !defined($urlLine) || $urlLine =~ /^#/ || $urlLine eq '';
-            if ($bandwidth > $bestBandwidth) {
-                $bestBandwidth = $bandwidth;
-                $bestVideoUrl = resolvePlaylistUrlPreserveQuery($masterUrl, $urlLine);
-                $bestAudioGroup = $attrs{'AUDIO'};
-            }
+            next unless (($attrs{'TYPE'} || '') eq 'AUDIO');
+            my $group = $attrs{'GROUP-ID'} || next;
+            my $uri = $attrs{'URI'} || next;
+            my $isDefault = (($attrs{'DEFAULT'} || '') =~ /^YES$/i) ? 1 : 0;
+            my $name = $attrs{'NAME'} || '';
+            my $lang = $attrs{'LANGUAGE'} || '';
+            $audioGroups{$group} ||= [];
+            push @{$audioGroups{$group}}, {
+                uri => resolvePlaylistUrlPreserveQuery($masterUrl, $uri),
+                default => $isDefault,
+                name => $name,
+                language => $lang,
+            };
         }
+    }
 
-        my $bestAudioUrl;
-        if ($bestAudioGroup && $audioGroups{$bestAudioGroup} && @{$audioGroups{$bestAudioGroup}}) {
-            my ($default) = grep { $_->{default} } @{$audioGroups{$bestAudioGroup}};
-            $default ||= $audioGroups{$bestAudioGroup}[0];
-            $bestAudioUrl = $default->{uri};
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        next unless $line =~ /^#EXT-X-STREAM-INF:(.+)$/i;
+        my %attrs = parseAttributeList($1);
+        my $bandwidth = int($attrs{'BANDWIDTH'} || 0);
+        next unless $i + 1 <= $#lines;
+        my $urlLine = $lines[$i + 1];
+        next if !defined($urlLine) || $urlLine =~ /^#/ || $urlLine eq '';
+        if ($bandwidth > $bestBandwidth) {
+            $bestBandwidth = $bandwidth;
+            $bestVideoUrl = resolvePlaylistUrlPreserveQuery($masterUrl, $urlLine);
+            $bestAudioGroup = $attrs{'AUDIO'};
         }
-
-        return ($bestVideoUrl, $bestAudioUrl, $bestAudioGroup);
     }
 
-    sub resolvePlaylistUrlPreserveQuery {
-        my ($baseUrl, $value) = @_;
-        return undef unless defined $value && length $value;
-        return $value if $value =~ m{^data:}i;
-        return URI->new_abs($value, $baseUrl)->as_string;
+    my $bestAudioUrl;
+    if ($bestAudioGroup && $audioGroups{$bestAudioGroup} && @{$audioGroups{$bestAudioGroup}}) {
+        my ($default) = grep { $_->{default} } @{$audioGroups{$bestAudioGroup}};
+        $default ||= $audioGroups{$bestAudioGroup}[0];
+        $bestAudioUrl = $default->{uri};
     }
 
-    sub rewriteManifestAttributeLine {
-        my ($line, $baseUrl) = @_;
-        return $line unless defined $line && defined $baseUrl;
-        $line =~ s{URI="([^"]+)"}{'URI="' . resolvePlaylistUrlPreserveQuery($baseUrl, $1) . '"'}eg;
-        return $line;
-    }
+    return ($bestVideoUrl, $bestAudioUrl, $bestAudioGroup);
+}
 
-    sub rewriteManifestForClient {
-        my ($manifest, $sourceUrl) = @_;
-        return $manifest unless defined $manifest && defined $sourceUrl;
-        my @lines = split /
+sub resolvePlaylistUrlPreserveQuery {
+    my ($baseUrl, $value) = @_;
+    return undef unless defined $value && length $value;
+    return $value if $value =~ m{^data:}i;
+    return URI->new_abs($value, $baseUrl)->as_string;
+}
+
+sub rewriteManifestAttributeLine {
+    my ($line, $baseUrl) = @_;
+    return $line unless defined $line && defined $baseUrl;
+    $line =~ s{URI="([^"]+)"}{'URI="' . resolvePlaylistUrlPreserveQuery($baseUrl, $1) . '"'}eg;
+    return $line;
+}
+
+sub rewriteManifestForClient {
+    my ($manifest, $sourceUrl) = @_;
+    return $manifest unless defined $manifest && defined $sourceUrl;
+    my @lines = split /
 ?
 /, $manifest;
-        my @out;
-        for my $line (@lines) {
-            if ($line =~ /^#EXT-X-(?:KEY|MAP):/) {
-                push @out, rewriteManifestAttributeLine($line, $sourceUrl);
-                next;
-            }
-            if ($line =~ /^#/) {
-                push @out, $line;
-                next;
-            }
-            if (!length $line) {
-                push @out, $line;
-                next;
-            }
-            my $resolved = resolvePlaylistUrlPreserveQuery($sourceUrl, $line);
-            if ($resolved =~ /\.m3u8(?:$|[?#])/i) {
-                push @out, 'http://' . $hostIp . ':' . $port . '/proxy.m3u8?src=' . uri_escape_utf8($resolved);
-            } else {
-                push @out, $resolved;
-            }
+    my @out;
+    for my $line (@lines) {
+        if ($line =~ /^#EXT-X-(?:KEY|MAP):/) {
+            push @out, rewriteManifestAttributeLine($line, $sourceUrl);
+            next;
         }
-        return join("
+        if ($line =~ /^#/) {
+            push @out, $line;
+            next;
+        }
+        if (!length $line) {
+            push @out, $line;
+            next;
+        }
+        my $resolved = resolvePlaylistUrlPreserveQuery($sourceUrl, $line);
+        if ($resolved =~ /\.m3u8(?:$|[?#])/i) {
+            push @out, 'http://' . $hostIp . ':' . $port . '/proxy.m3u8?src=' . uri_escape_utf8($resolved);
+        } else {
+            push @out, $resolved;
+        }
+    }
+    return join("
 ", @out) . "
 ";
+}
+
+sub getChannelJson {
+    my ($region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    my $boot = getBootFromPluto($region, $forceRefresh);
+    my @channels;
+
+    if ($boot && ref($boot->{EPG}) eq 'ARRAY' && @{ $boot->{EPG} } >= 10) {
+        @channels = map { normalizeChannel($_) } @{ $boot->{EPG} };
+        @channels = grep { $_ } @channels;
     }
 
-    sub getChannelJson {
-        my ($region, $forceRefresh) = @_;
-        $region ||= 'DE';
-        my $boot = getBootFromPluto($region, $forceRefresh);
-        my @channels;
-
-        if ($boot && ref($boot->{EPG}) eq 'ARRAY' && @{ $boot->{EPG} } >= 10) {
-            @channels = map { normalizeChannel($_) } @{ $boot->{EPG} };
-            @channels = grep { $_ } @channels;
-        }
-
-        if (!@channels) {
-            if ($boot && $boot->{servers} && $boot->{sessionToken}) {
-                my $url = $channelsApiUrl . '?channelIds=&offset=0&limit=1000&sort=number%3Aasc';
-                my $content = getFromUrl($url, token => $boot->{sessionToken});
-                if ($content) {
-                    my $parsed = try { parse_json($content) };
-                    my $items = ref($parsed) eq 'HASH' ? ($parsed->{data} || $parsed->{channels} || []) : [];
-                    @channels = map { normalizeChannel($_) } @{ $items || [] };
-                    @channels = grep { $_ } @channels;
-                }
+    if (!@channels) {
+        if ($boot && $boot->{servers} && $boot->{sessionToken}) {
+            my $url = $channelsApiUrl . '?channelIds=&offset=0&limit=1000&sort=number%3Aasc';
+            my $content = getFromUrl($url, token => $boot->{sessionToken});
+            if ($content) {
+                my $parsed = try { parse_json($content) };
+                my $items = ref($parsed) eq 'HASH' ? ($parsed->{data} || $parsed->{channels} || []) : [];
+                @channels = map { normalizeChannel($_) } @{ $items || [] };
+                @channels = grep { $_ } @channels;
             }
         }
-
-        if (@channels) {
-            @channels = sort { lc($a->{name} || '') cmp lc($b->{name} || '') } @channels;
-            $channel_cache{$region} = [ @channels ];
-            return @channels;
-        }
-
-        return @{ $channel_cache{$region} || [] };
     }
 
-    sub buildDirectMasterUrl {
-        my ($bootJson, $channelOrId, $region) = @_;
-        return undef unless $bootJson && $bootJson->{servers} && $bootJson->{servers}->{stitcher};
-        my $channelId;
-        my $stitchedPath;
-        if (ref($channelOrId) eq 'HASH') {
-            $channelId = $channelOrId->{id} || $channelOrId->{_id};
-            $stitchedPath = $channelOrId->{stitchedPath};
+    if (@channels) {
+        @channels = sort { lc($a->{name} || '') cmp lc($b->{name} || '') } @channels;
+        $channel_cache{$region} = [ @channels ];
+        return @channels;
+    }
+
+    return @{ $channel_cache{$region} || [] };
+}
+
+sub buildDirectMasterUrl {
+    my ($bootJson, $channelOrId, $region) = @_;
+    return undef unless $bootJson && $bootJson->{servers} && $bootJson->{servers}->{stitcher};
+    my $channelId;
+    my $stitchedPath;
+    if (ref($channelOrId) eq 'HASH') {
+        $channelId = $channelOrId->{id} || $channelOrId->{_id};
+        $stitchedPath = $channelOrId->{stitchedPath};
+    } else {
+        $channelId = $channelOrId;
+    }
+    return undef unless $channelId;
+    $stitchedPath ||= "/stitch/hls/channel/$channelId/master.m3u8";
+    $stitchedPath = upgradeStitchedPathToV2($stitchedPath);
+    my $url = $stitchedPath =~ m{^https?://}
+        ? $stitchedPath
+        : $bootJson->{servers}->{stitcher} . $stitchedPath;
+    my $query = buildStitchQuery($bootJson, $region);
+    if ($query) {
+        $url .= ($url =~ /\?/) ? '&' : '?';
+        $url .= $query;
+    }
+    return $url;
+}
+
+sub buildMasterUrlCandidates {
+    my ($bootJson, $channel, $channelId, $region) = @_;
+    my @candidates;
+
+    push @candidates, $master_url_cache{$channelId} if $master_url_cache{$channelId};
+
+    if ($channel) {
+        my $direct = buildDirectMasterUrl($bootJson, $channel, $region);
+        push @candidates, $direct if $direct;
+
+        if (($channel->{stitchedPath} || '') =~ m{/channel/([^/]+)/master\.m3u8$}) {
+            my $id_in_path = $1;
+            my $live_path = $channel->{stitchedPath};
+            $live_path =~ s{/channel/[^/]+/master\.m3u8$}{/channel/${id_in_path}livestitch/master.m3u8};
+            my $live = buildDirectMasterUrl($bootJson, { %$channel, stitchedPath => $live_path }, $region);
+            push @candidates, $live if $live;
+        }
+    }
+
+    my $fallback = buildDirectMasterUrl($bootJson, $channelId, $region);
+    push @candidates, $fallback if $fallback;
+
+    my $live_fallback = buildDirectMasterUrl(
+        $bootJson,
+        { id => $channelId, stitchedPath => "/stitch/hls/channel/${channelId}livestitch/master.m3u8" },
+        $region,
+    );
+    push @candidates, $live_fallback if $live_fallback;
+
+    my %seen;
+    return grep { defined $_ && length $_ && !$seen{$_}++ } @candidates;
+}
+
+sub fetchMasterPlaylistForChannel {
+    my ($bootJson, $channel, $channelId, $region) = @_;
+    my @candidates = buildMasterUrlCandidates($bootJson, $channel, $channelId, $region);
+    for my $masterUrl (@candidates) {
+        my $master = getFromUrl($masterUrl, token => $bootJson->{sessionToken});
+        next unless $master;
+        $master_url_cache{$channelId} = $masterUrl;
+        return ($masterUrl, $master);
+    }
+    return;
+}
+
+sub getChannelById {
+    my ($channelId, $region) = @_;
+    $region ||= 'DE';
+    for my $channel (getChannelJson($region)) {
+        return $channel if ($channel->{id} || '') eq $channelId;
+    }
+    return undef;
+}
+
+sub getMasterPlaylistForChannel {
+    my ($channelId, $region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    my $bootJson = getBootFromPluto($region, $forceRefresh);
+    return unless $bootJson && $bootJson->{servers};
+    my $channel = getChannelById($channelId, $region);
+    my ($masterUrl, $master) = fetchMasterPlaylistForChannel($bootJson, $channel, $channelId, $region);
+    return unless $masterUrl && $master;
+    return ($bootJson, $channel, $masterUrl, $master);
+}
+
+sub getPlaylistUrlForChannel {
+    my ($channelId, $region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    my ($bootJson, $channel, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, $forceRefresh);
+    return unless $bootJson && $master;
+    my $playlistUrl = extractBestPlaylistUrl($master, $bootJson->{servers}->{stitcher}, $channelId, $masterUrl);
+    return unless $playlistUrl;
+    return ($bootJson, $channel, $masterUrl, $playlistUrl, $master);
+}
+
+sub getPlaybackUrlsForChannel {
+    my ($channelId, $region, $forceRefresh) = @_;
+    $region ||= 'DE';
+    my ($bootJson, $channel, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, $forceRefresh);
+    return unless $bootJson && $master;
+    my ($videoUrl, $audioUrl, $audioGroup) = extractPlaybackUrls($master, $masterUrl);
+    return ($bootJson, $channel, $masterUrl, $master, $videoUrl, $audioUrl, $audioGroup);
+}
+
+sub buildM3uLegacy {
+    my ($session, @channels) = @_;
+    my $m3u = "#EXTM3U
+";
+    my $activeRegion = $session && $session->{session} && $session->{session}->{activeRegion}
+        ? lc($session->{session}->{activeRegion}) : 'de';
+    my $channelNumber = 1000;
+    for my $channel (@channels) {
+        next unless ($channel->{number} || 0) > 0 && ($channel->{number} || 0) != 2000;
+        my $logo = $channel->{logo_url} || '';
+        my $name = $channel->{name};
+        my $id = $channel->{id};
+        $m3u .= '#EXTINF:-1 tvg-chno="' . $channelNumber . '" tvg-id="' . uri_escape_utf8($name) .
+            '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="PlutoTV",' . $name . "
+";
+        if ($useStreamlink) {
+            my $url = 'https://pluto.tv/' . $activeRegion . '/live-tv/' . $channel->{slug};
+            $m3u .= 'pipe://' . $streamlink . ' --stdout --quiet --default-stream best ' .
+                '--hls-live-restart --url "' . $url . '"' . "
+";
         } else {
-            $channelId = $channelOrId;
+            $m3u .= 'pipe://' . $ffmpeg . ' -loglevel fatal -threads 0 -nostdin -re ' .
+                '-i "http://' . $hostIp . ':' . $port . '/master3u8?id=' . $id . '" ' .
+                '-c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts ' .
+                '-tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv ' .
+                '-metadata service_name="' . $name . '" pipe:1' . "
+";
         }
-        return undef unless $channelId;
-        $stitchedPath ||= "/stitch/hls/channel/$channelId/master.m3u8";
-        $stitchedPath = upgradeStitchedPathToV2($stitchedPath);
-        my $url = $stitchedPath =~ m{^https?://}
-            ? $stitchedPath
-            : $bootJson->{servers}->{stitcher} . $stitchedPath;
-        my $query = buildStitchQuery($bootJson, $region);
-        if ($query) {
-            $url .= ($url =~ /\?/) ? '&' : '?';
-            $url .= $query;
+        $channelNumber++;
+    }
+    return $m3u;
+}
+
+sub buildM3uDirect {
+    my (@channels) = @_;
+    my $m3u = "#EXTM3U
+";
+    my $channelNumber = 1000;
+    for my $channel (@channels) {
+        next unless ($channel->{number} || 0) > 0 && ($channel->{number} || 0) != 2000;
+        my $logo = $channel->{logo_url} || '';
+        my $name = $channel->{name};
+        my $id = $channel->{id};
+        $m3u .= '#EXTINF:-1 tvg-chno="' . $channelNumber . '" tvg-id="' . uri_escape_utf8($name) .
+            '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="PlutoTV",' . $name . "
+";
+        $m3u .= 'http://' . $hostIp . ':' . $port . '/stream/' . $id . ".m3u8
+";
+        $channelNumber++;
+    }
+    return $m3u;
+}
+
+sub sendMasterAlias {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = $params && $params->{id} ? $params->{id} : undef;
+    unless ($channelId) {
+        $client->send_error(RC_BAD_REQUEST, "Missing id parameter");
+        return;
+    }
+    my $fakeRequest = HTTP::Request->new(GET => "/stream/$channelId.m3u8");
+    sendDirectStream($client, $fakeRequest);
+}
+
+sub sendHelp {
+    my ($client, $request) = @_;
+    my $response = HTTP::Response->new();
+    $response->code(200);
+    $response->message("OK");
+    $response->content("Following endpoints are available:\n" .
+        "\t/playlist?region=REGION\tfor full m3u8-file (legacy pipes)\n" .
+        "\t/tvheadend?region=REGION\tfor direct streams (tvheadend optimized)\n" .
+        "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
+        "\t/master3u8?id=ID\tlegacy alias for ffmpeg pipe input\n" .
+        "\t/epg\t\tfor xmltv-epg-file\n" .
+        "\t/admin\t\tfor runtime configuration UI\n\n" .
+        "Available regions: " . join(", ", sort keys %regions) . "\n" .
+        "Example: /tvheadend?region=US\n");
+    $client->send_response($response);
+}
+
+sub xmltvTimestampFromIso {
+    my ($iso) = @_;
+    return undef unless defined $iso && length $iso;
+    if ($iso =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        return "$1$2$3$4$5$6 +0000";
+    }
+    return undef;
+}
+
+sub buildGuideStartIso {
+    my $now = DateTime->now(time_zone => 'UTC');
+    my $minute = $now->minute;
+    my $roundedMinute = int($minute / 30) * 30;
+    $now->set(minute => $roundedMinute, second => 0, nanosecond => 0);
+    return $now->strftime('%Y-%m-%dT%H:%M:%S.000Z');
+}
+
+sub buildGuideUrl {
+    my ($region, $channelIdsRef) = @_;
+    $region ||= 'DE';
+    my @channelIds = grep { defined $_ && length $_ } @{ $channelIdsRef || [] };
+    return undef unless @channelIds;
+    return $guideTimelinesApiUrl . '?start=' . uri_escape_utf8(buildGuideStartIso()) .
+        '&channelIds=' . uri_escape_utf8(join(',', @channelIds)) .
+        '&duration=' . $guideDurationMinutes;
+}
+
+sub extractGuideChannels {
+    my ($parsed) = @_;
+    return () unless $parsed;
+    return @{ $parsed->{data} } if ref($parsed->{data}) eq 'ARRAY';
+    return @{ $parsed } if ref($parsed) eq 'ARRAY';
+    return @{ $parsed->{channels} } if ref($parsed->{channels}) eq 'ARRAY';
+    return @{ $parsed->{guides} } if ref($parsed->{guides}) eq 'ARRAY';
+    return @{ $parsed->{EPG} } if ref($parsed->{EPG}) eq 'ARRAY';
+    return ();
+}
+
+sub getGuideChannelJson {
+    my ($region) = @_;
+    $region ||= 'DE';
+    my $boot = getBootFromPluto($region);
+    return () unless $boot && $boot->{sessionToken};
+
+    my @channels = getChannelJson($region);
+    my @channelIds = map { $_->{id} || $_->{_id} } grep { ($_->{id} || $_->{_id}) } @channels;
+    return () unless @channelIds;
+
+    my @guideChannels;
+    while (@channelIds) {
+        my @batch = splice(@channelIds, 0, $guideBatchSize);
+        my $url = buildGuideUrl($region, \@batch);
+        next unless $url;
+        my $content = getFromUrl($url, token => $boot->{sessionToken});
+        next unless $content;
+        my $parsed = try { parse_json($content) };
+        next unless $parsed;
+        for my $entry (extractGuideChannels($parsed)) {
+            next unless ref($entry) eq 'HASH';
+            my $id = $entry->{channelId} || $entry->{id} || $entry->{_id};
+            next unless $id;
+            push @guideChannels, {
+                id => $id,
+                _id => $id,
+                slug => $entry->{channelSlug} || '',
+                timelines => (ref($entry->{timelines}) eq 'ARRAY' ? $entry->{timelines} : []),
+            };
         }
-        return $url;
     }
 
-    sub buildMasterUrlCandidates {
-        my ($bootJson, $channel, $channelId, $region) = @_;
-        my @candidates;
+    return @guideChannels;
+}
 
-        push @candidates, $master_url_cache{$channelId} if $master_url_cache{$channelId};
-
-        if ($channel) {
-            my $direct = buildDirectMasterUrl($bootJson, $channel, $region);
-            push @candidates, $direct if $direct;
-
-            if (($channel->{stitchedPath} || '') =~ m{/channel/([^/]+)/master\.m3u8$}) {
-                my $id_in_path = $1;
-                my $live_path = $channel->{stitchedPath};
-                $live_path =~ s{/channel/[^/]+/master\.m3u8$}{/channel/${id_in_path}livestitch/master.m3u8};
-                my $live = buildDirectMasterUrl($bootJson, { %$channel, stitchedPath => $live_path }, $region);
-                push @candidates, $live if $live;
-            }
-        }
-
-        my $fallback = buildDirectMasterUrl($bootJson, $channelId, $region);
-        push @candidates, $fallback if $fallback;
-
-        my $live_fallback = buildDirectMasterUrl(
-            $bootJson,
-            { id => $channelId, stitchedPath => "/stitch/hls/channel/${channelId}livestitch/master.m3u8" },
-            $region,
-        );
-        push @candidates, $live_fallback if $live_fallback;
-
-        my %seen;
-        return grep { defined $_ && length $_ && !$seen{$_}++ } @candidates;
+sub mergeChannelsWithGuide {
+    my ($channelsRef, $guideChannelsRef) = @_;
+    my %byId = map { (($_->{id} || $_->{_id}) => { %$_ }) } @{ $channelsRef || [] };
+    for my $guide (@{ $guideChannelsRef || [] }) {
+        my $id = $guide->{id} || $guide->{_id} || next;
+        my $base = $byId{$id} || {};
+        my %merged = (%$base, %$guide);
+        $merged{id} = $id;
+        $merged{_id} = $id;
+        $merged{timelines} = $guide->{timelines} if ref($guide->{timelines}) eq 'ARRAY';
+        $merged{logo_url} ||= pickLogoUrl(\%merged);
+        $byId{$id} = \%merged;
     }
+    return values %byId;
+}
 
-    sub fetchMasterPlaylistForChannel {
-        my ($bootJson, $channel, $channelId, $region) = @_;
-        my @candidates = buildMasterUrlCandidates($bootJson, $channel, $channelId, $region);
-        for my $masterUrl (@candidates) {
-            my $master = getFromUrl($masterUrl, token => $bootJson->{sessionToken});
-            next unless $master;
-            $master_url_cache{$channelId} = $masterUrl;
-            return ($masterUrl, $master);
-        }
+
+sub forceUtf8 {
+    my ($value) = @_;
+    return '' unless defined $value;
+    return $value if ref($value);
+    return $value if is_utf8($value);
+    my $decoded = eval { decode_utf8($value, 1) };
+    return defined($decoded) ? $decoded : $value;
+}
+
+sub xmlCdata {
+    my ($value) = @_;
+    $value = forceUtf8($value);
+    $value =~ s/\]\]>/]]]]><![CDATA[>/g;
+    return '<![CDATA[' . $value . ']]>';
+}
+
+sub sendXmltvEpgFile {
+    my ($client, $request) = @_;
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+
+    my @channels = getChannelJson($region);
+    unless (@channels) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
         return;
     }
 
-    sub getChannelById {
-        my ($channelId, $region) = @_;
-        $region ||= 'DE';
-        for my $channel (getChannelJson($region)) {
-            return $channel if ($channel->{id} || '') eq $channelId;
+    my @guideChannels = getGuideChannelJson($region);
+    @channels = mergeChannelsWithGuide(\@channels, \@guideChannels) if @guideChannels;
+
+    my $langcode = "de";
+    my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
+    for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
+        next unless ($channel->{number} || 0) > 0;
+        my $channelName = forceUtf8($channel->{name} || "");
+        my $channelId = uri_escape_utf8($channelName);
+        $epg .= "<channel id=\"$channelId\">\n";
+        $epg .= "<display-name lang=\"$langcode\"><![CDATA[$channelName]]></display-name>\n";
+        if (my $logoPath = $channel->{logo_url}) {
+            $logoPath = substr($logoPath, 0, index($logoPath, "?")) if index($logoPath, "?") >= 0;
+            $epg .= "<icon src=\"$logoPath\" />\n";
         }
-        return undef;
+        $epg .= "</channel>\n";
     }
 
-    sub getMasterPlaylistForChannel {
-        my ($channelId, $region, $forceRefresh) = @_;
-        $region ||= 'DE';
-        my $bootJson = getBootFromPluto($region, $forceRefresh);
-        return unless $bootJson && $bootJson->{servers};
-        my $channel = getChannelById($channelId, $region);
-        my ($masterUrl, $master) = fetchMasterPlaylistForChannel($bootJson, $channel, $channelId, $region);
-        return unless $masterUrl && $master;
-        return ($bootJson, $channel, $masterUrl, $master);
-    }
+    for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
+        next unless ($channel->{number} || 0) > 0;
+        my $channelId = uri_escape_utf8(forceUtf8($channel->{name} || ""));
+        for my $programme (@{ $channel->{timelines} || [] }) {
+            my $start = xmltvTimestampFromIso($programme->{start});
+            my $stop  = xmltvTimestampFromIso($programme->{stop});
+            next unless $start && $stop;
 
-    sub getPlaylistUrlForChannel {
-        my ($channelId, $region, $forceRefresh) = @_;
-        $region ||= 'DE';
-        my ($bootJson, $channel, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, $forceRefresh);
-        return unless $bootJson && $master;
-        my $playlistUrl = extractBestPlaylistUrl($master, $bootJson->{servers}->{stitcher}, $channelId, $masterUrl);
-        return unless $playlistUrl;
-        return ($bootJson, $channel, $masterUrl, $playlistUrl, $master);
-    }
+            my $episode = $programme->{episode} || {};
+            my $title = forceUtf8($programme->{title} || $episode->{name} || $channel->{name} || '');
+            my $subtitle = forceUtf8($episode->{name} || '');
+            my $desc = forceUtf8($episode->{description} || '');
+            my $genre = forceUtf8($episode->{genre} || '');
+            my $rating = forceUtf8($episode->{rating} || '');
 
-    sub getPlaybackUrlsForChannel {
-        my ($channelId, $region, $forceRefresh) = @_;
-        $region ||= 'DE';
-        my ($bootJson, $channel, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, $forceRefresh);
-        return unless $bootJson && $master;
-        my ($videoUrl, $audioUrl, $audioGroup) = extractPlaybackUrls($master, $masterUrl);
-        return ($bootJson, $channel, $masterUrl, $master, $videoUrl, $audioUrl, $audioGroup);
-    }
-
-    sub buildM3uLegacy {
-        my ($session, @channels) = @_;
-        my $m3u = "#EXTM3U
-";
-        my $activeRegion = $session && $session->{session} && $session->{session}->{activeRegion}
-            ? lc($session->{session}->{activeRegion}) : 'de';
-        my $channelNumber = 1000;
-        for my $channel (@channels) {
-            next unless ($channel->{number} || 0) > 0 && ($channel->{number} || 0) != 2000;
-            my $logo = $channel->{logo_url} || '';
-            my $name = $channel->{name};
-            my $id = $channel->{id};
-            $m3u .= '#EXTINF:-1 tvg-chno="' . $channelNumber . '" tvg-id="' . uri_escape_utf8($name) .
-                '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="PlutoTV",' . $name . "
-";
-            if ($useStreamlink) {
-                my $url = 'https://pluto.tv/' . $activeRegion . '/live-tv/' . $channel->{slug};
-                $m3u .= 'pipe://' . $streamlink . ' --stdout --quiet --default-stream best ' .
-                    '--hls-live-restart --url "' . $url . '"' . "
-";
-            } else {
-                $m3u .= 'pipe://' . $ffmpeg . ' -loglevel fatal -threads 0 -nostdin -re ' .
-                    '-i "http://' . $hostIp . ':' . $port . '/master3u8?id=' . $id . '" ' .
-                    '-c copy -vcodec copy -acodec copy -mpegts_copyts 1 -f mpegts ' .
-                    '-tune zerolatency -mpegts_service_type advanced_codec_digital_hdtv ' .
-                    '-metadata service_name="' . $name . '" pipe:1' . "
-";
+            $epg .= "<programme start=\"$start\" stop=\"$stop\" channel=\"$channelId\">\n";
+            $epg .= "<title lang=\"$langcode\"><![CDATA[$title]]></title>\n";
+            $epg .= "<sub-title lang=\"$langcode\"><![CDATA[$subtitle]]></sub-title>\n" if length $subtitle;
+            $epg .= "<desc lang=\"$langcode\"><![CDATA[$desc]]></desc>\n" if length $desc;
+            $epg .= "<category lang=\"$langcode\"><![CDATA[$genre]]></category>\n" if length $genre;
+            if (length $rating) {
+                $epg .= "<rating><value>" . xmlCdata($rating) . "</value></rating>\n";
             }
-            $channelNumber++;
+            $epg .= "</programme>\n";
         }
-        return $m3u;
     }
 
-    sub buildM3uDirect {
-        my (@channels) = @_;
-        my $m3u = "#EXTM3U
-";
-        my $channelNumber = 1000;
-        for my $channel (@channels) {
-            next unless ($channel->{number} || 0) > 0 && ($channel->{number} || 0) != 2000;
-            my $logo = $channel->{logo_url} || '';
-            my $name = $channel->{name};
-            my $id = $channel->{id};
-            $m3u .= '#EXTINF:-1 tvg-chno="' . $channelNumber . '" tvg-id="' . uri_escape_utf8($name) .
-                '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="PlutoTV",' . $name . "
-";
-            $m3u .= 'http://' . $hostIp . ':' . $port . '/stream/' . $id . ".m3u8
-";
-            $channelNumber++;
-        }
-        return $m3u;
-    }
+    $epg .= "\n</tv>\n";
+    my $response = HTTP::Response->new();
+    $response->header("content-type", "application/xml; charset=utf-8");
+    $response->header("content-disposition", "filename=\"plutotv-epg.xml\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content(encode_utf8($epg));
+    $client->send_response($response);
+}
 
-    sub sendMasterAlias {
-        my ($client, $request) = @_;
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        my $channelId = $params && $params->{id} ? $params->{id} : undef;
-        unless ($channelId) {
-            $client->send_error(RC_BAD_REQUEST, "Missing id parameter");
-            return;
-        }
-        my $fakeRequest = HTTP::Request->new(GET => "/stream/$channelId.m3u8");
-        sendDirectStream($client, $fakeRequest);
-    }
-
-    sub sendHelp {
-        my ($client, $request) = @_;
-        my $response = HTTP::Response->new();
-        $response->code(200);
-        $response->message("OK");
-        $response->content("Following endpoints are available:\n" .
-            "\t/playlist?region=REGION\tfor full m3u8-file (legacy pipes)\n" .
-            "\t/tvheadend?region=REGION\tfor direct streams (tvheadend optimized)\n" .
-            "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
-            "\t/master3u8?id=ID\tlegacy alias for ffmpeg pipe input\n" .
-            "\t/epg\t\tfor xmltv-epg-file\n" .
-            "\t/admin\t\tfor runtime configuration UI\n\n" .
-            "Available regions: " . join(", ", sort keys %regions) . "\n" .
-            "Example: /tvheadend?region=US\n");
-        $client->send_response($response);
-    }
-
-    sub xmltvTimestampFromIso {
-        my ($iso) = @_;
-        return undef unless defined $iso && length $iso;
-        if ($iso =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
-            return "$1$2$3$4$5$6 +0000";
-        }
-        return undef;
-    }
-
-    sub buildGuideStartIso {
-        my $now = DateTime->now(time_zone => 'UTC');
-        my $minute = $now->minute;
-        my $roundedMinute = int($minute / 30) * 30;
-        $now->set(minute => $roundedMinute, second => 0, nanosecond => 0);
-        return $now->strftime('%Y-%m-%dT%H:%M:%S.000Z');
-    }
-
-    sub buildGuideUrl {
-        my ($region, $channelIdsRef) = @_;
-        $region ||= 'DE';
-        my @channelIds = grep { defined $_ && length $_ } @{ $channelIdsRef || [] };
-        return undef unless @channelIds;
-        return $guideTimelinesApiUrl . '?start=' . uri_escape_utf8(buildGuideStartIso()) .
-            '&channelIds=' . uri_escape_utf8(join(',', @channelIds)) .
-            '&duration=' . $guideDurationMinutes;
-    }
-
-    sub extractGuideChannels {
-        my ($parsed) = @_;
-        return () unless $parsed;
-        return @{ $parsed->{data} } if ref($parsed->{data}) eq 'ARRAY';
-        return @{ $parsed } if ref($parsed) eq 'ARRAY';
-        return @{ $parsed->{channels} } if ref($parsed->{channels}) eq 'ARRAY';
-        return @{ $parsed->{guides} } if ref($parsed->{guides}) eq 'ARRAY';
-        return @{ $parsed->{EPG} } if ref($parsed->{EPG}) eq 'ARRAY';
-        return ();
-    }
-
-    sub getGuideChannelJson {
-        my ($region) = @_;
-        $region ||= 'DE';
-        my $boot = getBootFromPluto($region);
-        return () unless $boot && $boot->{sessionToken};
-
-        my @channels = getChannelJson($region);
-        my @channelIds = map { $_->{id} || $_->{_id} } grep { ($_->{id} || $_->{_id}) } @channels;
-        return () unless @channelIds;
-
-        my @guideChannels;
-        while (@channelIds) {
-            my @batch = splice(@channelIds, 0, $guideBatchSize);
-            my $url = buildGuideUrl($region, \@batch);
-            next unless $url;
-            my $content = getFromUrl($url, token => $boot->{sessionToken});
-            next unless $content;
-            my $parsed = try { parse_json($content) };
-            next unless $parsed;
-            for my $entry (extractGuideChannels($parsed)) {
-                next unless ref($entry) eq 'HASH';
-                my $id = $entry->{channelId} || $entry->{id} || $entry->{_id};
-                next unless $id;
-                push @guideChannels, {
-                    id => $id,
-                    _id => $id,
-                    slug => $entry->{channelSlug} || '',
-                    timelines => (ref($entry->{timelines}) eq 'ARRAY' ? $entry->{timelines} : []),
-                };
-            }
-        }
-
-        return @guideChannels;
-    }
-
-    sub mergeChannelsWithGuide {
-        my ($channelsRef, $guideChannelsRef) = @_;
-        my %byId = map { (($_->{id} || $_->{_id}) => { %$_ }) } @{ $channelsRef || [] };
-        for my $guide (@{ $guideChannelsRef || [] }) {
-            my $id = $guide->{id} || $guide->{_id} || next;
-            my $base = $byId{$id} || {};
-            my %merged = (%$base, %$guide);
-            $merged{id} = $id;
-            $merged{_id} = $id;
-            $merged{timelines} = $guide->{timelines} if ref($guide->{timelines}) eq 'ARRAY';
-            $merged{logo_url} ||= pickLogoUrl(\%merged);
-            $byId{$id} = \%merged;
-        }
-        return values %byId;
-    }
-
-
-    sub forceUtf8 {
-        my ($value) = @_;
-        return '' unless defined $value;
-        return $value if ref($value);
-        return $value if is_utf8($value);
-        my $decoded = eval { decode_utf8($value, 1) };
-        return defined($decoded) ? $decoded : $value;
-    }
-
-    sub xmlCdata {
-        my ($value) = @_;
-        $value = forceUtf8($value);
-        $value =~ s/\]\]>/]]]]><![CDATA[>/g;
-        return '<![CDATA[' . $value . ']]>';
-    }
-
-    sub sendXmltvEpgFile {
-        my ($client, $request) = @_;
-        my $region = 'DE';
+sub sendM3uFile {
+    my ($client, $useDirectStreams, $request) = @_;
+    my $region = 'DE';
+    if ($request) {
         my $params = try { HTTP::Request::Params->new({ req => $request })->params };
         $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    }
+    my @channels = getChannelJson($region);
+    unless (@channels) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
+        return;
+    }
+    my $session = getBootFromPluto($region);
+    my $m3uContent = $useDirectStreams ? buildM3uDirect(@channels) : buildM3uLegacy($session, @channels);
+    my $response = HTTP::Response->new();
+    $response->header("content-type", "audio/x-mpegurl; charset=utf-8");
+    $response->header("content-disposition", "filename=\"plutotv.m3u8\"");
+    $response->code(200);
+    $response->message("OK");
+    $response->content(encode_utf8($m3uContent));
+    $client->send_response($response);
+}
 
-        my @channels = getChannelJson($region);
-        unless (@channels) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
-            return;
-        }
+sub sendDirectStream {
+    my ($client, $request) = @_;
+    my $path = $request->uri->path;
+    my ($channelId) = $path =~ m{/stream/([^/]+)\.m3u8$};
+    unless ($channelId) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid stream path");
+        return;
+    }
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
-        my @guideChannels = getGuideChannelJson($region);
-        @channels = mergeChannelsWithGuide(\@channels, \@guideChannels) if @guideChannels;
-
-        my $langcode = "de";
-        my $epg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<tv>\n";
-        for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
-            next unless ($channel->{number} || 0) > 0;
-            my $channelName = forceUtf8($channel->{name} || "");
-            my $channelId = uri_escape_utf8($channelName);
-            $epg .= "<channel id=\"$channelId\">\n";
-            $epg .= "<display-name lang=\"$langcode\"><![CDATA[$channelName]]></display-name>\n";
-            if (my $logoPath = $channel->{logo_url}) {
-                $logoPath = substr($logoPath, 0, index($logoPath, "?")) if index($logoPath, "?") >= 0;
-                $epg .= "<icon src=\"$logoPath\" />\n";
-            }
-            $epg .= "</channel>\n";
-        }
-
-        for my $channel (sort { ($a->{number} || 0) <=> ($b->{number} || 0) } @channels) {
-            next unless ($channel->{number} || 0) > 0;
-            my $channelId = uri_escape_utf8(forceUtf8($channel->{name} || ""));
-            for my $programme (@{ $channel->{timelines} || [] }) {
-                my $start = xmltvTimestampFromIso($programme->{start});
-                my $stop  = xmltvTimestampFromIso($programme->{stop});
-                next unless $start && $stop;
-
-                my $episode = $programme->{episode} || {};
-                my $title = forceUtf8($programme->{title} || $episode->{name} || $channel->{name} || '');
-                my $subtitle = forceUtf8($episode->{name} || '');
-                my $desc = forceUtf8($episode->{description} || '');
-                my $genre = forceUtf8($episode->{genre} || '');
-                my $rating = forceUtf8($episode->{rating} || '');
-
-                $epg .= "<programme start=\"$start\" stop=\"$stop\" channel=\"$channelId\">\n";
-                $epg .= "<title lang=\"$langcode\"><![CDATA[$title]]></title>\n";
-                $epg .= "<sub-title lang=\"$langcode\"><![CDATA[$subtitle]]></sub-title>\n" if length $subtitle;
-                $epg .= "<desc lang=\"$langcode\"><![CDATA[$desc]]></desc>\n" if length $desc;
-                $epg .= "<category lang=\"$langcode\"><![CDATA[$genre]]></category>\n" if length $genre;
-                if (length $rating) {
-                    $epg .= "<rating><value>" . xmlCdata($rating) . "</value></rating>\n";
-                }
-                $epg .= "</programme>\n";
-            }
-        }
-
-        $epg .= "\n</tv>\n";
-        my $response = HTTP::Response->new();
-        $response->header("content-type", "application/xml; charset=utf-8");
-        $response->header("content-disposition", "filename=\"plutotv-epg.xml\"");
-        $response->code(200);
-        $response->message("OK");
-        $response->content(encode_utf8($epg));
-        $client->send_response($response);
+    my (undef, undef, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, 1);
+    unless ($master && $masterUrl) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
+        return;
     }
 
-    sub sendM3uFile {
-        my ($client, $useDirectStreams, $request) = @_;
-        my $region = 'DE';
-        if ($request) {
-            my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-            $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-        }
-        my @channels = getChannelJson($region);
-        unless (@channels) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Unable to fetch channel list from pluto.tv-api.");
-            return;
-        }
-        my $session = getBootFromPluto($region);
-        my $m3uContent = $useDirectStreams ? buildM3uDirect(@channels) : buildM3uLegacy($session, @channels);
-        my $response = HTTP::Response->new();
-        $response->header("content-type", "audio/x-mpegurl; charset=utf-8");
-        $response->header("content-disposition", "filename=\"plutotv.m3u8\"");
-        $response->code(200);
-        $response->message("OK");
-        $response->content(encode_utf8($m3uContent));
-        $client->send_response($response);
+    my $dynamicPlaylist = createDynamicPlaylist($master, $channelId, $masterUrl);
+    my $response = HTTP::Response->new();
+    $response->code(200);
+    $response->message("OK");
+    $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+    $response->header("cache-control", "no-cache, no-store, must-revalidate");
+    $response->header("pragma", "no-cache");
+    $response->header("expires", "0");
+    $response->content(encode_utf8($dynamicPlaylist));
+    $client->send_response($response);
+}
+sub sendPlaylistProxy {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $src = $params && $params->{src} ? $params->{src} : undef;
+    unless ($src) {
+        $client->send_error(RC_BAD_REQUEST, "Missing src parameter");
+        return;
     }
-
-    sub sendDirectStream {
-        my ($client, $request) = @_;
-        my $path = $request->uri->path;
-        my ($channelId) = $path =~ m{/stream/([^/]+)\.m3u8$};
-        unless ($channelId) {
-            $client->send_error(RC_BAD_REQUEST, "Invalid stream path");
-            return;
-        }
-        my $region = 'DE';
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-
-        my (undef, undef, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, 1);
-        unless ($master && $masterUrl) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
-            return;
-        }
-
-        my $dynamicPlaylist = createDynamicPlaylist($master, $channelId, $masterUrl);
-        my $response = HTTP::Response->new();
-        $response->code(200);
-        $response->message("OK");
-        $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
-        $response->header("cache-control", "no-cache, no-store, must-revalidate");
-        $response->header("pragma", "no-cache");
-        $response->header("expires", "0");
-        $response->content(encode_utf8($dynamicPlaylist));
-        $client->send_response($response);
+    my $content = getFromUrl($src);
+    unless ($content) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch proxied playlist");
+        return;
     }
-    sub sendPlaylistProxy {
-        my ($client, $request) = @_;
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        my $src = $params && $params->{src} ? $params->{src} : undef;
-        unless ($src) {
-            $client->send_error(RC_BAD_REQUEST, "Missing src parameter");
-            return;
-        }
-        my $content = getFromUrl($src);
-        unless ($content) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch proxied playlist");
-            return;
-        }
-        my $rewritten = rewriteManifestForClient($content, $src);
-        my $response = HTTP::Response->new();
-        $response->code(200);
-        $response->message("OK");
-        $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
-        $response->header("cache-control", "no-cache, no-store, must-revalidate");
-        $response->header("pragma", "no-cache");
-        $response->header("expires", "0");
-        $response->content(encode_utf8($rewritten));
-        $client->send_response($response);
-    }
+    my $rewritten = rewriteManifestForClient($content, $src);
+    my $response = HTTP::Response->new();
+    $response->code(200);
+    $response->message("OK");
+    $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+    $response->header("cache-control", "no-cache, no-store, must-revalidate");
+    $response->header("pragma", "no-cache");
+    $response->header("expires", "0");
+    $response->content(encode_utf8($rewritten));
+    $client->send_response($response);
+}
 
-    sub createDynamicPlaylist {
-        my ($masterPlaylist, $channelId, $baseUrl) = @_;
-        my $injectDiscontinuity = consumeForcedDiscontinuity($channelId);
-        my @lines = split /\r?\n/, $masterPlaylist;
-        my $bestStreamUrl;
-        my $bestBandwidth = 0;
-        for my $i (0 .. $#lines) {
-            my $line = $lines[$i];
-            if ($line =~ /^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/i) {
-                my $bandwidth = $1;
-                if ($bandwidth > $bestBandwidth && $i + 1 <= $#lines) {
-                    my $urlLine = $lines[$i + 1];
-                    if ($urlLine && $urlLine !~ /^#/) {
-                        $bestBandwidth = $bandwidth;
-                        $bestStreamUrl = $urlLine;
-                    }
+sub createDynamicPlaylist {
+    my ($masterPlaylist, $channelId, $baseUrl) = @_;
+    my $injectDiscontinuity = consumeForcedDiscontinuity($channelId);
+    my @lines = split /\r?\n/, $masterPlaylist;
+    my $bestStreamUrl;
+    my $bestBandwidth = 0;
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/i) {
+            my $bandwidth = $1;
+            if ($bandwidth > $bestBandwidth && $i + 1 <= $#lines) {
+                my $urlLine = $lines[$i + 1];
+                if ($urlLine && $urlLine !~ /^#/) {
+                    $bestBandwidth = $bandwidth;
+                    $bestStreamUrl = $urlLine;
                 }
             }
         }
-        return $masterPlaylist unless $bestStreamUrl;
-        unless ($bestStreamUrl =~ /^https?:\/\//) {
-            $bestStreamUrl = resolvePlaylistUrlPreserveQuery($baseUrl, $bestStreamUrl);
+    }
+    return $masterPlaylist unless $bestStreamUrl;
+    unless ($bestStreamUrl =~ /^https?:\/\//) {
+        $bestStreamUrl = resolvePlaylistUrlPreserveQuery($baseUrl, $bestStreamUrl);
+    }
+    my $dynamicPlaylist = "#EXTM3U\n";
+    $dynamicPlaylist .= "#EXT-X-VERSION:3\n";
+    $dynamicPlaylist .= "#EXT-X-TARGETDURATION:10\n";
+    $dynamicPlaylist .= "#EXT-X-MEDIA-SEQUENCE:0\n";
+    $dynamicPlaylist .= "#EXT-X-PLAYLIST-TYPE:EVENT\n";
+    $dynamicPlaylist .= "#EXT-X-DISCONTINUITY\n" if $injectDiscontinuity;
+    $dynamicPlaylist .= "#EXTINF:86400.0,\n";
+    $dynamicPlaylist .= "http://$hostIp:$port/dynamic_stream/$channelId.ts\n";
+    $dynamicPlaylist .= "#EXT-X-ENDLIST\n";
+    return $dynamicPlaylist;
+}
+
+# ── Hardware encoder detection ────────────────────────────────────────────────
+# ── RPi4 hardware encoder detection ──────────────────────────────────────────
+sub detectHwEncoder {
+    return 'libx264' unless $ffmpeg;
+    my $out = '';
+    if (open(my $fh, '-|', $ffmpeg, '-hide_banner', '-encoders', '2>/dev/null')) {
+        while (<$fh>) { $out .= $_; }
+        close $fh;
+    }
+    return ($out =~ /h264_v4l2m2m/) ? 'h264_v4l2m2m' : 'libx264';
+}
+
+# Return '/dev/shm' if it exists (RPi RAM disk), else '/tmp'
+sub shmBase { return (-d '/dev/shm') ? '/dev/shm' : '/tmp'; }
+
+# ── Fetch one segment, decrypt AES-128-CBC if needed, return raw bytes ────────
+# $keyCache: hashref {keyUri => hexKey} to avoid re-fetching the same key
+sub fetchDecryptSegment {
+    my ($ua, $segment, $keyCache) = @_;
+    $keyCache //= {};
+
+    my $res = $ua->get($segment->{url});
+    unless ($res && $res->is_success) {
+        printf("fetchDecrypt: segment fetch failed: %s\n", $segment->{url}) if $debug;
+        return undef;
+    }
+    my $data = $res->content;
+
+    if (($segment->{method} || 'NONE') eq 'AES-128' && ($segment->{keyUri} || '') ne '') {
+        my $hexKey = $keyCache->{$segment->{keyUri}};
+        unless ($hexKey) {
+            my $kr = $ua->get($segment->{keyUri});
+            unless ($kr && $kr->is_success && length($kr->content) == 16) {
+                printf("fetchDecrypt: key fetch failed: %s\n", $segment->{keyUri}) if $debug;
+                return undef;
+            }
+            $hexKey = unpack('H*', $kr->content);
+            $keyCache->{$segment->{keyUri}} = $hexKey;
         }
-        my $dynamicPlaylist = "#EXTM3U\n";
-        $dynamicPlaylist .= "#EXT-X-VERSION:3\n";
-        $dynamicPlaylist .= "#EXT-X-TARGETDURATION:10\n";
-        $dynamicPlaylist .= "#EXT-X-MEDIA-SEQUENCE:0\n";
-        $dynamicPlaylist .= "#EXT-X-PLAYLIST-TYPE:EVENT\n";
-        $dynamicPlaylist .= "#EXT-X-DISCONTINUITY\n" if $injectDiscontinuity;
-        $dynamicPlaylist .= "#EXTINF:86400.0,\n";
-        $dynamicPlaylist .= "http://$hostIp:$port/dynamic_stream/$channelId.ts\n";
-        $dynamicPlaylist .= "#EXT-X-ENDLIST\n";
-        return $dynamicPlaylist;
-    }
-
-    sub buildLocalChildStreamUrl {
-        my ($channelId, $region, $kind) = @_;
-        my $path = ($kind && $kind eq 'audio') ? 'dynamic_audio_stream' : 'dynamic_video_stream';
-        my $url = 'http://' . $hostIp . ':' . $port . '/' . $path . '/' . $channelId . '.ts';
-        $url .= '?region=' . uri_escape_utf8($region) if defined $region && length $region;
-        return $url;
-    }
-
-    sub streamPlaylistToHandle {
-        my ($fh, $channelId, $region, $playlistUrl, $kind) = @_;
-        $region ||= 'DE';
-        my $ua = createUserAgent();
-        my %processedSegments = ();
-        my %processedMaps = ();
-        my $runningNumber = 1;
-        my $lastRefreshAt = $playlistUrl ? time() : 0;
-        my $consecutiveFailures = 0;
-
-        while (1) {
-            if (!$playlistUrl || (time() - $lastRefreshAt) >= $sessionRefreshInterval) {
-                my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
-                my $refreshedPlaylistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
-                if ($refreshedPlaylistUrl) {
-                    $playlistUrl = $refreshedPlaylistUrl;
-                    $lastRefreshAt = time();
-                    if ($debug) {
-                        printf("Refreshed %s session/playlist for %s\n", ($kind || 'video'), $channelId);
-                    }
-                }
-            }
-
-            my $playlistResponse = getResponseFromUrl($playlistUrl, ua => $ua);
-            my $playlistContent = $playlistResponse && $playlistResponse->is_success
-                ? $playlistResponse->decoded_content
-                : undef;
-            unless ($playlistContent) {
-                $consecutiveFailures++;
-                if ($debug) {
-                    my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
-                    printf("Failed to fetch %s playlist for %s (attempt %d): %s\nURL: %s\n", ($kind || 'video'), $channelId, $consecutiveFailures, $status, ($playlistUrl || ''));
-                }
-                my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region, 1);
-                my $refreshedPlaylistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
-                $playlistUrl = $refreshedPlaylistUrl if $refreshedPlaylistUrl;
-                last if $consecutiveFailures >= 5;
-                sleep(1);
-                next;
-            }
-            $consecutiveFailures = 0;
-
-            my $playlistInfo = parsePlaylistInfo($playlistContent);
-            my @allSegments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$runningNumber);
-            my @newSegments = filterNewSegments(\@allSegments, \%processedSegments);
-            if ($debug && @allSegments == 0) {
-                printf("No %s segments found for %s
-Playlist URL: %s
-", ($kind || 'video'), $channelId, ($playlistUrl || ''));
-            }
-            if (@newSegments == 0) {
-                sleep(1);
-                next;
-            }
-            if ($debug) {
-                printf("Processing %d new %s segments for channel %s\n", scalar(@newSegments), ($kind || 'video'), $channelId);
-            }
-            my $streamOk = 1;
-            for my $segment (@newSegments) {
-                my $success = streamSegment($fh, $ua, $segment, $channelId . '-' . ($kind || 'video'), \%processedMaps);
-                unless ($success) {
-                    if ($segment->{isDiscontinuity}) {
-                        if ($debug) {
-                            printf("Failed to stream %s discontinuity segment, refreshing playlist for %s\n", ($kind || 'video'), $channelId);
-                        }
-                        $lastRefreshAt = 0;
-                        next;
-                    }
-                    $streamOk = 0;
-                    if ($debug) {
-                        printf("Failed to stream %s segment, ending stream for %s\n", ($kind || 'video'), $channelId);
-                    }
-                    last;
-                }
-                $processedSegments{$segment->{url}} = time();
-                $processedMaps{$segment->{mapUrl}} = 1 if $segment->{mapUrl};
-            }
-            last unless $streamOk;
-            cleanupOldSegments(\%processedSegments);
-            sleep(2);
-        }
-
-        return 1;
-    }
-
-    sub streamMuxedFromLocalChildStreams {
-        my ($client, $channelId, $region, $videoUrl, $audioUrl, $headersSentRef, $activeStreamKey, $request) = @_;
-        return 0 unless $ffmpeg;
-        return 0 unless $videoUrl && $audioUrl;
-
-        if (!$headersSentRef || !$$headersSentRef) {
-            eval {
-                $client->write("HTTP/1.1 200 OK
-");
-                $client->write("Content-Type: video/mp2t
-");
-                $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-                $client->write("Connection: close
-");
-                $client->write("
-");
+        my $iv = $segment->{iv} || sprintf('%032x', $segment->{sequence} || 0);
+        if (which('openssl')) {
+            my ($out, $err) = ('', '');
+            my $ok = eval {
+                run(
+                    ['openssl', 'enc', '-d', '-aes-128-cbc', '-K', $hexKey, '-iv', $iv],
+                    '<', \$data, '>', \$out, '2>', \$err
+                ); 1;
             };
-            if ($@) {
-                printf("Failed to send headers - client disconnected: %s
-", $@);
-                return 0;
+            unless ($ok && length($out)) {
+                printf("fetchDecrypt: openssl failed: %s\n", $err) if $debug;
+                return undef;
             }
-            $$headersSentRef = 1 if $headersSentRef;
-        }
-
-        my $maxFailures = 5;
-        my $failures = 0;
-
-        while ($failures < $maxFailures) {
-            updateActiveStream($activeStreamKey, mode => 'copy', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
-
-            if ($failures > 0) {
-                if ($debug) {
-                    printf("Restarting mux for %s (attempt %d/%d)
-", $channelId, $failures + 1, $maxFailures);
-                }
-                sleep(2);
-                my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
-                $videoUrl = $freshVideo if $freshVideo;
-                $audioUrl = $freshAudio if $freshAudio;
-            }
-
-            my $tmpdir = tempdir('plutotv-mux-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-            my $videoFifo = "$tmpdir/video.ts";
-            my $audioFifo = "$tmpdir/audio.ts";
-
-            unless (mkfifo($videoFifo, 0700)) { warn "Failed to create video fifo: $!
-"; $failures++; next; }
-            unless (mkfifo($audioFifo, 0700)) { warn "Failed to create audio fifo: $!
-"; unlink $videoFifo; $failures++; next; }
-
-            if ($debug) { printf("Muxing separate video/audio for %s using FIFOs
-", $channelId); }
-
-            my @children;
-            for my $spec (
-                { kind => 'video', fifo => $videoFifo, url => $videoUrl },
-                { kind => 'audio', fifo => $audioFifo, url => $audioUrl },
-            ) {
-                my $pid = fork();
-                if (!defined $pid) { warn "Failed to fork $spec->{kind} worker: $!
-"; next; }
-                if ($pid == 0) {
-                    local $SIG{PIPE} = 'DEFAULT';
-                    open(my $fh, '>', $spec->{fifo}) or do { warn "Failed to open $spec->{kind} fifo for writing: $!
-"; exit(1); };
-                    binmode($fh);
-                    eval { streamPlaylistToHandle($fh, $channelId, $region, $spec->{url}, $spec->{kind}); };
-                    close($fh);
-                    exit(0);
-                }
-                push @children, $pid;
-            }
-
-            my @cmd = (
-                $ffmpeg, '-loglevel', 'error', '-nostdin',
-                '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
-                '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
-                '-map', '0:v:0', '-map', '1:a:0',
-                '-c', 'copy',
-                '-muxdelay', '0', '-muxpreload', '0',
-                '-mpegts_flags', '+resend_headers',
-                '-avoid_negative_ts', 'make_zero',
-                '-max_interleave_delta', '1000000',
-                '-flush_packets', '1',
-                '-f', 'mpegts', 'pipe:1'
+            $data = $out;
+        } else {
+            my $cipher = Crypt::CBC->new(
+                -key     => pack('H*', $hexKey),
+                -cipher  => 'Rijndael',
+                -iv      => pack('H*', $iv),
+                -header  => 'none',
+                -padding => 'standard',
             );
+            $data = $cipher->decrypt($data);
+        }
+    }
+    return $data;
+}
 
-            my $ffh;
-            my $ffpid = open($ffh, '-|', @cmd);
-            unless ($ffpid) {
-                warn "Failed to start ffmpeg for muxing: $!
-";
-                for my $pid (@children) { kill 'TERM', $pid if $pid; }
-                unlink $videoFifo; unlink $audioFifo;
-                $failures++; next;
+# ── Download + decrypt a batch of segments into $batchDir (RAM disk) ──────────
+# Returns list of local file paths, or empty list on hard failure.
+sub prepareSegmentBatch {
+    my ($ua, $segsRef, $batchDir, $keyCache) = @_;
+    my @segs = @{$segsRef || []};
+    return () unless @segs;
+
+    mkdir $batchDir unless -d $batchDir;
+
+    my %savedMaps;   # mapUrl => local path
+    my @localPaths;
+
+    for my $i (0 .. $#segs) {
+        my $seg  = $segs[$i];
+        my $base = sprintf('%s/seg%04d.ts', $batchDir, $i);
+
+        # Save init segment (fmp4 MAP) once per unique mapUrl
+        if ($seg->{mapUrl} && !$savedMaps{$seg->{mapUrl}}) {
+            my $mapData;
+            if ($seg->{mapUrl} =~ m{^data:}i) {
+                $mapData = decodeDataUri($seg->{mapUrl});
+            } else {
+                my $mr = $ua->get($seg->{mapUrl});
+                $mapData = ($mr && $mr->is_success) ? $mr->content : undef;
             }
-            binmode($ffh);
-
-            my $client_alive = 1;
-            my $mode_switch_requested = 0;
-            my $buffer = '';
-            while (1) {
-                if (desiredModeByOverride($channelId, $request) eq 'harmonize') {
-                    $mode_switch_requested = 1;
-                    last;
+            if (defined $mapData) {
+                my $mapPath = "$batchDir/init_$i.mp4";
+                if (open(my $fh, '>', $mapPath)) {
+                    binmode $fh; print $fh $mapData; close $fh;
+                    $savedMaps{$seg->{mapUrl}} = $mapPath;
                 }
-                my $read = sysread($ffh, $buffer, 1316);
-                last unless defined $read && $read > 0;
-                my $ok = eval { $client->write($buffer); 1 };
-                unless ($ok) { $client_alive = 0; last; }
             }
-
-            if ($mode_switch_requested) {
-                appendRecentLog('Live-Umschaltung auf harmonize: ' . $channelId);
-                kill 'TERM', $ffpid if $ffpid;
-            }
-            close($ffh);
-
-            for my $pid (@children) {
-                kill 'TERM', $pid if $pid;
-                waitpid($pid, 0);
-            }
-            unlink $videoFifo if -p $videoFifo || -e $videoFifo;
-            unlink $audioFifo if -p $audioFifo || -e $audioFifo;
-
-            return 'switch' if $mode_switch_requested;
-            last unless $client_alive;
-            $failures++;
         }
 
-        return 1;
-    }
-
-    sub sendElementaryDynamicStream {
-        my ($client, $request, $kind) = @_;
-        my $path = $request->uri->path;
-        my ($channelId) = $path =~ m{/dynamic_(?:video|audio)_stream/([^/]+)\.ts$};
-        unless ($channelId) {
-            $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
-            return;
+        my $data = fetchDecryptSegment($ua, $seg, $keyCache);
+        unless (defined $data) {
+            printf("prepareSegmentBatch: failed segment %d, skipping batch\n", $i) if $debug;
+            # Clean up partial batch
+            unlink $_ for glob("$batchDir/*");
+            rmdir $batchDir;
+            return ();
         }
-        my $region = 'DE';
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
-        my (undef, undef, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
-        my $playlistUrl = ($kind && $kind eq 'audio') ? $audioUrl : $videoUrl;
-        unless ($playlistUrl) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
-            return;
-        }
-        streamWithDiscontinuityRestart($client, $channelId . '-' . ($kind || 'video'), $region, $playlistUrl);
-    }
-
-    sub collectPlaylistWindows {
-        my ($playlistContent, $playlistUrl) = @_;
-        my $playlistInfo = parsePlaylistInfo($playlistContent);
-        my $running = 1;
-        my @segments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$running);
-        my @windows;
-        my @current;
-        my $windowIndex = 0;
-
-        my $pushWindow = sub {
-            my ($segmentsRef, $startsAfterDiscontinuity) = @_;
-            return unless $segmentsRef && ref($segmentsRef) eq 'ARRAY' && @$segmentsRef;
-            my $startSeq = $segmentsRef->[0]->{sequence};
-            my $endSeq   = $segmentsRef->[-1]->{sequence};
-            my $signature = join('|', defined $startSeq ? $startSeq : '', defined $endSeq ? $endSeq : '', scalar(@$segmentsRef), ($segmentsRef->[0]->{url}||''), ($segmentsRef->[-1]->{url}||''));
-            push @windows, {
-                id => $windowIndex++, signature => $signature, segments => [ @$segmentsRef ],
-                startsAfterDiscontinuity => $startsAfterDiscontinuity ? 1 : 0,
-            };
-        };
-
-        for my $segment (@segments) {
-            if ($segment->{isDiscontinuity} && @current) {
-                $pushWindow->(\@current, ($windowIndex > 0 ? 1 : 0));
-                @current = ();
-            }
-            push @current, $segment;
-        }
-        $pushWindow->(\@current, ($windowIndex > 0 && @windows ? 1 : 0)) if @current;
-        return \@windows;
-    }
-
-    sub findMatchingWindow {
-        my ($windows, $processedWindowSignatures) = @_;
-        return undef unless $windows && ref($windows) eq 'ARRAY';
-        for my $window (@$windows) {
-            next unless $window && ref($window) eq 'HASH';
-            next unless ref($window->{segments}) eq 'ARRAY' && @{ $window->{segments} };
-            my $signature = $window->{signature} || '';
-            next if length($signature) && $processedWindowSignatures->{$signature};
-            return $window;
-        }
-        return undef;
-    }
-
-    sub decryptSegmentPayloadWithOpenSSL {
-        my ($ua, $segment, $encrypted) = @_;
-        return $encrypted unless (($segment->{keyUri} || '') ne '' && ($segment->{method} || 'NONE') eq 'AES-128');
-        return undef unless which('openssl');
-        my $keyRes = $ua->get($segment->{keyUri});
-        return undef unless $keyRes->is_success;
-        my $encryptionKey = $keyRes->content;
-        return undef unless length($encryptionKey) == 16;
-        my $iv = $segment->{iv};
-        $iv = sprintf('%032x', $segment->{sequence} || 0) unless defined $iv && length $iv;
-        my $hexKey = unpack('H*', $encryptionKey);
-        my $decrypted = '';
-        my $stderr = '';
-        my $ok = eval {
-            run(["openssl","aes-128-cbc","-d","-in","-","-out","-","-K",$hexKey,"-iv",$iv], '<', \$encrypted, '>', \$decrypted, '2>', \$stderr);
-            1;
-        };
-        if (!$ok || !defined $decrypted || !length $decrypted) {
-            appendRecentLog('OpenSSL decrypt failed: ' . ($segment->{url}||'') . (length($stderr) ? ' | ' . $stderr : ''));
-            return undef;
-        }
-        return $decrypted;
-    }
-
-    sub fetchSegmentMaterializedPayload {
-        my ($ua, $segment) = @_;
-        my $res = $ua->get($segment->{url});
-        return undef unless $res->is_success;
-        my $payload = $res->content;
-        if (($segment->{keyUri} || '') ne '' && ($segment->{method} || 'NONE') eq 'AES-128') {
-            $payload = decryptSegmentPayloadWithOpenSSL($ua, $segment, $payload);
-            return undef unless defined $payload;
-        }
-        return $payload;
-    }
-
-    sub materializeWindowSegments {
-        my (%args) = @_;
-        my $ua = $args{ua} or return;
-        my $segments = $args{segments} or return;
-        my $dir = $args{dir} or return;
-        my $prefix = $args{prefix} || 'video';
-        my $playlistPath = $args{playlistPath} or return;
-        return 0 unless @$segments;
-        my $targetDuration = 1;
-        my %mapFiles;
-        my @entries;
-        my $segIndex = 0;
-        for my $segment (@$segments) {
-            if ($segment->{mapUrl} && !exists $mapFiles{$segment->{mapUrl}}) {
-                my $mapPayload;
-                if ($segment->{mapUrl} =~ m{^data:}i) {
-                    $mapPayload = decodeDataUri($segment->{mapUrl});
-                } else {
-                    my $mapRes = $ua->get($segment->{mapUrl});
-                    return 0 unless $mapRes->is_success;
-                    $mapPayload = $mapRes->content;
-                }
-                return 0 unless defined $mapPayload;
-                my $mapFile = sprintf('%s/%s_init_%03d.bin', $dir, $prefix, scalar(keys %mapFiles));
-                open(my $mfh, '>:raw', $mapFile) or return 0;
-                print {$mfh} $mapPayload;
-                close($mfh);
-                $mapFiles{$segment->{mapUrl}} = $mapFile;
-            }
-            my $payload = fetchSegmentMaterializedPayload($ua, $segment);
-            return 0 unless defined $payload;
-            my $ext = (($segment->{container} || 'ts') eq 'fmp4') ? 'm4s' : 'ts';
-            my $segFile = sprintf('%s/%s_%05d.%s', $dir, $prefix, $segIndex, $ext);
-            open(my $sfh, '>:raw', $segFile) or return 0;
-            print {$sfh} $payload;
-            close($sfh);
-            push @entries, {
-                duration => ($segment->{duration} || 1),
-                file => $segFile,
-                mapFile => ($segment->{mapUrl} ? $mapFiles{$segment->{mapUrl}} : undef)
-            };
-            my $rounded = int(($segment->{duration} || 1) + 0.999999);
-            $targetDuration = $rounded if $rounded > $targetDuration;
-            $segIndex++;
-        }
-        open(my $fh, '>:utf8', $playlistPath) or return 0;
-        print {$fh} "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:$targetDuration\n";
-        my $lastMap = '';
-        for my $entry (@entries) {
-            if (($entry->{mapFile} || '') ne $lastMap && $entry->{mapFile}) {
-                print {$fh} '#EXT-X-MAP:URI="file://' . $entry->{mapFile} . '"' . "\n";
-                $lastMap = $entry->{mapFile};
-            }
-            print {$fh} '#EXTINF:' . $entry->{duration} . ",\n";
-            print {$fh} 'file://' . $entry->{file} . "\n";
-        }
-        print {$fh} "#EXT-X-ENDLIST\n";
-        close($fh);
-        return 1;
-    }
-
-    sub buildReencodeFfmpegCommand {
-        my (%args) = @_;
-        my $encoder       = $args{encoder}       || 'libx264';
-        my $videoPlaylist = $args{videoPlaylist} or return;
-        my $audioPlaylist = $args{audioPlaylist};
-        my $channelName   = $args{channelName}   || 'PlutoTV';
-        my $hasAudio      = $args{hasAudio} ? 1 : 0;
-
-        my @cmd = (
-            $ffmpeg, '-loglevel', 'warning', '-nostdin',
-            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-            '-fflags', '+genpts+discardcorrupt',
-            '-i', $videoPlaylist,
-        );
-        if ($hasAudio) {
-            push @cmd,
-                '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-                '-fflags', '+genpts+discardcorrupt',
-                '-i', $audioPlaylist,
-                '-map', '0:v:0', '-map', '1:a:0?';
+        if (open(my $fh, '>', $base)) {
+            binmode $fh; print $fh $data; close $fh;
+            push @localPaths, { path => $base,
+                duration => $seg->{duration} || 10,
+                mapPath  => $savedMaps{$seg->{mapUrl}} || '' };
         } else {
-            push @cmd, '-map', '0:v:0', '-map', '0:a:0?';
+            printf("prepareSegmentBatch: write failed: %s\n", $!) if $debug;
+            unlink $_ for glob("$batchDir/*");
+            rmdir $batchDir;
+            return ();
         }
-        push @cmd, '-vf', 'scale=1280:720,format=nv12', '-c:v', $encoder;
-        if ($encoder eq 'h264_v4l2m2m') {
-            push @cmd, '-num_capture_buffers','16','-num_output_buffers','16','-b:v','4M','-maxrate','4M','-bufsize','8M','-bf','0','-g','50';
-        } else {
-            push @cmd, '-preset','veryfast','-tune','zerolatency','-profile:v','high','-bf','0','-g','50','-b:v','4M','-maxrate','4M','-bufsize','8M';
+    }
+    return @localPaths;
+}
+
+# ── Write a finite HLS playlist for local (decrypted) segment files ───────────
+sub writeBatchM3u8 {
+    my ($m3uPath, $localPathsRef) = @_;
+    my @paths = @{$localPathsRef || []};
+    return 0 unless @paths;
+
+    my $maxDur = 0;
+    for my $p (@paths) { $maxDur = $p->{duration} if $p->{duration} > $maxDur; }
+    $maxDur = int($maxDur + 1); $maxDur ||= 12;
+
+    my $m3u  = "#EXTM3U\n#EXT-X-VERSION:3\n";
+    $m3u    .= "#EXT-X-TARGETDURATION:$maxDur\n";
+    $m3u    .= "#EXT-X-MEDIA-SEQUENCE:0\n";
+
+    my $lastMap = '';
+    for my $p (@paths) {
+        if (($p->{mapPath} || '') ne $lastMap && $p->{mapPath}) {
+            $m3u .= "#EXT-X-MAP:URI=\"$p->{mapPath}\"\n";
+            $lastMap = $p->{mapPath};
         }
+        $m3u .= sprintf("#EXTINF:%.4f,\n%s\n", $p->{duration}, $p->{path});
+    }
+    $m3u .= "#EXT-X-ENDLIST\n";
+
+    open(my $fh, '>', $m3uPath) or return 0;
+    print $fh $m3u;
+    close $fh;
+    return 1;
+}
+
+# ── Build the ffmpeg encoding command ─────────────────────────────────────────
+sub buildFfmpegCmd {
+    my ($m3uPath, $encoder) = @_;
+    my @cmd = (
+        $ffmpeg, '-v', 'fatal', '-nostdin',
+        '-allowed_extensions', 'ALL',
+        '-protocol_whitelist', 'file,pipe,crypto',
+        '-fflags', '+genpts+discardcorrupt',
+        '-i', $m3uPath,
+        '-map', '0:v:0', '-map', '0:a:0?',  # '?' = no-abort if audio absent
+    );
+    if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
-            '-c:a','aac','-ar','48000','-b:a','160k','-ac','2',
-            '-muxdelay','0','-muxpreload','0','-mpegts_flags','+resend_headers',
-            '-avoid_negative_ts','make_zero','-flush_packets','1',
-            '-metadata','service_provider=PlutoTV',
-            '-metadata','service_name=' . $channelName,
-            '-f','mpegts','pipe:1';
-        return @cmd;
+            '-c:v',              'h264_v4l2m2m',
+            '-vf',               'format=nv12,scale=1280:720',  # NV12 is mandatory for RPi4 hw encoder
+            '-num_capture_buffers', '16',
+            '-num_output_buffers',  '16',
+            '-b:v',              '4M',
+            '-maxrate',          '4M',
+            '-bufsize',          '8M';
+    } else {
+        push @cmd,
+            '-c:v',     'libx264',
+            '-preset',  'fast',
+            '-crf',     '23',
+            '-vf',      'scale=1280:720';
+    }
+    push @cmd,
+        '-c:a',              'aac',
+        '-ar',               '48000',
+        '-b:a',              '128k',
+        '-avoid_negative_ts', 'make_zero',
+        '-f',                'mpegts',
+        'pipe:1';
+    return @cmd;
+}
+
+# ── Harmonized transcode pipeline ─────────────────────────────────────────────
+# Masterplan:
+#  1. Poll PlutoTV m3u8
+#  2. Download + decrypt each segment to /dev/shm/ (or /tmp)
+#  3. Write local m3u8 for each batch (up to next DISCONTINUITY)
+#  4. Run ffmpeg (HW encoder if available) on local m3u8
+#  5. Wait for previous ffmpeg to fully drain before starting next (sequential stitching)
+#  6. Apply correctMpegTsTimestamps to ffmpeg output
+#  7. Stream corrected bytes to tvheadend
+sub streamHarmonized {
+    my ($client, $channelId, $region, $videoUrl, $channelName, $headersSentRef, $activeStreamKey) = @_;
+    return 0 unless $ffmpeg && $videoUrl;
+
+    if (!$headersSentRef || !$$headersSentRef) {
+        eval {
+            $client->write("HTTP/1.1 200 OK\n");
+            $client->write("Content-Type: video/mp2t\n");
+            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+            $client->write("Connection: close\n\n");
+        };
+        if ($@) {
+            printf("streamHarmonized: header write failed: %s\n", $@) if $debug;
+            return 0;
+        }
+        $$headersSentRef = 1 if $headersSentRef;
     }
 
-    sub streamReencodedWindow {
-        my (%args) = @_;
-        my $client = $args{client} or return 0;
-        my $channelId = $args{channelId} || 'unknown';
-        my $channelName = $args{channelName} || $channelId;
-        my $window = $args{window} or return 0;
-        my $headersSentRef = $args{headersSentRef};
-        my $request = $args{request};
-        my $ua = $args{ua} || createUserAgent();
+    my $encoder        = detectHwEncoder();
+    my $maxFailures    = int(getConfigValue('max_failures',  5));
+    my $stallTimeout   = int(getConfigValue('stall_timeout', 30));
+    my $startupTimeout = ($stallTimeout >= 30) ? $stallTimeout : 30;  # RPi4 hw driver needs time
+    my $ua             = createUserAgent();
+    my %keyCache;
+    my %processed;
+    my $lastRefreshAt  = 0;
+    my $batchNum       = 0;
+    my $failures       = 0;
+    my $clientAlive    = 1;
+    my @pendingSegs;   # segments carried over from after a DISCONTINUITY
 
-        my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-        my $videoPlaylist = "$tmpdir/video.m3u8";
-        my $audioPlaylist = "$tmpdir/audio.m3u8";
+    printf("streamHarmonized: channel=%s encoder=%s startup_timeout=%ds\n",
+        $channelId, $encoder, $startupTimeout) if $debug;
 
-        materializeWindowSegments(ua=>$ua, segments=>$window->{videoSegments}, dir=>$tmpdir, prefix=>'video', playlistPath=>$videoPlaylist) or return 0;
-        my $hasAudio = $window->{audioSegments} && ref($window->{audioSegments}) eq 'ARRAY' && @{ $window->{audioSegments} };
-        materializeWindowSegments(ua=>$ua, segments=>$window->{audioSegments}, dir=>$tmpdir, prefix=>'audio', playlistPath=>$audioPlaylist) if $hasAudio;
+    while ($clientAlive && $failures < $maxFailures) {
 
-        appendRecentLog('Lokales Harmonize-Fenster erstellt: ' . $channelId . ' seg=' . scalar(@{ $window->{videoSegments} || [] }));
-
-        if (!$headersSentRef || !$$headersSentRef) {
-            eval {
-                $client->write("HTTP/1.1 200 OK\n");
-                $client->write("Content-Type: video/mp2t\n");
-                $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
-                $client->write("Connection: close\n\n");
-            };
-            return 0 if $@;
-            $$headersSentRef = 1 if $headersSentRef;
+        # Periodically refresh the playlist URL (session token expiry)
+        if ((time() - $lastRefreshAt) >= $sessionRefreshInterval) {
+            my (undef, undef, undef, undef, $fresh) = getPlaybackUrlsForChannel($channelId, $region, 1);
+            if ($fresh) { $videoUrl = $fresh; $lastRefreshAt = time(); }
         }
 
-        my $encoder = selectH264Encoder();
-        my @cmd = buildReencodeFfmpegCommand(
-            encoder=>$encoder,
-            videoPlaylist=>$videoPlaylist,
-            audioPlaylist=>$audioPlaylist,
-            hasAudio=>$hasAudio,
-            channelName=>$channelName,
-        );
-        my $ffh;
-        my $ffpid = open($ffh, '-|', @cmd);
-        return 0 unless $ffpid;
-        binmode($ffh);
-        my $client_alive = 1;
-        my $buffer = '';
-        my $sel = IO::Select->new($ffh);
-        my $last_output_at = time();
-        my $stall_timeout = int(getConfigValue('stall_timeout', 15));
-        my $startup_timeout = int(getConfigValue('startup_timeout', 30));
-        my $firstChunk = 1;
-        my $has_output = 0;
-        while (1) {
-            my $desired = desiredModeByOverride($channelId, $request);
-            if ($desired ne 'harmonize') {
-                kill 'TERM', $ffpid;
-                close($ffh);
-                return 'switch';
+        # Fetch current playlist
+        my $resp = getResponseFromUrl($videoUrl, ua => $ua);
+        unless ($resp && $resp->is_success) {
+            printf("streamHarmonized: playlist failed for %s: %s\n",
+                $channelId, $resp ? $resp->status_line : 'no response') if $debug;
+            $failures++; sleep(1); next;
+        }
+
+        my $content = $resp->decoded_content;
+        my $info    = parsePlaylistInfo($content);
+        my $rn      = 1;
+        my @all     = extractSegmentsFromPlaylist($content, $videoUrl, $info, \$rn);
+        my @newSegs = filterNewSegments(\@all, \%processed);
+
+        # Merge carryover segments from previous DISCONTINUITY boundary
+        unshift @newSegs, @pendingSegs;
+        @pendingSegs = ();
+
+        unless (@newSegs) { sleep(2); next; }
+
+        # Split at first DISCONTINUITY: batch = segments BEFORE it
+        my (@batch, @remainder);
+        my $foundDisc = 0;
+        for my $i (0 .. $#newSegs) {
+            my $seg = $newSegs[$i];
+            if ($seg->{isDiscontinuity} && @batch) {
+                @remainder = @newSegs[$i .. $#newSegs];
+                $foundDisc = 1;
+                last;
             }
+            push @batch, $seg;
+        }
+        @batch = @newSegs unless @batch;   # edge: DISCONTINUITY on very first segment
+
+        # ── Step 2+3: Download, decrypt, write to RAM disk ────────────────────
+        my $batchDir = shmBase() . "/plutotv-$$-$batchNum";
+        my @local    = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache);
+        unless (@local) {
+            printf("streamHarmonized: segment download failed, batch %d\n", $batchNum) if $debug;
+            $failures++; sleep(1); next;
+        }
+
+        my $m3uPath = "$batchDir/playlist.m3u8";
+        unless (writeBatchM3u8($m3uPath, \@local)) {
+            unlink $_ for glob("$batchDir/*"); rmdir $batchDir;
+            $failures++; sleep(1); next;
+        }
+
+        printf("streamHarmonized: batch %d: %d segs, disc=%s, encoder=%s\n",
+            $batchNum, scalar(@batch), $foundDisc ? 'yes' : 'no', $encoder) if $debug;
+
+        # ── Step 4: Start ffmpeg on local playlist ────────────────────────────
+        my @cmd = buildFfmpegCmd($m3uPath, $encoder);
+
+        my $ffh;
+        my $ffpid = open($ffh, '-|');
+        unless (defined $ffpid) {
+            warn "streamHarmonized: fork failed: $!\n";
+            unlink $_ for glob("$batchDir/*"); rmdir $batchDir;
+            $failures++; sleep(1); next;
+        }
+        if ($ffpid == 0) { exec @cmd; exit(1); }
+        binmode($ffh);
+
+        # ── Steps 5+6+7: Read ffmpeg output → correct timestamps → send ───────
+        # Sequential stitching is guaranteed because we read to EOF (close($ffh)
+        # calls waitpid) before starting the next batch.
+        my $sel         = IO::Select->new($ffh);
+        my $lastOutput  = time();
+        my $firstChunk  = ($batchNum > 0) ? 1 : 0;   # triggers TS discontinuity correction
+        my $gotOutput   = 0;
+        my $curTimeout  = $startupTimeout;             # longer wait for first byte (hw driver init)
+        my $buf         = '';
+
+        FFREAD: while (1) {
             my @ready = $sel->can_read(0.5);
             if (@ready) {
-                my $read = sysread($ffh, $buffer, 1316);
-                last unless defined $read && $read > 0;
-                $last_output_at = time();
-                $has_output = 1;
-                $buffer = correctMpegTsTimestamps($buffer, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
-                $firstChunk = 0;
-                my $ok = eval { $client->write($buffer); $client->flush(); 1 };
-                unless ($ok) {
-                    $client_alive = 0;
-                    last;
+                my $n = sysread($ffh, $buf, 65536);
+                last FFREAD unless defined $n && $n > 0;
+                unless ($gotOutput) {
+                    $gotOutput   = 1;
+                    $curTimeout  = $stallTimeout;   # switch to shorter stall timeout after first byte
                 }
-            } elsif (!$has_output && (time() - $last_output_at) >= $startup_timeout) {
-                appendRecentLog('ffmpeg-Fenster-Starttimeout [' . $encoder . ']: ' . $channelId);
-                kill 'TERM', $ffpid;
-                close($ffh);
-                return 0;
-            } elsif ($has_output && (time() - $last_output_at) >= $stall_timeout) {
-                appendRecentLog('ffmpeg-Fenster-Stall [' . $encoder . ']: ' . $channelId);
-                kill 'TERM', $ffpid;
-                close($ffh);
-                return 0;
+                $lastOutput = time();
+                # Step 6: timestamp correction
+                my $out = correctMpegTsTimestamps($buf, "$channelId-harm", $firstChunk);
+                $firstChunk = 0;
+                # Step 7: send to tvheadend
+                my $ok = eval { $client->write($out); 1 };
+                unless ($ok) { $clientAlive = 0; last FFREAD; }
+            } elsif (time() - $lastOutput >= $curTimeout) {
+                printf("streamHarmonized: %s >%ds for %s batch %d\n",
+                    $gotOutput ? 'stall' : 'startup timeout',
+                    $curTimeout, $channelId, $batchNum) if $debug;
+                last FFREAD;
             }
         }
-        close($ffh);
-        waitpid($ffpid, 0);
-        return $client_alive ? 1 : 0;
+
+        # Sequential stitching: wait for ffmpeg to fully exit before next batch
+        close($ffh);   # implicit waitpid - previous process fully drained
+
+        # Clean up RAM disk for this batch
+        unlink $_ for glob("$batchDir/*");
+        rmdir $batchDir;
+
+        # Mark segments as processed
+        $processed{$_->{url}} = time() for @batch;
+        cleanupOldSegments(\%processed);
+        $failures = 0;
+        $batchNum++;
+
+        if ($foundDisc && @remainder) {
+            @pendingSegs = @remainder;
+            # No sleep: move immediately to next batch
+        } else {
+            sleep(2);
+        }
     }
 
-    sub streamHlsViaFfmpeg {
-        my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName, $headersSentRef, $activeStreamKey, $request) = @_;
-        return 0 unless $ffmpeg;
-        return 0 unless $videoUrl;
+    return 1;
+}
 
-        my $ua = createUserAgent();
-        my %processedVideoWindows;
-        my %processedAudioWindows;
-        my $maxFailures = int(getConfigValue('max_failures', 5));
-        my $failures = 0;
 
-        while ($failures < $maxFailures) {
-            updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
+sub sendDynamicStream {
+    my ($client, $request) = @_;
+    my $path = $request->uri->path;
+    my ($channelId) = $path =~ m{/dynamic_stream/([^/]+)\.ts$};
+    unless ($channelId) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid stream path");
+        return;
+    }
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'}
+        if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
-            my $videoResponse = getResponseFromUrl($videoUrl, ua => $ua);
-            my $audioResponse = $audioUrl ? getResponseFromUrl($audioUrl, ua => $ua) : undef;
-            my $videoContent = $videoResponse && $videoResponse->is_success ? $videoResponse->decoded_content : undef;
-            my $audioContent = $audioResponse && $audioResponse->is_success ? $audioResponse->decoded_content : undef;
-            unless ($videoContent) {
-                $failures++;
-                my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
-                $videoUrl = $freshVideo if $freshVideo;
-                $audioUrl = $freshAudio if $freshAudio;
-                sleep(1);
-                next;
+    my (undef, $channel, undef, undef, $videoUrl) = getPlaybackUrlsForChannel($channelId, $region);
+    unless ($videoUrl) {
+        $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream URL");
+        return;
+    }
+
+    my $channelName = $channel ? ($channel->{name} || $channelId) : $channelId;
+    my $harmonize   = loadHarmonizeOverrides();
+    my $useHarmonize = ($harmonize->{$channelId} || $hybrid_harmonize_channels{$channelId}) ? 1 : 0;
+    my $mode        = $useHarmonize ? 'harmonize' : 'copy';
+
+    my $activeStreamKey = registerActiveStream(
+        channelId   => $channelId,
+        channelName => $channelName,
+        mode        => $mode,
+    );
+    appendRecentLog("Stream gestartet: $channelName [$mode]");
+
+    # Local handlers: guarantee cleanup on disconnect (SIGPIPE) or admin restart (SIGTERM)
+    my $cleanup = sub {
+        unregisterActiveStream($activeStreamKey) if $activeStreamKey;
+        appendRecentLog("Stream unterbrochen: $channelName");
+        exit(0);
+    };
+    local $SIG{PIPE} = $cleanup;
+    local $SIG{TERM} = $cleanup;
+
+    if ($debug) { printf("sendDynamicStream: %s mode=%s\n", $channelId, $mode); }
+
+    my $headersSent = 0;
+    if ($useHarmonize && $ffmpeg) {
+        streamHarmonized($client, $channelId, $region, $videoUrl, $channelName,
+            \$headersSent, $activeStreamKey);
+    } else {
+        streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
+    }
+
+    unregisterActiveStream($activeStreamKey);
+    appendRecentLog("Stream beendet: $channelName");
+}
+
+
+sub extractBestPlaylistUrl {
+    my ($masterPlaylist, $baseUrl, $channelId, $masterUrl) = @_;
+    my @lines = split /
+?
+/, $masterPlaylist;
+    my $bestStreamUrl;
+    my $bestBandwidth = 0;
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        if ($line =~ /^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/i) {
+            my $bandwidth = $1;
+            if ($bandwidth > $bestBandwidth && $i + 1 <= $#lines) {
+                my $urlLine = $lines[$i + 1];
+                if ($urlLine && $urlLine !~ /^#/) {
+                    $bestBandwidth = $bandwidth;
+                    $bestStreamUrl = $urlLine;
+                }
             }
-
-            my $videoWindows = collectPlaylistWindows($videoContent, $videoUrl);
-            my $audioWindows = $audioContent ? collectPlaylistWindows($audioContent, $audioUrl) : [];
-            my $videoWindow = findMatchingWindow($videoWindows, \%processedVideoWindows);
-            unless ($videoWindow) {
-                sleep(1);
-                next;
+        }
+    }
+    return unless $bestStreamUrl;
+    my $resolverBase = $masterUrl || $baseUrl;
+    return resolvePlaylistUrl($resolverBase, $bestStreamUrl);
+}
+sub streamWithDiscontinuityRestart {
+    my ($client, $channelId, $region, $playlistUrl) = @_;
+    $region ||= 'DE';
+    $client->timeout(5);
+    eval {
+        $client->write("HTTP/1.1 200 OK
+");
+        $client->write("Content-Type: video/mp2t
+");
+        $client->write("Cache-Control: no-cache, no-store, must-revalidate
+");
+        $client->write("Connection: close
+");
+        $client->write("
+");
+    };
+    if ($@) {
+        printf("Failed to send headers - client disconnected: %s
+", $@);
+        return;
+    }
+    my $ua = createUserAgent();
+    my %processedSegments = ();
+    my %processedMaps = ();
+    my $runningNumber = 1;
+    my $lastRefreshAt = $playlistUrl ? time() : 0;
+    my $consecutiveFailures = 0;
+    if ($debug) {
+        printf("Starting stream for channel $channelId
+");
+    }
+    while (1) {
+        if (!$playlistUrl || (time() - $lastRefreshAt) >= $sessionRefreshInterval) {
+            my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
+            if ($refreshedPlaylistUrl) {
+                $playlistUrl = $refreshedPlaylistUrl;
+                $lastRefreshAt = time();
+                if ($debug) {
+                    printf("Refreshed session/playlist for %s
+", $channelId);
+                }
             }
-            my $audioWindow = findMatchingWindow($audioWindows, \%processedAudioWindows);
-            my %window = (
-                signature => $videoWindow->{signature},
-                startsAfterDiscontinuity => $videoWindow->{startsAfterDiscontinuity},
-                videoSegments => $videoWindow->{segments},
-                audioSegments => ($audioWindow ? $audioWindow->{segments} : []),
-            );
-            appendRecentLog('Harmonize-Fenster: ' . $channelId . ' v=' . (($videoWindow->{segments}[0]{sequence}//'') . '-' . ($videoWindow->{segments}[-1]{sequence}//'')) . ' seg=' . scalar(@{ $videoWindow->{segments} || [] }) . ($audioWindow ? ' audio=separate' : ' audio=embedded'));
-            my $result = streamReencodedWindow(
-                client=>$client,
-                channelId=>$channelId,
-                channelName=>($channelName||$channelId),
-                window=>\%window,
-                headersSentRef=>$headersSentRef,
-                request=>$request,
-                ua=>$ua,
-            );
-            return 'switch' if defined $result && $result eq 'switch';
-            last unless $result;
-            $processedVideoWindows{$videoWindow->{signature} || $videoWindow->{id}} = 1;
-            $processedAudioWindows{$audioWindow->{signature} || $audioWindow->{id}} = 1 if $audioWindow;
-            $failures = 0;
+        }
+
+        my $playlistResponse = getResponseFromUrl($playlistUrl, ua => $ua);
+        my $playlistContent = $playlistResponse && $playlistResponse->is_success
+            ? $playlistResponse->decoded_content
+            : undef;
+        unless ($playlistContent) {
+            $consecutiveFailures++;
+            if ($debug) {
+                my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
+                printf("Failed to fetch playlist for %s (attempt %d): %s\nURL: %s
+", $channelId, $consecutiveFailures, $status, $playlistUrl);
+            }
+            my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
+            $playlistUrl = $refreshedPlaylistUrl if $refreshedPlaylistUrl;
+            last if $consecutiveFailures >= 5;
+            sleep(1);
+            next;
+        }
+        $consecutiveFailures = 0;
+
+        my $playlistInfo = parsePlaylistInfo($playlistContent);
+        my @allSegments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$runningNumber);
+        my @newSegments = filterNewSegments(\@allSegments, \%processedSegments);
+        if ($debug && @allSegments == 0) {
+            printf("No segments found for channel %s
+Playlist URL: %s
+", $channelId, ($playlistUrl || ''));
+        }
+        if (@newSegments == 0) {
+            sleep(1);
+            next;
+        }
+        if ($debug) {
+            printf("Processing %d new segments for channel %s
+", scalar(@newSegments), $channelId);
+        }
+        my $streamOk = 1;
+        for my $segment (@newSegments) {
+            if ($segment->{isDiscontinuity} && $segment->{mapUrl}) {
+                delete $processedMaps{$segment->{mapUrl}};
+            }
+            my $success = streamSegment($client, $ua, $segment, $channelId, \%processedMaps);
+            unless ($success) {
+                if ($segment->{isDiscontinuity}) {
+                    if ($debug) {
+                        printf("Failed to stream discontinuity segment, refreshing playlist for %s\n", $channelId);
+                    }
+                    $lastRefreshAt = 0;
+                    next;
+                }
+                $streamOk = 0;
+                if ($debug) {
+                    printf("Failed to stream segment, ending stream for %s\n", $channelId);
+                }
+                last;
+            }
+            $processedSegments{$segment->{url}} = time();
+            $processedMaps{$segment->{mapUrl}} = 1 if $segment->{mapUrl};
+        }
+        last unless $streamOk;
+        cleanupOldSegments(\%processedSegments);
+        sleep(2);
+    }
+}
+sub parsePlaylistInfo {
+    my ($playlistContent) = @_;
+    my @lines = split /\r?\n/, $playlistContent;
+    my %info = (
+        mediaSequence => 0,
+        hasDiscontinuity => 0,
+        targetDuration => 10,
+    );
+    for my $line (@lines) {
+        if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
+            $info{mediaSequence} = $1;
+        }
+        elsif ($line =~ /^#EXT-X-TARGETDURATION:(\d+)/) {
+            $info{targetDuration} = $1;
+        }
+        elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            $info{hasDiscontinuity} = 1;
+        }
+    }
+    return \%info;
+}
+
+sub resolvePlaylistUrl {
+    my ($baseUrl, $value) = @_;
+    return undef unless defined $value && length $value;
+    return $value if $value =~ m{^(?:https?://|data:)}i;
+    return URI->new_abs($value, $baseUrl)->as_string;
+}
+
+sub extractSegmentsFromPlaylist {
+    my ($playlistContent, $baseUrl, $playlistInfo, $runningNumberRef) = @_;
+    my @lines = split /\r?\n/, $playlistContent;
+    my @segments = ();
+    my %currentSegment;
+    my $sequenceNumber = $playlistInfo->{mediaSequence} || 0;
+    my $inDiscontinuityBlock = 0;
+    my %currentKey = (method => 'NONE');
+    my $currentMapUrl;
+
+    $$runningNumberRef = 1;
+
+    for my $line (@lines) {
+        if ($line =~ /^#EXT-X-DISCONTINUITY$/) {
+            $inDiscontinuityBlock = 1;
+        }
+        elsif ($line =~ /^#EXT-X-MAP:(.+)$/) {
+            my $attrString = $1;
+            my %attrs;
+            while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
+                my ($k, $v) = ($1, $2);
+                $v =~ s/^"//;
+                $v =~ s/"$//;
+                $attrs{$k} = $v;
+            }
+            $currentMapUrl = resolvePlaylistUrlPreserveQuery($baseUrl, $attrs{URI}) if $attrs{URI};
+        }
+        elsif ($line =~ /^#EXT-X-KEY:(.+)$/) {
+            my $attrString = $1;
+            my %attrs;
+            while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
+                my ($k, $v) = ($1, $2);
+                $v =~ s/^"//;
+                $v =~ s/"$//;
+                $attrs{$k} = $v;
+            }
+            my $method = $attrs{METHOD} || 'NONE';
+            if ($method eq 'NONE') {
+                %currentKey = (method => 'NONE');
+            } else {
+                %currentKey = (
+                    method => $method,
+                    keyUri => resolvePlaylistUrlPreserveQuery($baseUrl, $attrs{URI}),
+                    iv     => $attrs{IV},
+                );
+                $currentKey{iv} =~ s/^0x//i if defined $currentKey{iv};
+            }
+        }
+        elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
+            $currentSegment{duration} = $1;
+        }
+        elsif ($line !~ /^#/ && length $line) {
+            next unless exists $currentSegment{duration} || $currentMapUrl;
+            $currentSegment{url} = resolvePlaylistUrlPreserveQuery($baseUrl, $line);
+            $currentSegment{sequence} = $sequenceNumber;
+            $currentSegment{running} = $$runningNumberRef;
+            $currentSegment{isDiscontinuity} = $inDiscontinuityBlock;
+            $currentSegment{mapUrl} = $currentMapUrl if $currentMapUrl;
+            $currentSegment{container} = ($currentSegment{url} =~ /\.m4s(?:\?.*)?$/i) ? 'fmp4' : 'ts';
+            $currentSegment{method} = $currentKey{method} || 'NONE';
+            if (($currentKey{method} || 'NONE') eq 'AES-128' && $currentKey{keyUri}) {
+                $currentSegment{keyUri} = $currentKey{keyUri};
+                $currentSegment{iv} = defined $currentKey{iv} && length $currentKey{iv}
+                    ? $currentKey{iv}
+                    : sprintf('%032x', $sequenceNumber);
+            }
+            push @segments, { %currentSegment };
+            %currentSegment = ();
+            $inDiscontinuityBlock = 0;
+            $sequenceNumber++;
+            $$runningNumberRef++;
+            if ($$runningNumberRef > 1000000) {
+                $$runningNumberRef = 1;
+            }
+        }
+    }
+    @segments = sortByRunningNumber(@segments);
+    return @segments;
+}
+sub filterNewSegments {
+    my ($segments, $processedSegmentsRef) = @_;
+    my @newSegments;
+    for my $segment (@$segments) {
+        next if exists $processedSegmentsRef->{$segment->{url}};
+        push @newSegments, $segment;
+    }
+    return sortByRunningNumber(@newSegments);
+}
+
+sub decodeDataUri {
+    my ($uri) = @_;
+    return undef unless defined $uri && $uri =~ m{^data:}i;
+    my ($meta, $payload) = split /,/, $uri, 2;
+    return undef unless defined $payload;
+    if ($meta =~ /;base64/i) {
+        return decode_base64($payload);
+    }
+    $payload =~ s/\+/ /g;
+    return uri_unescape($payload);
+}
+
+sub streamSegment {
+    my ($client, $ua, $segment, $channelId, $processedMapsRef) = @_;
+    $processedMapsRef ||= {};
+    my $is_discontinuity = $segment->{isDiscontinuity} || 0;
+
+    if ($segment->{mapUrl} && !$processedMapsRef->{$segment->{mapUrl}}) {
+        my $mapPayload;
+        if ($segment->{mapUrl} =~ m{^data:}i) {
+            $mapPayload = decodeDataUri($segment->{mapUrl});
+            unless (defined $mapPayload) {
+                if ($debug) {
+                    printf("Failed to decode init data URI for %s
+", $channelId);
+                }
+                return 0;
+            }
+        } else {
+            my $mapReq = HTTP::Request->new(GET => $segment->{mapUrl});
+            my $mapRes = $ua->request($mapReq);
+            unless ($mapRes->is_success) {
+                if ($debug) {
+                    printf("Failed to fetch init segment %s: %s
+", $segment->{mapUrl}, $mapRes->status_line);
+                }
+                return 0;
+            }
+            $mapPayload = $mapRes->content;
+        }
+        eval {
+            print $client $mapPayload;
+            $client->flush();
+        };
+        if ($@) {
+            printf("Failed to send init segment to client: %s
+", $@);
+            return 0;
+        }
+        $processedMapsRef->{$segment->{mapUrl}} = 1;
+    }
+
+    my $req = HTTP::Request->new(GET => $segment->{url});
+    my $res = $ua->request($req);
+    unless ($res->is_success) {
+        if ($debug) {
+            printf("Failed to fetch segment %s: %s
+", $segment->{url}, $res->status_line);
         }
         return 0;
     }
 
-    sub shouldUseHlsHarmonizer {
-        my ($channelId, $request) = @_;
-        return 0 unless $ffmpeg;
-        return desiredModeByOverride($channelId, $request) eq 'harmonize' ? 1 : 0;
-    }
+    my $chunk = $res->content;
+    my $decryptedData = $chunk;
 
-    sub sendDynamicStream {
-        my ($client, $request) = @_;
-        my $activeStreamKey;
-        my $path = $request->uri->path;
-        my ($channelId) = $path =~ m{/dynamic_stream/([^/]+)\.ts$};
-        unless ($channelId) {
-            $client->send_error(RC_BAD_REQUEST, "Invalid dynamic stream path");
-            return;
-        }
-        my $region = 'DE';
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-
-        my (undef, $channel, undef, undef, $videoUrl, $audioUrl) = getPlaybackUrlsForChannel($channelId, $region);
-        unless ($videoUrl) {
-            $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch playlist URL");
-            return;
-        }
-
-        my $headersSent = 0;
-        my $mode = desiredModeByOverride($channelId, $request);
-        $activeStreamKey = registerActiveStream(
-            channelId => $channelId,
-            channelName => ($channel ? ($channel->{name} || $channelId) : $channelId),
-            mode => $mode,
-            desiredMode => $mode,
-        );
-        appendRecentLog('Stream gestartet: ' . $channelId . ' [' . $mode . ']');
-
-        # Local handlers ensure cleanup even on unexpected disconnect (SIGPIPE)
-        # or admin-triggered restart (SIGTERM via restart_stream endpoint).
-        my $cleanup = sub {
-            unregisterActiveStream($activeStreamKey) if $activeStreamKey;
-            appendRecentLog('Stream unterbrochen: ' . $channelId);
-            exit(0);
-        };
-        local $SIG{PIPE} = $cleanup;
-        local $SIG{TERM} = $cleanup;
-
-        if ($debug) {
-            printf("Dynamic stream mode for %s: %s\n", $channelId, $mode);
-        }
-
-        while (1) {
-            $mode = desiredModeByOverride($channelId, $request);
-            updateActiveStream($activeStreamKey, mode => $mode, desiredMode => $mode) if $activeStreamKey;
-
-            my $result;
-            if ($mode eq 'harmonize') {
-                $result = streamHlsViaFfmpeg($client, $channelId, $region, $videoUrl, $audioUrl, ($channel ? $channel->{name} : undef), \$headersSent, $activeStreamKey, $request);
-            } elsif ($audioUrl && $ffmpeg) {
-                $result = streamMuxedFromLocalChildStreams($client, $channelId, $region, $videoUrl, $audioUrl, \$headersSent, $activeStreamKey, $request);
-            } else {
-                $result = streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
-            }
-
-            if (defined $result && $result eq 'switch') {
-                my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
-                $videoUrl = $freshVideo if $freshVideo;
-                $audioUrl = $freshAudio if $freshAudio;
-                next;
-            }
-            last;
-        }
-
-        unregisterActiveStream($activeStreamKey);
-        appendRecentLog('Stream beendet: ' . $channelId);
-    }
-    sub extractBestPlaylistUrl {
-        my ($masterPlaylist, $baseUrl, $channelId, $masterUrl) = @_;
-        my @lines = split /
-?
-/, $masterPlaylist;
-        my $bestStreamUrl;
-        my $bestBandwidth = 0;
-        for my $i (0 .. $#lines) {
-            my $line = $lines[$i];
-            if ($line =~ /^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/i) {
-                my $bandwidth = $1;
-                if ($bandwidth > $bestBandwidth && $i + 1 <= $#lines) {
-                    my $urlLine = $lines[$i + 1];
-                    if ($urlLine && $urlLine !~ /^#/) {
-                        $bestBandwidth = $bandwidth;
-                        $bestStreamUrl = $urlLine;
-                    }
-                }
-            }
-        }
-        return unless $bestStreamUrl;
-        my $resolverBase = $masterUrl || $baseUrl;
-        return resolvePlaylistUrl($resolverBase, $bestStreamUrl);
-    }
-    sub streamWithDiscontinuityRestart {
-        my ($client, $channelId, $region, $playlistUrl) = @_;
-        $region ||= 'DE';
-        $client->timeout(5);
-        eval {
-            $client->write("HTTP/1.1 200 OK
-");
-            $client->write("Content-Type: video/mp2t
-");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-            $client->write("Connection: close
-");
-            $client->write("
-");
-        };
-        if ($@) {
-            printf("Failed to send headers - client disconnected: %s
-", $@);
-            return;
-        }
-        my $ua = createUserAgent();
-        my %processedSegments = ();
-        my %processedMaps = ();
-        my $runningNumber = 1;
-        my $lastRefreshAt = $playlistUrl ? time() : 0;
-        my $consecutiveFailures = 0;
-        if ($debug) {
-            printf("Starting stream for channel $channelId
-");
-        }
-        while (1) {
-            if (!$playlistUrl || (time() - $lastRefreshAt) >= $sessionRefreshInterval) {
-                my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
-                if ($refreshedPlaylistUrl) {
-                    $playlistUrl = $refreshedPlaylistUrl;
-                    $lastRefreshAt = time();
-                    if ($debug) {
-                        printf("Refreshed session/playlist for %s
-", $channelId);
-                    }
-                }
-            }
-
-            my $playlistResponse = getResponseFromUrl($playlistUrl, ua => $ua);
-            my $playlistContent = $playlistResponse && $playlistResponse->is_success
-                ? $playlistResponse->decoded_content
-                : undef;
-            unless ($playlistContent) {
-                $consecutiveFailures++;
-                if ($debug) {
-                    my $status = $playlistResponse ? $playlistResponse->status_line : 'no response';
-                    printf("Failed to fetch playlist for %s (attempt %d): %s\nURL: %s
-", $channelId, $consecutiveFailures, $status, $playlistUrl);
-                }
-                my (undef, undef, undef, $refreshedPlaylistUrl) = getPlaylistUrlForChannel($channelId, $region, 1);
-                $playlistUrl = $refreshedPlaylistUrl if $refreshedPlaylistUrl;
-                last if $consecutiveFailures >= 5;
-                sleep(1);
-                next;
-            }
-            $consecutiveFailures = 0;
-
-            my $playlistInfo = parsePlaylistInfo($playlistContent);
-            my @allSegments = extractSegmentsFromPlaylist($playlistContent, $playlistUrl, $playlistInfo, \$runningNumber);
-            my @newSegments = filterNewSegments(\@allSegments, \%processedSegments);
-            if ($debug && @allSegments == 0) {
-                printf("No segments found for channel %s
-Playlist URL: %s
-", $channelId, ($playlistUrl || ''));
-            }
-            if (@newSegments == 0) {
-                sleep(1);
-                next;
-            }
+    if (($segment->{keyUri} || '') ne '' && ($segment->{method} || 'NONE') eq 'AES-128') {
+        my $keyRes = $ua->get($segment->{keyUri});
+        unless ($keyRes->is_success) {
             if ($debug) {
-                printf("Processing %d new segments for channel %s
-", scalar(@newSegments), $channelId);
+                printf("Failed to fetch key %s: %s
+", $segment->{keyUri}, $keyRes->status_line);
             }
-            my $streamOk = 1;
-            for my $segment (@newSegments) {
-                if ($segment->{isDiscontinuity} && $segment->{mapUrl}) {
-                    delete $processedMaps{$segment->{mapUrl}};
+            return 0;
+        }
+        my $encryptionKey = $keyRes->content;
+        if (length($encryptionKey) != 16) {
+            if ($debug) {
+                printf("Invalid key length: %d bytes (expected 16)
+", length($encryptionKey));
+            }
+            return 0;
+        }
+
+        my $iv = $segment->{iv};
+        $iv = sprintf('%032x', $segment->{sequence} || 0) unless defined $iv && length $iv;
+        my $hexKey = unpack('H*', $encryptionKey);
+
+        if (which('openssl')) {
+            my $opensslStderr = '';
+            my $ok = eval {
+                run(
+                    ["openssl", "aes-128-cbc", "-d", "-in", "-", "-out", "-", "-K", $hexKey, "-iv", $iv],
+                    "<", \$chunk,
+                    ">", \$decryptedData,
+                    "2>", \$opensslStderr
+                );
+                1;
+            };
+            unless ($ok && defined $decryptedData && length $decryptedData) {
+                if ($debug) {
+                    printf("OpenSSL decrypt failed for %s%s
+", $segment->{url}, length($opensslStderr) ? ": $opensslStderr" : '');
                 }
-                my $success = streamSegment($client, $ua, $segment, $channelId, \%processedMaps);
-                unless ($success) {
-                    if ($segment->{isDiscontinuity}) {
-                        if ($debug) {
-                            printf("Failed to stream discontinuity segment, refreshing playlist for %s\n", $channelId);
-                        }
-                        $lastRefreshAt = 0;
-                        next;
-                    }
-                    $streamOk = 0;
-                    if ($debug) {
-                        printf("Failed to stream segment, ending stream for %s\n", $channelId);
-                    }
+                return 0;
+            }
+        } else {
+            my $ivBin = pack 'H*', $iv;
+            my $cipher = Crypt::CBC->new(
+                -key     => $encryptionKey,
+                -cipher  => 'Rijndael',
+                -iv      => $ivBin,
+                -header  => 'none',
+                -padding => 'standard',
+            );
+            $decryptedData = $cipher->decrypt($chunk);
+        }
+    }
+
+    my $payload = $decryptedData;
+    my $isTsPayload = ($segment->{container} || 'ts') eq 'ts';
+    if (length($decryptedData) > 0) {
+        my $firstByte = unpack('C', substr($decryptedData, 0, 1));
+        if ($firstByte != 0x47) {
+            $isTsPayload = 0;
+            if ($debug) {
+                printf("Info: Non-TS segment detected (first byte 0x%02X) for %s
+", $firstByte, $segment->{url});
+            }
+        }
+    }
+    if ($isTsPayload) {
+        $payload = correctMpegTsTimestamps($decryptedData, $channelId, $is_discontinuity);
+    }
+
+    eval {
+        print $client $payload;
+        $client->flush();
+    };
+    if ($@) {
+        printf("Failed to send data to client: %s
+", $@);
+        return 0;
+    }
+    return 1;
+}
+sub correctMpegTsTimestamps {
+    my ($data, $channelId, $is_discontinuity) = @_;
+    unless (exists $channel_timestamps{$channelId}) {
+        $channel_timestamps{$channelId} = {
+            last_pcr => undef,
+            last_pts => undef,
+            last_dts => undef,
+            pcr_offset => 0,
+            pts_offset => 0,
+            dts_offset => 0,
+            cc_counters => {},
+            discontinuity_reset => 0,
+            pcr_calculated => 0,
+            pts_calculated => 0,
+            dts_calculated => 0
+        };
+    }
+    my $ts_info = $channel_timestamps{$channelId};
+    if ($is_discontinuity) {
+        if ($debug) {
+            printf("DISCONTINUITY detected for channel %s\n", $channelId);
+        }
+        $ts_info->{discontinuity_reset} = 1;
+        $ts_info->{pending_discontinuity_indicator} = 1;
+        $ts_info->{pcr_calculated} = 0;
+        $ts_info->{pts_calculated} = 0;
+        $ts_info->{dts_calculated} = 0;
+        $ts_info->{cc_counters} = {};
+    }
+    my $output = '';
+    my $packet_size = 188;
+    my $data_length = length($data);
+    for (my $pos = 0; $pos < $data_length; $pos += $packet_size) {
+        my $packet_data = substr($data, $pos, $packet_size);
+        last if length($packet_data) < $packet_size;
+        my $sync_byte = unpack('C', substr($packet_data, 0, 1));
+        if ($sync_byte != 0x47) {
+            my $found_sync = 0;
+            for (my $i = 1; $i < $packet_size && ($pos + $i) < $data_length; $i++) {
+                my $test_byte = unpack('C', substr($data, $pos + $i, 1));
+                if ($test_byte == 0x47) {
+                    $pos += $i - $packet_size;
+                    $found_sync = 1;
                     last;
                 }
-                $processedSegments{$segment->{url}} = time();
-                $processedMaps{$segment->{mapUrl}} = 1 if $segment->{mapUrl};
             }
-            last unless $streamOk;
-            cleanupOldSegments(\%processedSegments);
-            sleep(2);
+            next unless $found_sync;
         }
+        $packet_data = correctContinuityCounter($packet_data, $ts_info);
+        $packet_data = processTimestampsInPacket($packet_data, $ts_info);
+        $output .= $packet_data;
     }
-    sub parsePlaylistInfo {
-        my ($playlistContent) = @_;
-        my @lines = split /\r?\n/, $playlistContent;
-        my %info = (
-            mediaSequence => 0,
-            hasDiscontinuity => 0,
-            targetDuration => 10,
-        );
-        for my $line (@lines) {
-            if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
-                $info{mediaSequence} = $1;
-            }
-            elsif ($line =~ /^#EXT-X-TARGETDURATION:(\d+)/) {
-                $info{targetDuration} = $1;
-            }
-            elsif ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-                $info{hasDiscontinuity} = 1;
-            }
+    return $output;
+}
+
+sub correctContinuityCounter {
+    my ($packet_data, $ts_info) = @_;
+    my @header = unpack('C4', substr($packet_data, 0, 4));
+    my $pid = (($header[1] & 0x1F) << 8) | $header[2];
+    unless (exists $ts_info->{cc_counters}->{$pid}) {
+        $ts_info->{cc_counters}->{$pid} = -1;
+    }
+    my $cc = ($ts_info->{cc_counters}->{$pid} + 1) % 16;
+    my $header_byte_4 = $header[3];
+    my $adaptation_control = $header_byte_4 & 0x30;
+    my $corrected_header_byte_4 = $adaptation_control | $cc;
+    substr($packet_data, 3, 1) = pack('C', $corrected_header_byte_4);
+    $ts_info->{cc_counters}->{$pid} = $cc;
+    return $packet_data;
+}
+
+sub markDiscontinuityIndicator {
+    my ($packet_data, $offset, $adaptation_length, $ts_info) = @_;
+    return $packet_data unless $ts_info->{pending_discontinuity_indicator};
+    return $packet_data unless $adaptation_length && $adaptation_length >= 1;
+    my $flags = unpack('C', substr($packet_data, $offset, 1));
+    $flags |= 0x80;
+    substr($packet_data, $offset, 1) = pack('C', $flags);
+    $ts_info->{pending_discontinuity_indicator} = 0;
+    return $packet_data;
+}
+
+sub processTimestampsInPacket {
+    my ($packet_data, $ts_info) = @_;
+    my $pos = 4;
+    my @header = unpack('C4', substr($packet_data, 0, 4));
+    my $payload_start = ($header[1] & 0x40) >> 6;
+    my $adaptation_field = ($header[3] & 0x30) >> 4;
+    if ($adaptation_field == 2 || $adaptation_field == 3) {
+        my $adaptation_length = unpack('C', substr($packet_data, $pos, 1));
+        $pos++;
+        if ($adaptation_length > 0) {
+            $packet_data = markDiscontinuityIndicator($packet_data, $pos, $adaptation_length, $ts_info);
+            $packet_data = processPcr($packet_data, $pos, $adaptation_length, $ts_info);
         }
-        return \%info;
+        $pos += $adaptation_length;
     }
-
-    sub resolvePlaylistUrl {
-        my ($baseUrl, $value) = @_;
-        return undef unless defined $value && length $value;
-        return $value if $value =~ m{^(?:https?://|data:)}i;
-        return URI->new_abs($value, $baseUrl)->as_string;
+    if (($adaptation_field == 1 || $adaptation_field == 3) && $payload_start && $pos < 188) {
+        $packet_data = processPesTimestamps($packet_data, $pos, $ts_info);
     }
+    return $packet_data;
+}
 
-    sub extractSegmentsFromPlaylist {
-        my ($playlistContent, $baseUrl, $playlistInfo, $runningNumberRef) = @_;
-        my @lines = split /\r?\n/, $playlistContent;
-        my @segments = ();
-        my %currentSegment;
-        my $sequenceNumber = $playlistInfo->{mediaSequence} || 0;
-        my $inDiscontinuityBlock = 0;
-        my %currentKey = (method => 'NONE');
-        my $currentMapUrl;
+sub processPcr {
+    my ($packet_data, $offset, $adaptation_length, $ts_info) = @_;
+    my $pcr_ext;
+    return $packet_data if $adaptation_length < 1;
+    my $flags = unpack('C', substr($packet_data, $offset, 1));
+    my $pcr_flag = ($flags & 0x10) >> 4;
+    if ($pcr_flag && $adaptation_length >= 6) {
+        my @pcr_bytes = unpack('C6', substr($packet_data, $offset + 1, 6));
+        my $pcr_base = ($pcr_bytes[0] << 25) | ($pcr_bytes[1] << 17) |
+            ($pcr_bytes[2] << 9) | ($pcr_bytes[3] << 1) |
+            (($pcr_bytes[4] & 0x80) >> 7);
+        $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
 
-        $$runningNumberRef = 1;
-
-        for my $line (@lines) {
-            if ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-                $inDiscontinuityBlock = 1;
-            }
-            elsif ($line =~ /^#EXT-X-MAP:(.+)$/) {
-                my $attrString = $1;
-                my %attrs;
-                while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
-                    my ($k, $v) = ($1, $2);
-                    $v =~ s/^"//;
-                    $v =~ s/"$//;
-                    $attrs{$k} = $v;
-                }
-                $currentMapUrl = resolvePlaylistUrlPreserveQuery($baseUrl, $attrs{URI}) if $attrs{URI};
-            }
-            elsif ($line =~ /^#EXT-X-KEY:(.+)$/) {
-                my $attrString = $1;
-                my %attrs;
-                while ($attrString =~ /([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)/g) {
-                    my ($k, $v) = ($1, $2);
-                    $v =~ s/^"//;
-                    $v =~ s/"$//;
-                    $attrs{$k} = $v;
-                }
-                my $method = $attrs{METHOD} || 'NONE';
-                if ($method eq 'NONE') {
-                    %currentKey = (method => 'NONE');
-                } else {
-                    %currentKey = (
-                        method => $method,
-                        keyUri => resolvePlaylistUrlPreserveQuery($baseUrl, $attrs{URI}),
-                        iv     => $attrs{IV},
-                    );
-                    $currentKey{iv} =~ s/^0x//i if defined $currentKey{iv};
-                }
-            }
-            elsif ($line =~ /^#EXTINF:([0-9.]+),/) {
-                $currentSegment{duration} = $1;
-            }
-            elsif ($line !~ /^#/ && length $line) {
-                next unless exists $currentSegment{duration} || $currentMapUrl;
-                $currentSegment{url} = resolvePlaylistUrlPreserveQuery($baseUrl, $line);
-                $currentSegment{sequence} = $sequenceNumber;
-                $currentSegment{running} = $$runningNumberRef;
-                $currentSegment{isDiscontinuity} = $inDiscontinuityBlock;
-                $currentSegment{mapUrl} = $currentMapUrl if $currentMapUrl;
-                $currentSegment{container} = ($currentSegment{url} =~ /\.m4s(?:\?.*)?$/i) ? 'fmp4' : 'ts';
-                $currentSegment{method} = $currentKey{method} || 'NONE';
-                if (($currentKey{method} || 'NONE') eq 'AES-128' && $currentKey{keyUri}) {
-                    $currentSegment{keyUri} = $currentKey{keyUri};
-                    $currentSegment{iv} = defined $currentKey{iv} && length $currentKey{iv}
-                        ? $currentKey{iv}
-                        : sprintf('%032x', $sequenceNumber);
-                }
-                push @segments, { %currentSegment };
-                %currentSegment = ();
-                $inDiscontinuityBlock = 0;
-                $sequenceNumber++;
-                $$runningNumberRef++;
-                if ($$runningNumberRef > 1000000) {
-                    $$runningNumberRef = 1;
-                }
-            }
+        if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated} && defined $ts_info->{last_pcr}) {
+            # +9000 ticks = 100ms at 90kHz: ensures PCR moves forward, never stagnates
+            $ts_info->{pcr_offset} = $ts_info->{last_pcr} + 9000 - $pcr_base;
+            $ts_info->{pcr_calculated} = 1;
+            $ts_info->{discontinuity_reset} = 0;
         }
-        @segments = sortByRunningNumber(@segments);
-        return @segments;
-    }
-    sub filterNewSegments {
-        my ($segments, $processedSegmentsRef) = @_;
-        my @newSegments;
-        for my $segment (@$segments) {
-            next if exists $processedSegmentsRef->{$segment->{url}};
-            push @newSegments, $segment;
-        }
-        return sortByRunningNumber(@newSegments);
-    }
+        my $corrected_pcr_base = $pcr_base + $ts_info->{pcr_offset};
 
-    sub decodeDataUri {
-        my ($uri) = @_;
-        return undef unless defined $uri && $uri =~ m{^data:}i;
-        my ($meta, $payload) = split /,/, $uri, 2;
-        return undef unless defined $payload;
-        if ($meta =~ /;base64/i) {
-            return decode_base64($payload);
-        }
-        $payload =~ s/\+/ /g;
-        return uri_unescape($payload);
+        $ts_info->{last_pcr} = $corrected_pcr_base;
+        $corrected_pcr_base = $corrected_pcr_base & (2**33 - 1);
+        $pcr_bytes[0] = ($corrected_pcr_base >> 25) & 0xFF;
+        $pcr_bytes[1] = ($corrected_pcr_base >> 17) & 0xFF;
+        $pcr_bytes[2] = ($corrected_pcr_base >> 9) & 0xFF;
+        $pcr_bytes[3] = ($corrected_pcr_base >> 1) & 0xFF;
+        $pcr_bytes[4] = (($corrected_pcr_base & 0x01) << 7) | (($pcr_ext >> 8) & 0x01);
+        $pcr_bytes[5] = $pcr_ext & 0xFF;
+        substr($packet_data, $offset + 1, 6) = pack('C6', @pcr_bytes);
+    }
+    return $packet_data;
+}
+
+sub processPesTimestamps {
+    my ($packet_data, $offset, $ts_info) = @_;
+    return $packet_data if $offset + 9 >= 188;
+    my @pes_start = unpack('C3', substr($packet_data, $offset, 3));
+    return $packet_data unless ($pes_start[0] == 0x00 && $pes_start[1] == 0x00 && $pes_start[2] == 0x01);
+    my $stream_id = unpack('C', substr($packet_data, $offset + 3, 1));
+    return $packet_data unless (($stream_id >= 0xC0 && $stream_id <= 0xDF) ||
+        ($stream_id >= 0xE0 && $stream_id <= 0xEF));
+    return $packet_data if $offset + 8 >= 188;
+    my $pes_flags = unpack('C', substr($packet_data, $offset + 7, 1));
+    my $pts_dts_flags = ($pes_flags & 0xC0) >> 6;
+    my $header_length = unpack('C', substr($packet_data, $offset + 8, 1));
+    return $packet_data unless $pts_dts_flags > 0;
+    return $packet_data if $offset + 9 + $header_length >= 188;
+    my $pts_offset = $offset + 9;
+    if ($pts_dts_flags >= 2 && $pts_offset + 4 < 188) {
+        $packet_data = correctPts($packet_data, $pts_offset, $ts_info);
+    }
+    if ($pts_dts_flags == 3 && $pts_offset + 9 < 188) {
+        $packet_data = correctDts($packet_data, $pts_offset + 5, $ts_info);
+    }
+    return $packet_data;
+}
+
+sub correctPts {
+    my ($packet_data, $pts_offset, $ts_info) = @_;
+    my @pts_bytes = unpack('C5', substr($packet_data, $pts_offset, 5));
+    my $pts = (($pts_bytes[0] & 0x0E) << 29) | ($pts_bytes[1] << 22) |
+        (($pts_bytes[2] & 0xFE) << 14) | ($pts_bytes[3] << 7) |
+        (($pts_bytes[4] & 0xFE) >> 1);
+
+    my $corrected_pts = $pts;
+    if (defined $ts_info->{pcr_offset}) {
+        $corrected_pts = $pts + $ts_info->{pcr_offset};
     }
 
-    sub streamSegment {
-        my ($client, $ua, $segment, $channelId, $processedMapsRef) = @_;
-        $processedMapsRef ||= {};
-        my $is_discontinuity = $segment->{isDiscontinuity} || 0;
+    $ts_info->{last_pts} = $corrected_pts;
+    $corrected_pts = $corrected_pts & (2**33 - 1);
+    $pts_bytes[0] = ($pts_bytes[0] & 0xF1) | (($corrected_pts >> 29) & 0x0E);
+    $pts_bytes[1] = ($corrected_pts >> 22) & 0xFF;
+    $pts_bytes[2] = (($corrected_pts >> 14) & 0xFE) | 0x01;
+    $pts_bytes[3] = ($corrected_pts >> 7) & 0xFF;
+    $pts_bytes[4] = (($corrected_pts << 1) & 0xFE) | 0x01;
+    substr($packet_data, $pts_offset, 5) = pack('C5', @pts_bytes);
+    return $packet_data;
+}
 
-        if ($segment->{mapUrl} && !$processedMapsRef->{$segment->{mapUrl}}) {
-            my $mapPayload;
-            if ($segment->{mapUrl} =~ m{^data:}i) {
-                $mapPayload = decodeDataUri($segment->{mapUrl});
-                unless (defined $mapPayload) {
-                    if ($debug) {
-                        printf("Failed to decode init data URI for %s
-", $channelId);
-                    }
-                    return 0;
-                }
-            } else {
-                my $mapReq = HTTP::Request->new(GET => $segment->{mapUrl});
-                my $mapRes = $ua->request($mapReq);
-                unless ($mapRes->is_success) {
-                    if ($debug) {
-                        printf("Failed to fetch init segment %s: %s
-", $segment->{mapUrl}, $mapRes->status_line);
-                    }
-                    return 0;
-                }
-                $mapPayload = $mapRes->content;
-            }
-            eval {
-                print $client $mapPayload;
-                $client->flush();
-            };
-            if ($@) {
-                printf("Failed to send init segment to client: %s
-", $@);
-                return 0;
-            }
-            $processedMapsRef->{$segment->{mapUrl}} = 1;
-        }
+sub correctDts {
+    my ($packet_data, $dts_offset, $ts_info) = @_;
+    my @dts_bytes = unpack('C5', substr($packet_data, $dts_offset, 5));
+    my $dts = (($dts_bytes[0] & 0x0E) << 29) | ($dts_bytes[1] << 22) |
+        (($dts_bytes[2] & 0xFE) << 14) | ($dts_bytes[3] << 7) |
+        (($dts_bytes[4] & 0xFE) >> 1);
 
-        my $req = HTTP::Request->new(GET => $segment->{url});
-        my $res = $ua->request($req);
-        unless ($res->is_success) {
-            if ($debug) {
-                printf("Failed to fetch segment %s: %s
-", $segment->{url}, $res->status_line);
-            }
-            return 0;
-        }
-
-        my $chunk = $res->content;
-        my $decryptedData = $chunk;
-
-        if (($segment->{keyUri} || '') ne '' && ($segment->{method} || 'NONE') eq 'AES-128') {
-            my $keyRes = $ua->get($segment->{keyUri});
-            unless ($keyRes->is_success) {
-                if ($debug) {
-                    printf("Failed to fetch key %s: %s
-", $segment->{keyUri}, $keyRes->status_line);
-                }
-                return 0;
-            }
-            my $encryptionKey = $keyRes->content;
-            if (length($encryptionKey) != 16) {
-                if ($debug) {
-                    printf("Invalid key length: %d bytes (expected 16)
-", length($encryptionKey));
-                }
-                return 0;
-            }
-
-            my $iv = $segment->{iv};
-            $iv = sprintf('%032x', $segment->{sequence} || 0) unless defined $iv && length $iv;
-            my $hexKey = unpack('H*', $encryptionKey);
-
-            if (which('openssl')) {
-                my $opensslStderr = '';
-                my $ok = eval {
-                    run(
-                        ["openssl", "aes-128-cbc", "-d", "-in", "-", "-out", "-", "-K", $hexKey, "-iv", $iv],
-                        "<", \$chunk,
-                        ">", \$decryptedData,
-                        "2>", \$opensslStderr
-                    );
-                    1;
-                };
-                unless ($ok && defined $decryptedData && length $decryptedData) {
-                    if ($debug) {
-                        printf("OpenSSL decrypt failed for %s%s
-", $segment->{url}, length($opensslStderr) ? ": $opensslStderr" : '');
-                    }
-                    return 0;
-                }
-            } else {
-                my $ivBin = pack 'H*', $iv;
-                my $cipher = Crypt::CBC->new(
-                    -key     => $encryptionKey,
-                    -cipher  => 'Rijndael',
-                    -iv      => $ivBin,
-                    -header  => 'none',
-                    -padding => 'standard',
-                );
-                $decryptedData = $cipher->decrypt($chunk);
-            }
-        }
-
-        my $payload = $decryptedData;
-        my $isTsPayload = ($segment->{container} || 'ts') eq 'ts';
-        if (length($decryptedData) > 0) {
-            my $firstByte = unpack('C', substr($decryptedData, 0, 1));
-            if ($firstByte != 0x47) {
-                $isTsPayload = 0;
-                if ($debug) {
-                    printf("Info: Non-TS segment detected (first byte 0x%02X) for %s
-", $firstByte, $segment->{url});
-                }
-            }
-        }
-        if ($isTsPayload) {
-            $payload = correctMpegTsTimestamps($decryptedData, $channelId, $is_discontinuity);
-        }
-
-        eval {
-            print $client $payload;
-            $client->flush();
-        };
-        if ($@) {
-            printf("Failed to send data to client: %s
-", $@);
-            return 0;
-        }
-        return 1;
-    }
-    sub correctMpegTsTimestamps {
-        my ($data, $channelId, $is_discontinuity) = @_;
-        unless (exists $channel_timestamps{$channelId}) {
-            $channel_timestamps{$channelId} = {
-                last_pcr => undef,
-                last_pts => undef,
-                last_dts => undef,
-                pcr_offset => 0,
-                pts_offset => 0,
-                dts_offset => 0,
-                cc_counters => {},
-                discontinuity_reset => 0,
-                pcr_calculated => 0,
-                pts_calculated => 0,
-                dts_calculated => 0
-            };
-        }
-        my $ts_info = $channel_timestamps{$channelId};
-        if ($is_discontinuity) {
-            if ($debug) {
-                printf("DISCONTINUITY detected for channel %s\n", $channelId);
-            }
-            $ts_info->{discontinuity_reset} = 1;
-            $ts_info->{pending_discontinuity_indicator} = 1;
-            $ts_info->{pcr_calculated} = 0;
-            $ts_info->{pts_calculated} = 0;
-            $ts_info->{dts_calculated} = 0;
-            $ts_info->{cc_counters} = {};
-        }
-        my $output = '';
-        my $packet_size = 188;
-        my $data_length = length($data);
-        for (my $pos = 0; $pos < $data_length; $pos += $packet_size) {
-            my $packet_data = substr($data, $pos, $packet_size);
-            last if length($packet_data) < $packet_size;
-            my $sync_byte = unpack('C', substr($packet_data, 0, 1));
-            if ($sync_byte != 0x47) {
-                my $found_sync = 0;
-                for (my $i = 1; $i < $packet_size && ($pos + $i) < $data_length; $i++) {
-                    my $test_byte = unpack('C', substr($data, $pos + $i, 1));
-                    if ($test_byte == 0x47) {
-                        $pos += $i - $packet_size;
-                        $found_sync = 1;
-                        last;
-                    }
-                }
-                next unless $found_sync;
-            }
-            $packet_data = correctContinuityCounter($packet_data, $ts_info);
-            $packet_data = processTimestampsInPacket($packet_data, $ts_info);
-            $output .= $packet_data;
-        }
-        return $output;
+    my $corrected_dts = $dts;
+    if (defined $ts_info->{pcr_offset}) {
+        $corrected_dts = $dts + $ts_info->{pcr_offset};
     }
 
-    sub correctContinuityCounter {
-        my ($packet_data, $ts_info) = @_;
-        my @header = unpack('C4', substr($packet_data, 0, 4));
-        my $pid = (($header[1] & 0x1F) << 8) | $header[2];
-        unless (exists $ts_info->{cc_counters}->{$pid}) {
-            $ts_info->{cc_counters}->{$pid} = -1;
-        }
-        my $cc = ($ts_info->{cc_counters}->{$pid} + 1) % 16;
-        my $header_byte_4 = $header[3];
-        my $adaptation_control = $header_byte_4 & 0x30;
-        my $corrected_header_byte_4 = $adaptation_control | $cc;
-        substr($packet_data, 3, 1) = pack('C', $corrected_header_byte_4);
-        $ts_info->{cc_counters}->{$pid} = $cc;
-        return $packet_data;
-    }
+    $ts_info->{last_dts} = $corrected_dts;
+    $corrected_dts = $corrected_dts & (2**33 - 1);
+    $dts_bytes[0] = ($dts_bytes[0] & 0xF1) | (($corrected_dts >> 29) & 0x0E);
+    $dts_bytes[1] = ($corrected_dts >> 22) & 0xFF;
+    $dts_bytes[2] = (($corrected_dts >> 14) & 0xFE) | 0x01;
+    $dts_bytes[3] = ($corrected_dts >> 7) & 0xFF;
+    $dts_bytes[4] = (($corrected_dts << 1) & 0xFE) | 0x01;
+    substr($packet_data, $dts_offset, 5) = pack('C5', @dts_bytes);
+    return $packet_data;
+}
 
-    sub markDiscontinuityIndicator {
-        my ($packet_data, $offset, $adaptation_length, $ts_info) = @_;
-        return $packet_data unless $ts_info->{pending_discontinuity_indicator};
-        return $packet_data unless $adaptation_length && $adaptation_length >= 1;
-        my $flags = unpack('C', substr($packet_data, $offset, 1));
-        $flags |= 0x80;
-        substr($packet_data, $offset, 1) = pack('C', $flags);
-        $ts_info->{pending_discontinuity_indicator} = 0;
-        return $packet_data;
-    }
-
-    sub processTimestampsInPacket {
-        my ($packet_data, $ts_info) = @_;
-        my $pos = 4;
-        my @header = unpack('C4', substr($packet_data, 0, 4));
-        my $payload_start = ($header[1] & 0x40) >> 6;
-        my $adaptation_field = ($header[3] & 0x30) >> 4;
-        if ($adaptation_field == 2 || $adaptation_field == 3) {
-            my $adaptation_length = unpack('C', substr($packet_data, $pos, 1));
-            $pos++;
-            if ($adaptation_length > 0) {
-                $packet_data = markDiscontinuityIndicator($packet_data, $pos, $adaptation_length, $ts_info);
-                $packet_data = processPcr($packet_data, $pos, $adaptation_length, $ts_info);
-            }
-            $pos += $adaptation_length;
-        }
-        if (($adaptation_field == 1 || $adaptation_field == 3) && $payload_start && $pos < 188) {
-            $packet_data = processPesTimestamps($packet_data, $pos, $ts_info);
-        }
-        return $packet_data;
-    }
-
-    sub processPcr {
-        my ($packet_data, $offset, $adaptation_length, $ts_info) = @_;
-        my $pcr_ext;
-        return $packet_data if $adaptation_length < 1;
-        my $flags = unpack('C', substr($packet_data, $offset, 1));
-        my $pcr_flag = ($flags & 0x10) >> 4;
-        if ($pcr_flag && $adaptation_length >= 6) {
-            my @pcr_bytes = unpack('C6', substr($packet_data, $offset + 1, 6));
-            my $pcr_base = ($pcr_bytes[0] << 25) | ($pcr_bytes[1] << 17) |
-                ($pcr_bytes[2] << 9) | ($pcr_bytes[3] << 1) |
-                (($pcr_bytes[4] & 0x80) >> 7);
-            $pcr_ext = (($pcr_bytes[4] & 0x01) << 8) | $pcr_bytes[5];
-
-            if ($ts_info->{discontinuity_reset} && !$ts_info->{pcr_calculated} && defined $ts_info->{last_pcr}) {
-                # +9000 ticks = 100ms at 90kHz: ensures PCR moves forward, never stagnates
-                $ts_info->{pcr_offset} = $ts_info->{last_pcr} + 9000 - $pcr_base;
-                $ts_info->{pcr_calculated} = 1;
-                $ts_info->{discontinuity_reset} = 0;
-            }
-            my $corrected_pcr_base = $pcr_base + $ts_info->{pcr_offset};
-
-            $ts_info->{last_pcr} = $corrected_pcr_base;
-            $corrected_pcr_base = $corrected_pcr_base & (2**33 - 1);
-            $pcr_bytes[0] = ($corrected_pcr_base >> 25) & 0xFF;
-            $pcr_bytes[1] = ($corrected_pcr_base >> 17) & 0xFF;
-            $pcr_bytes[2] = ($corrected_pcr_base >> 9) & 0xFF;
-            $pcr_bytes[3] = ($corrected_pcr_base >> 1) & 0xFF;
-            $pcr_bytes[4] = (($corrected_pcr_base & 0x01) << 7) | (($pcr_ext >> 8) & 0x01);
-            $pcr_bytes[5] = $pcr_ext & 0xFF;
-            substr($packet_data, $offset + 1, 6) = pack('C6', @pcr_bytes);
-        }
-        return $packet_data;
-    }
-
-    sub processPesTimestamps {
-        my ($packet_data, $offset, $ts_info) = @_;
-        return $packet_data if $offset + 9 >= 188;
-        my @pes_start = unpack('C3', substr($packet_data, $offset, 3));
-        return $packet_data unless ($pes_start[0] == 0x00 && $pes_start[1] == 0x00 && $pes_start[2] == 0x01);
-        my $stream_id = unpack('C', substr($packet_data, $offset + 3, 1));
-        return $packet_data unless (($stream_id >= 0xC0 && $stream_id <= 0xDF) ||
-            ($stream_id >= 0xE0 && $stream_id <= 0xEF));
-        return $packet_data if $offset + 8 >= 188;
-        my $pes_flags = unpack('C', substr($packet_data, $offset + 7, 1));
-        my $pts_dts_flags = ($pes_flags & 0xC0) >> 6;
-        my $header_length = unpack('C', substr($packet_data, $offset + 8, 1));
-        return $packet_data unless $pts_dts_flags > 0;
-        return $packet_data if $offset + 9 + $header_length >= 188;
-        my $pts_offset = $offset + 9;
-        if ($pts_dts_flags >= 2 && $pts_offset + 4 < 188) {
-            $packet_data = correctPts($packet_data, $pts_offset, $ts_info);
-        }
-        if ($pts_dts_flags == 3 && $pts_offset + 9 < 188) {
-            $packet_data = correctDts($packet_data, $pts_offset + 5, $ts_info);
-        }
-        return $packet_data;
-    }
-
-    sub correctPts {
-        my ($packet_data, $pts_offset, $ts_info) = @_;
-        my @pts_bytes = unpack('C5', substr($packet_data, $pts_offset, 5));
-        my $pts = (($pts_bytes[0] & 0x0E) << 29) | ($pts_bytes[1] << 22) |
-            (($pts_bytes[2] & 0xFE) << 14) | ($pts_bytes[3] << 7) |
-            (($pts_bytes[4] & 0xFE) >> 1);
-
-        my $corrected_pts = $pts;
-        if (defined $ts_info->{pcr_offset}) {
-            $corrected_pts = $pts + $ts_info->{pcr_offset};
-        }
-
-        $ts_info->{last_pts} = $corrected_pts;
-        $corrected_pts = $corrected_pts & (2**33 - 1);
-        $pts_bytes[0] = ($pts_bytes[0] & 0xF1) | (($corrected_pts >> 29) & 0x0E);
-        $pts_bytes[1] = ($corrected_pts >> 22) & 0xFF;
-        $pts_bytes[2] = (($corrected_pts >> 14) & 0xFE) | 0x01;
-        $pts_bytes[3] = ($corrected_pts >> 7) & 0xFF;
-        $pts_bytes[4] = (($corrected_pts << 1) & 0xFE) | 0x01;
-        substr($packet_data, $pts_offset, 5) = pack('C5', @pts_bytes);
-        return $packet_data;
-    }
-
-    sub correctDts {
-        my ($packet_data, $dts_offset, $ts_info) = @_;
-        my @dts_bytes = unpack('C5', substr($packet_data, $dts_offset, 5));
-        my $dts = (($dts_bytes[0] & 0x0E) << 29) | ($dts_bytes[1] << 22) |
-            (($dts_bytes[2] & 0xFE) << 14) | ($dts_bytes[3] << 7) |
-            (($dts_bytes[4] & 0xFE) >> 1);
-
-        my $corrected_dts = $dts;
-        if (defined $ts_info->{pcr_offset}) {
-            $corrected_dts = $dts + $ts_info->{pcr_offset};
-        }
-
-        $ts_info->{last_dts} = $corrected_dts;
-        $corrected_dts = $corrected_dts & (2**33 - 1);
-        $dts_bytes[0] = ($dts_bytes[0] & 0xF1) | (($corrected_dts >> 29) & 0x0E);
-        $dts_bytes[1] = ($corrected_dts >> 22) & 0xFF;
-        $dts_bytes[2] = (($corrected_dts >> 14) & 0xFE) | 0x01;
-        $dts_bytes[3] = ($corrected_dts >> 7) & 0xFF;
-        $dts_bytes[4] = (($corrected_dts << 1) & 0xFE) | 0x01;
-        substr($packet_data, $dts_offset, 5) = pack('C5', @dts_bytes);
-        return $packet_data;
-    }
-
-    sub cleanupOldSegments {
-        my ($processedSegmentsRef) = @_;
-        my $now = time();
-        my $cutoffTime = $now - (15 * 60);
-        my $removedCount = 0;
-        for my $url (keys %$processedSegmentsRef) {
-            my $segmentTime = $processedSegmentsRef->{$url};
-            if ($segmentTime < $cutoffTime) {
-                delete $processedSegmentsRef->{$url};
-                $removedCount++;
-            }
-        }
-        if ($debug && $removedCount > 0) {
-            printf("Removed %d old segments.\n", $removedCount);
+sub cleanupOldSegments {
+    my ($processedSegmentsRef) = @_;
+    my $now = time();
+    my $cutoffTime = $now - (15 * 60);
+    my $removedCount = 0;
+    for my $url (keys %$processedSegmentsRef) {
+        my $segmentTime = $processedSegmentsRef->{$url};
+        if ($segmentTime < $cutoffTime) {
+            delete $processedSegmentsRef->{$url};
+            $removedCount++;
         }
     }
-
-
-    sub findChannelMetaById {
-        my ($channelId, $region) = @_;
-        $region ||= 'DE';
-        for my $channel (getChannelJson($region)) {
-            return $channel if ($channel->{id} || '') eq $channelId;
-        }
-        return undef;
+    if ($debug && $removedCount > 0) {
+        printf("Removed %d old segments.\n", $removedCount);
     }
+}
 
-    sub sendAdminPage {
-        my ($client, $request) = @_;
-        my $region = 'DE';
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
-        my $snapshot = buildAdminSnapshot($region);
-        my $snapshotJson = encode_json($snapshot);
-        my $regionOptions = '';
-        for my $r (sort keys %regions) {
-            my $sel = ($r eq $region) ? ' selected' : '';
-            $regionOptions .= "<option value=\"$r\"$sel>$r</option>\n";
-        }
-        my $html = <<'HTML';
-<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PlutoTV Admin</title>
-    <style>body{font-family:system-ui,Arial,sans-serif;background:#f3f4f6;color:#111827;margin:0}header{background:#111827;color:#fff;padding:14px 20px;display:flex;gap:12px;align-items:center}main{max-width:1200px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}.head{padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;gap:10px}.body{padding:16px}table{width:100%;border-collapse:collapse}th,td{padding:8px 10px;border-bottom:1px solid #f3f4f6;text-align:left}th{font-size:12px;color:#6b7280;text-transform:uppercase}.empty{padding:16px;color:#9ca3af;font-style:italic}input[type=text],input[type=number],select{padding:6px 8px;border:1px solid #d1d5db;border-radius:6px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.btn{padding:6px 10px;border:1px solid #111827;background:#111827;color:#fff;border-radius:6px;cursor:pointer}pre{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;max-height:260px;overflow:auto}.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#eef2ff}.on{background:#dcfce7}.off{background:#fee2e2}</style></head><body>
-<header><strong>PlutoTV Admin</strong><select id="regionSel">__REGION_OPTIONS__</select><span id="liveState" style="margin-left:auto">Verbinde...</span></header>
+
+sub findChannelMetaById {
+    my ($channelId, $region) = @_;
+    $region ||= 'DE';
+    for my $channel (getChannelJson($region)) {
+        return $channel if ($channel->{id} || '') eq $channelId;
+    }
+    return undef;
+}
+
+sub sendAdminPage {
+    my ($client, $request) = @_;
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'}
+        if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my $snapshot     = buildAdminSnapshot($region);
+    my $snapshotJson = encode_json($snapshot);
+    my $regionsJson  = encode_json([ sort keys %regions ]);
+    my $regionOpts   = join('', map {
+        my $sel = ($_ eq $region) ? ' selected' : '';
+        "<option value=\"$_\"$sel>$_</option>"
+    } sort keys %regions);
+
+    my $html = <<'HTML';
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>PlutoTV Admin</title>
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:system-ui,Arial,sans-serif;background:#f0f2f5;color:#1a1d23;font-size:14px}
+        header{background:#1a1d23;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:14px}
+        header h1{font-size:15px;font-weight:600}
+        .rsel{padding:4px 8px;border:1px solid #555;border-radius:5px;background:#2d3340;color:#fff;font-size:12px;cursor:pointer}
+        .sse-pill{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:11px;opacity:.75}
+        .dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
+        .dot.off{background:#ef4444}
+        main{padding:20px;max-width:1140px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+        .card{background:#fff;border-radius:8px;border:1px solid #e0e4ea;overflow:hidden}
+        .ch{padding:10px 16px;border-bottom:1px solid #e0e4ea;display:flex;align-items:center;gap:8px}
+        .ch h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#667085}
+        .cb{padding:0}
+        .search-wrap{padding:10px 14px;border-bottom:1px solid #f0f2f5}
+        .search-wrap input{width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:5px;font-size:13px;font-family:inherit}
+        .search-wrap input:focus{outline:none;border-color:#6366f1}
+        .ch-list{max-height:420px;overflow-y:auto}
+        .ch-row{display:flex;align-items:center;padding:8px 14px;border-bottom:1px solid #f5f7fa;gap:10px}
+        .ch-row:last-child{border-bottom:none}
+        .ch-row:hover{background:#fafbfc}
+        .ch-name{flex:1;font-size:13px}
+        .ch-id{font-size:11px;color:#9ca3af;font-family:ui-monospace,monospace}
+        /* Toggle switch */
+        .sw{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+        .sw input{opacity:0;width:0;height:0}
+        .sl{position:absolute;inset:0;background:#d1d5db;border-radius:20px;cursor:pointer;transition:.2s}
+        .sl:before{content:'';position:absolute;width:14px;height:14px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+        input:checked+.sl{background:#6366f1}
+        input:checked+.sl:before{transform:translateX(16px)}
+        .ch-empty{padding:20px;text-align:center;color:#9ca3af;font-style:italic}
+        table{width:100%;border-collapse:collapse}
+        th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af;padding:7px 10px;text-align:left;border-bottom:2px solid #f0f2f5;white-space:nowrap}
+        td{padding:9px 10px;border-bottom:1px solid #f5f7fa;vertical-align:middle}
+        tr:last-child td{border-bottom:none}
+        tr:hover td{background:#fafbfc}
+        code{font-family:ui-monospace,monospace;font-size:12px;background:#f0f2f5;padding:1px 5px;border-radius:3px}
+        .badge{display:inline-block;padding:2px 7px;border-radius:9px;font-size:11px;font-weight:600}
+        .badge-harmonize{background:#fff8e1;color:#8a6000}
+        .badge-copy{background:#e3f0ff;color:#1565c0}
+        .btns{display:flex;gap:5px;flex-wrap:wrap}
+        .btn{display:inline-flex;align-items:center;padding:4px 10px;border:1px solid #d1d5db;border-radius:5px;background:#fff;color:#374151;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
+        .btn:hover{background:#f3f4f6}
+        .btn-danger{background:#fef2f2;color:#c0392b;border-color:#fca5a5}
+        .btn-danger:hover{background:#fee2e2}
+        .btn-save{background:#1a1d23;color:#fff;border-color:#1a1d23}
+        .btn-save:hover{background:#2d3340}
+        .empty{color:#9ca3af;font-style:italic;text-align:center;padding:16px}
+        .cfg-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #f5f7fa}
+        .cfg-row:last-child{border-bottom:none}
+        .cfg-label{width:155px;font-size:13px;flex-shrink:0}
+        .cfg-hint{flex:1;font-size:12px;color:#9ca3af}
+        .cfg-num{width:70px;padding:4px 7px;border:1px solid #d1d5db;border-radius:5px;font-size:13px;font-family:inherit;text-align:right}
+        .cfg-num:focus{outline:none;border-color:#6366f1}
+        .cfg-unit{font-size:12px;color:#9ca3af;width:18px}
+        pre{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;line-height:1.6;color:#374151;max-height:190px;overflow-y:auto}
+        .loading{color:#9ca3af;padding:20px;text-align:center}
+        .toast{position:fixed;bottom:20px;right:20px;padding:9px 15px;border-radius:7px;font-size:13px;font-weight:500;background:#1a1d23;color:#fff;opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
+        .toast.show{opacity:1;transform:none}
+        .toast.err{background:#c0392b}
+    </style>
+</head>
+<body>
+<header>
+    <h1>&#127916; PlutoTV Admin</h1>
+    <select class="rsel" id="rsel">__REGION_OPTIONS__</select>
+    <div class="sse-pill">
+        <span class="dot off" id="sseDot"></span>
+        <span id="sseLabel">Verbinde...</span>
+    </div>
+</header>
 <main>
-    <div class="card"><div class="head"><strong>Sender-Harmonize</strong><span id="channelCnt"></span></div><div class="body"><div style="margin-bottom:12px"><input type="text" id="channelFilter" placeholder="Nach Sender filtern..." style="width:320px"></div><table><thead><tr><th>Sender</th><th>ID</th><th>Quelle</th><th>Effektiv</th><th>Persistent</th></tr></thead><tbody id="channelsTbody"><tr><td colspan="5" class="empty">Keine Sender.</td></tr></tbody></table></div></div>
-    <div class="card"><div class="head"><strong>Aktive Streams</strong><span id="streamsCnt"></span></div><div class="body"><table><thead><tr><th>Sender</th><th>Modus</th><th>Gewünscht</th><th>Start</th><th>PID</th></tr></thead><tbody id="streamsTbody"><tr><td colspan="5" class="empty">Keine aktiven Streams.</td></tr></tbody></table></div></div>
-    <div class="card"><div class="head"><strong>Konfiguration</strong></div><div class="body"><div class="grid"><label>Stall-Timeout<br><input type="number" id="cfgStall"></label><label>Startup-Timeout<br><input type="number" id="cfgStartup"></label><label>Max. Fehlversuche<br><input type="number" id="cfgFail"></label><label>Log-Tiefe<br><input type="number" id="cfgLogDepth"></label></div><div style="margin-top:12px"><button class="btn" id="saveCfg">Speichern</button></div></div></div>
-    <div class="card"><div class="head"><strong>Log</strong></div><div class="body"><pre id="logPre">Keine Einträge.</pre></div></div>
-</main><script>
-    (function(){var snap=__SNAPSHOT__;var region='__REGION__';var es; function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-        function post(path,params){var body=[]; for(var k in params){body.push(encodeURIComponent(k)+'='+encodeURIComponent(params[k]));} var xhr=new XMLHttpRequest(); xhr.open('POST',path); xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded'); xhr.send(body.join('&'));}
-        function renderChannels(channels){var filter=(document.getElementById('channelFilter').value||'').toLowerCase(); var rows=(channels||[]).filter(function(c){return !filter || String(c.channelName||'').toLowerCase().indexOf(filter)>=0;}); document.getElementById('channelCnt').textContent=rows.length+' sichtbar'; var tbody=document.getElementById('channelsTbody'); if(!rows.length){tbody.innerHTML='<tr><td colspan="5" class="empty">Keine Sender.</td></tr>'; return;} tbody.innerHTML=rows.map(function(c){var checked=(c.persistedHarmonize===1)?' checked':''; var eff=c.effectiveHarmonize?'<span class="tag on">harmonize</span>':'<span class="tag off">copy</span>'; return '<tr><td>'+esc(c.channelName)+'</td><td><code>'+esc(c.channelId)+'</code></td><td>'+esc(c.source||'default')+'</td><td>'+eff+'</td><td><input type="checkbox" data-channel-id="'+esc(c.channelId)+'"'+checked+'></td></tr>';}).join('');}
-        function renderStreams(streams){var tbody=document.getElementById('streamsTbody'); document.getElementById('streamsCnt').textContent=(streams||[]).length+' aktiv'; if(!(streams||[]).length){tbody.innerHTML='<tr><td colspan="5" class="empty">Keine aktiven Streams.</td></tr>'; return;} tbody.innerHTML=streams.map(function(s){return '<tr><td>'+esc(s.channelName)+'<br><code>'+esc(s.channelId)+'</code></td><td>'+esc(s.mode)+'</td><td>'+esc(s.desiredMode)+'</td><td>'+esc(s.started)+'</td><td>'+esc(s.pid)+'</td></tr>';}).join('');}
-        function renderLogs(logs){document.getElementById('logPre').textContent=(logs||[]).map(function(l){return '['+l.ts+'] '+l.line;}).join('\n')||'Keine Einträge.';}
-        function renderConfig(cfg){if(!cfg)return; document.getElementById('cfgStall').value=cfg.stall_timeout||15; document.getElementById('cfgStartup').value=cfg.startup_timeout||30; document.getElementById('cfgFail').value=cfg.max_failures||5; document.getElementById('cfgLogDepth').value=cfg.log_depth||10;}
-        function render(s){renderChannels(s.channels||[]); renderStreams(s.streams||[]); renderLogs(s.logs||[]); renderConfig(s.config||{});} document.getElementById('channelFilter').addEventListener('input',function(){render(snap);}); document.getElementById('channelsTbody').addEventListener('change',function(ev){var t=ev.target; if(t&&t.matches('input[data-channel-id]')){post('/admin/toggle_harmonize',{channelId:t.getAttribute('data-channel-id'),enabled:t.checked?1:0,region:region});}}); document.getElementById('saveCfg').addEventListener('click',function(){post('/admin/set_config',{stall_timeout:document.getElementById('cfgStall').value,startup_timeout:document.getElementById('cfgStartup').value,max_failures:document.getElementById('cfgFail').value,log_depth:document.getElementById('cfgLogDepth').value});}); document.getElementById('regionSel').onchange=function(){location.href='/admin?region='+encodeURIComponent(this.value);}; function connect(){document.getElementById('liveState').textContent='Verbinde...'; es=new EventSource('/admin/events?region='+encodeURIComponent(region)); es.addEventListener('snapshot',function(ev){try{snap=JSON.parse(ev.data); render(snap);}catch(e){}}); es.onopen=function(){document.getElementById('liveState').textContent='Live verbunden';}; es.onerror=function(){document.getElementById('liveState').textContent='Getrennt'; try{es.close();}catch(e){} setTimeout(connect,3000);};} render(snap); connect();})();
-</script></body></html>
-HTML
-        $html =~ s/__SNAPSHOT__/$snapshotJson/;
-        $html =~ s/__REGION__/$region/g;
-        $html =~ s/__REGION_OPTIONS__/$regionOptions/;
-        my $response = HTTP::Response->new();
-        $response->header('content-type' => 'text/html; charset=utf-8');
-        $response->code(200);
-        $response->message('OK');
-        $response->content(encode_utf8($html));
-        $client->send_response($response);
-    }
 
-    sub sendRedirect {
-        my ($client, $location) = @_;
-        my $response = HTTP::Response->new(303);
-        $response->header('Location' => $location);
-        $response->content('');
-        $client->send_response($response);
-    }
+    <!-- Channel list with harmonize toggles -->
+    <div class="card">
+        <div class="ch">
+            <h2>Sender-Konfiguration</h2>
+            <span id="chCount" style="font-size:11px;color:#9ca3af;margin-left:auto"></span>
+        </div>
+        <div class="search-wrap">
+            <input type="text" id="chSearch" placeholder="Sender suchen..." oninput="filterChannels(this.value)">
+        </div>
+        <div class="ch-list" id="chList">
+            <div class="loading">Lade Sender...</div>
+        </div>
+    </div>
 
-    sub handleAdminToggleHarmonize {
-        my ($client, $request) = @_;
-        my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
-        my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
-        my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
-        unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
-        my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
-        my $ok = setHarmonizeOverride($channelId, $on);
-        unless ($ok) { sendJsonError($client, 'Persistenz fehlgeschlagen'); return; }
-        appendRecentLog(($on ? 'Persistentes Harmonize an: ' : 'Persistentes Harmonize aus: ') . $channelId);
-        sendJsonOk($client, msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'));
-    }
+    <!-- Active streams -->
+    <div class="card">
+        <div class="ch">
+            <span class="dot off" id="streamsDot"></span>
+            <h2>Aktive Streams</h2>
+            <span id="streamsCnt" style="font-size:11px;color:#9ca3af;margin-left:auto"></span>
+        </div>
+        <table>
+            <thead><tr>
+                <th>Sender</th><th>Modus</th><th>Start</th><th>Aktionen</th>
+            </tr></thead>
+            <tbody id="streamsTbody">
+            <tr><td colspan="4" class="empty">Keine aktiven Streams.</td></tr>
+            </tbody>
+        </table>
+    </div>
 
-    sub handleAdminForceDiscontinuity {
-        my ($client, $request) = @_;
-        my $params    = try { HTTP::Request::Params->new({ req => $request })->params };
-        my $channelId = ($params && $params->{channelId}) ? $params->{channelId} : '';
-        unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
-        queueForcedDiscontinuity($channelId);
-        appendRecentLog('DISCONTINUITY vorgemerkt: ' . $channelId);
-        sendJsonOk($client, msg => 'DISCONTINUITY vorgemerkt');
-    }
+    <!-- Config -->
+    <div class="card">
+        <div class="ch">
+            <h2>Konfiguration</h2>
+            <span style="font-size:11px;color:#9ca3af;margin-left:6px">(ab naechstem Stream-Start)</span>
+        </div>
+        <div style="padding:12px 16px">
+            <div class="cfg-row">
+                <span class="cfg-label">Stall-Timeout</span>
+                <span class="cfg-hint">Sekunden ohne ffmpeg-Output bis Neustart</span>
+                <input class="cfg-num" type="number" id="cfgStall" min="5" max="120" value="30">
+                <span class="cfg-unit">s</span>
+            </div>
+            <div class="cfg-row">
+                <span class="cfg-label">Max. Fehlversuche</span>
+                <span class="cfg-hint">Wie oft ein Batch neu startet</span>
+                <input class="cfg-num" type="number" id="cfgFail" min="1" max="20" value="5">
+                <span class="cfg-unit"></span>
+            </div>
+            <div class="cfg-row">
+                <span class="cfg-label">Log-Tiefe</span>
+                <span class="cfg-hint">Gespeicherte Log-Eintraege</span>
+                <input class="cfg-num" type="number" id="cfgLog" min="5" max="100" value="10">
+                <span class="cfg-unit"></span>
+            </div>
+            <div style="margin-top:12px">
+                <button class="btn btn-save" onclick="saveConfig()">Speichern</button>
+            </div>
+        </div>
+    </div>
 
+    <!-- Log -->
+    <div class="card">
+        <div class="ch"><h2>Log</h2></div>
+        <div style="padding:12px 16px"><pre id="logPre">Keine Eintraege.</pre></div>
+    </div>
 
-    sub handleAdminRestartStream {
-        my ($client, $request) = @_;
-        my $params = try { HTTP::Request::Params->new({ req => $request })->params };
-        my $key = ($params && $params->{key}) ? $params->{key} : '';
-        unless ($key) { sendJsonError($client, 'Fehlender key'); return; }
-        my $streams = loadActiveStreams();
-        my $entry   = $streams->{$key};
-        unless (ref($entry) eq 'HASH' && $entry->{pid}) {
-            sendJsonError($client, 'Stream nicht gefunden'); return;
+</main>
+<div class="toast" id="toast"></div>
+<script>
+    (function(){
+        'use strict';
+        var snap0      = __SNAPSHOT__;
+        var region0    = '__REGION__';
+        var allRegions = __REGIONS__;
+        var channels   = [];  // [{id, name, harmonize}]
+
+    // Region selector
+        document.getElementById('rsel').onchange = function(){
+            location.href = '/admin?region=' + encodeURIComponent(this.value);
+        };
+
+        function esc(s){
+            return String(s==null?'':s)
+                .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
-        kill('TERM', $entry->{pid});
-        appendRecentLog('Neustart: ' . ($entry->{channelId} || $key));
-        sendJsonOk($client);
-    }
-
-    sub processRequest {
-        my ($client) = @_;
-        my $request = $client->get_request() or die("could not get Client-Request.\n");
-        $client->autoflush(1);
-        my $path = $request->uri->path;
-        if ($debug) {
-            printf("Request received for path $path\n");
+        function toast(msg, err){
+            var t=document.getElementById('toast');
+            t.textContent=msg; t.className='toast show'+(err?' err':'');
+            clearTimeout(t._t); t._t=setTimeout(function(){t.className='toast';},2500);
         }
-        if ($path eq "/playlist") {
-            sendM3uFile($client, 0, $request);
-        } elsif ($path eq "/tvheadend") {
-            sendM3uFile($client, 1, $request);
-        } elsif ($path =~ m{^/stream/}) {
-            sendDirectStream($client, $request);
-        } elsif ($path eq "/proxy.m3u8") {
-            sendPlaylistProxy($client, $request);
-        } elsif ($path eq "/master3u8") {
-            sendMasterAlias($client, $request);
-        } elsif ($path eq "/epg") {
-            sendXmltvEpgFile($client, $request);
-        } elsif ($path =~ m{^/dynamic_stream/}) {
-            sendDynamicStream($client, $request);
-        } elsif ($path =~ m{^/dynamic_video_stream/}) {
-            sendElementaryDynamicStream($client, $request, 'video');
-        } elsif ($path =~ m{^/dynamic_audio_stream/}) {
-            sendElementaryDynamicStream($client, $request, 'audio');
-        } elsif ($path eq "/admin") {
-            sendAdminPage($client, $request);
-        } elsif ($path eq "/admin/events") {
-            sendAdminEvents($client, $request);
-        } elsif ($path eq "/admin/toggle_harmonize") {
-            handleAdminToggleHarmonize($client, $request);
-        } elsif ($path eq "/admin/force_discontinuity") {
-            handleAdminForceDiscontinuity($client, $request);
-        } elsif ($path eq "/admin/set_config") {
-            handleAdminSetConfig($client, $request);
-        } elsif ($path eq "/admin/restart_stream") {
-            handleAdminRestartStream($client, $request);
-        } elsif ($path eq "/favicon.ico") {
-            my $response = HTTP::Response->new(204);
-            $client->send_response($response);
-        } elsif ($path eq "/") {
-            sendHelp($client, $request);
-        } else {
-            $client->send_error(RC_NOT_FOUND, "No such path available: $path");
-        }
-    }
-
-    if (!$localhost) {
-        $hostIp = Net::Address::IP::Local->public_ipv4;
-    }
-
-    if (defined(getArgsValue("--port"))) {
-        $port = getArgsValue("--port");
-    }
-
-    my $daemon = HTTP::Daemon->new(
-        LocalAddr => $hostIp,
-        LocalPort => $port,
-        Reuse => 1,
-        ReuseAddr => 1,
-        ReusePort => $port,
-    ) or die "Server could not be started.\n\n";
-
-    $SIG{PIPE} = sub {
-        if ($debug) {
-            printf("SIGPIPE received - client disconnected\n");
-        }
-        exit(0);
-    };
-    $SIG{CHLD} = 'IGNORE';
-
-    printf("PlutoTVServer started in version $version listening on $hostIp using port $port.\n");
-    appendRecentLog("Serverstart auf $hostIp:$port");
-
-    while (my $client = $daemon->accept) {
-        if (forkProcess() == 1) {
-            try {
-                processRequest($client);
-            } catch {
-                warn "Error processing request: $_\n";
+        function api(path, data, cb){
+            var body=Object.keys(data).map(function(k){
+                return encodeURIComponent(k)+'='+encodeURIComponent(data[k]);
+            }).join('&');
+            var xhr=new XMLHttpRequest();
+            xhr.open('POST',path);
+            xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+            xhr.onload=function(){
+                try{
+                    var d=JSON.parse(xhr.responseText);
+                    if(d.ok) toast(d.msg||'OK'); else toast(d.error||'Fehler',true);
+                    if(cb) cb(d);
+                }catch(e){toast('Fehler',true);}
             };
-            exit(0);
+            xhr.onerror=function(){toast('Netzwerkfehler',true);};
+            xhr.send(body);
         }
-    }}
+
+    // ── Channel list ─────────────────────────────────────────────────────────────
+        function renderChannels(filter){
+            var list=document.getElementById('chList');
+            var q=(filter||'').toLowerCase().trim();
+            var visible=q ? channels.filter(function(c){
+                return (c.name||'').toLowerCase().indexOf(q)>=0 ||
+                    (c.id||'').toLowerCase().indexOf(q)>=0;
+            }) : channels;
+
+            document.getElementById('chCount').textContent =
+                channels.length + ' Sender' + (q ? ', '+visible.length+' gefiltert' : '');
+
+            if(!visible.length){
+                list.innerHTML='<div class="ch-empty">Keine Treffer.</div>';
+                return;
+            }
+            list.innerHTML = visible.map(function(c){
+                var chk = c.harmonize ? ' checked' : '';
+                return '<div class="ch-row" data-id="'+esc(c.id)+'">'
+                    + '<span class="ch-name">'+esc(c.name)+'</span>'
+                    + '<span class="ch-id">'+esc(c.id)+'</span>'
+                    + '<label class="sw"><input type="checkbox"'+chk+' onchange="toggleHarmonize(\''+esc(c.id)+'\',this.checked)">'
+                    + '<span class="sl"></span></label>'
+                    + '</div>';
+            }).join('');
+        }
+
+        window.filterChannels = function(v){ renderChannels(v); };
+
+        window.toggleHarmonize = function(channelId, on){
+            api('/admin/toggle_harmonize',
+                {channelId: channelId, enabled: on?'1':'0', region: region0},
+                function(d){
+                    if(!d.ok) return;
+                    // Update local cache
+                    var ch=channels.find(function(c){return c.id===channelId;});
+                    if(ch){ ch.harmonize=on?1:0; }
+                });
+        };
+
+        function loadChannels(){
+            var xhr=new XMLHttpRequest();
+            xhr.open('GET','/admin/channels?region='+encodeURIComponent(region0));
+            xhr.onload=function(){
+                try{
+                    channels=JSON.parse(xhr.responseText);
+                    renderChannels(document.getElementById('chSearch').value);
+                }catch(e){
+                    document.getElementById('chList').innerHTML=
+                        '<div class="ch-empty">Fehler beim Laden.</div>';
+                }
+            };
+            xhr.onerror=function(){
+                document.getElementById('chList').innerHTML=
+                    '<div class="ch-empty">Netzwerkfehler.</div>';
+            };
+            xhr.send();
+        }
+
+    // ── Active streams ────────────────────────────────────────────────────────────
+        function renderStreams(streams){
+            var tbody=document.getElementById('streamsTbody');
+            var sdot=document.getElementById('streamsDot');
+            var cnt=document.getElementById('streamsCnt');
+            sdot.className='dot'+(streams.length?'':' off');
+            cnt.textContent=streams.length?(streams.length+' aktiv'):'';
+            if(!streams.length){
+                tbody.innerHTML='<tr><td colspan="4" class="empty">Keine aktiven Streams.</td></tr>';
+                return;
+            }
+            tbody.innerHTML=streams.map(function(e){
+                return '<tr>'
+                    +'<td><strong>'+esc(e.channelName)+'</strong><br>'
+                    +'<span style="font-size:11px;color:#9ca3af">'+esc(e.channelId)+'</span></td>'
+                    +'<td><span class="badge badge-'+esc(e.mode)+'">'+esc(e.mode)+'</span></td>'
+                    +'<td>'+esc(e.started)+'</td>'
+                    +'<td><div class="btns">'
+                    +'<button class="btn btn-danger" onclick="restartStream(\''+esc(e.key)+'\')">'
+                    +'&#8635; Neustart</button>'
+                    +'</div></td>'
+                    +'</tr>';
+            }).join('');
+        }
+
+        window.restartStream = function(key){
+            api('/admin/restart_stream',{key:key});
+        };
+
+    // ── Config ────────────────────────────────────────────────────────────────────
+        function renderConfig(cfg){
+            if(!cfg) return;
+            if(cfg.stall_timeout!=null) document.getElementById('cfgStall').value=cfg.stall_timeout;
+            if(cfg.max_failures!=null)  document.getElementById('cfgFail').value=cfg.max_failures;
+            if(cfg.log_depth!=null)     document.getElementById('cfgLog').value=cfg.log_depth;
+        }
+        window.saveConfig = function(){
+            api('/admin/set_config',{
+                stall_timeout: document.getElementById('cfgStall').value,
+                max_failures:  document.getElementById('cfgFail').value,
+                log_depth:     document.getElementById('cfgLog').value
+            });
+        };
+
+    // ── Render SSE snapshot ───────────────────────────────────────────────────────
+        function renderLogs(logs){
+            document.getElementById('logPre').textContent =
+                (logs||[]).map(function(l){return '['+l.ts+'] '+l.line;}).join('\n')
+                || 'Keine Eintraege.';
+        }
+        function render(s){
+            renderStreams(s.streams||[]);
+            renderLogs(s.logs||[]);
+            renderConfig(s.config);
+            // Update harmonize state in channel list from snapshot harmonizeList
+            if(s.harmonizeList){
+                var hmSet={};
+                (s.harmonizeList||[]).forEach(function(e){ hmSet[e.channelId]=1; });
+                channels.forEach(function(c){ c.harmonize=hmSet[c.id]?1:0; });
+                renderChannels(document.getElementById('chSearch').value);
+            }
+        }
+
+    // ── SSE ───────────────────────────────────────────────────────────────────────
+        var es, retryT;
+        function connectSSE(){
+            var dot=document.getElementById('sseDot');
+            var lbl=document.getElementById('sseLabel');
+            if(es){try{es.close();}catch(e){}}
+            dot.className='dot off'; lbl.textContent='Verbinde...';
+            es=new EventSource('/admin/events?region='+encodeURIComponent(region0));
+            es.addEventListener('snapshot',function(ev){
+                try{render(JSON.parse(ev.data));}catch(e){}
+            });
+            es.onopen=function(){dot.className='dot';lbl.textContent='Live';clearTimeout(retryT);};
+            es.onerror=function(){
+                dot.className='dot off';lbl.textContent='Getrennt';
+                es.close();retryT=setTimeout(connectSSE,3000);
+            };
+        }
+
+    // ── Init ──────────────────────────────────────────────────────────────────────
+        render(snap0);
+        loadChannels();
+        connectSSE();
+    })();
+</script>
+</body>
+</html>
+HTML
+
+    $html =~ s/__SNAPSHOT__/$snapshotJson/;
+    $html =~ s/__REGION__/$region/g;
+    $html =~ s/__REGION_OPTIONS__/$regionOpts/;
+    $html =~ s/__REGIONS__/$regionsJson/;
+
+    my $resp = HTTP::Response->new(200);
+    $resp->header('content-type' => 'text/html; charset=utf-8');
+    $resp->code(200);
+    $resp->message('OK');
+    $resp->content(encode_utf8($html));
+    $client->send_response($resp);
+}
+
+sub sendJsonOk {
+    my ($client, %extra) = @_;
+    my $r = HTTP::Response->new(200);
+    $r->header('Content-Type' => 'application/json; charset=utf-8');
+    $r->content(encode_json({ ok => 1, %extra }));
+    $client->send_response($r);
+}
+sub sendJsonError {
+    my ($client, $msg) = @_;
+    my $r = HTTP::Response->new(400);
+    $r->header('Content-Type' => 'application/json; charset=utf-8');
+    $r->content(encode_json({ ok => 0, error => ($msg || 'error') }));
+    $client->send_response($r);
+}
+
+sub sendAdminChannels {
+    my ($client, $request) = @_;
+    my $region = 'DE';
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    $region = $params->{'region'}
+        if $params && $params->{'region'} && exists $regions{$params->{'region'}};
+    my @channels  = getChannelJson($region);
+    my $harmonize = loadHarmonizeOverrides();
+    my @result = map {
+        { id        => ($_->{id} || ''),
+            name      => ($_->{name} || ''),
+            harmonize => ($harmonize->{$_->{id} || ''} ? 1 : 0) }
+    } sort { lc($a->{name}||'') cmp lc($b->{name}||'') }
+        grep { ($_->{number}||0) > 0 } @channels;
+    my $r = HTTP::Response->new(200);
+    $r->header('Content-Type' => 'application/json; charset=utf-8');
+    $r->content(encode_json(\@result));
+    $client->send_response($r);
+}
+
+sub handleAdminSetConfig {
+    my ($client, $request) = @_;
+    my $params  = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $cfg     = loadRuntimeConfig();
+    my $changed = 0;
+    my %limits  = (stall_timeout => [5, 120], max_failures => [1, 20], log_depth => [5, 100]);
+    for my $key (keys %limits) {
+        next unless $params && defined $params->{$key} && $params->{$key} =~ /^\d+$/;
+        my $val = int($params->{$key});
+        my ($lo, $hi) = @{$limits{$key}};
+        $val = $lo if $val < $lo; $val = $hi if $val > $hi;
+        $cfg->{$key} = $val; $changed = 1;
+    }
+    if ($changed) {
+        saveRuntimeConfig($cfg);
+        appendRecentLog(sprintf('Config: stall=%ds fail=%d logs=%d',
+            $cfg->{stall_timeout}||30, $cfg->{max_failures}||5, $cfg->{log_depth}||10));
+        sendJsonOk($client);
+    } else {
+        sendJsonError($client, 'Keine gueltigen Parameter');
+    }
+}
+
+sub handleAdminRestartStream {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $key    = ($params && $params->{key}) ? $params->{key} : '';
+    unless ($key) { sendJsonError($client, 'Fehlender key'); return; }
+    my $streams = loadActiveStreams();
+    my $entry   = $streams->{$key};
+    unless (ref($entry) eq 'HASH' && $entry->{pid}) {
+        sendJsonError($client, 'Stream nicht gefunden'); return;
+    }
+    kill('TERM', $entry->{pid});
+    appendRecentLog('Neustart: ' . ($entry->{channelId} || $key));
+    sendJsonOk($client);
+}
+
+sub sendRedirect {
+    my ($client, $location) = @_;
+    my $response = HTTP::Response->new(303);
+    $response->header('Location' => $location);
+    $response->content('');
+    $client->send_response($response);
+}
+
+sub handleAdminToggleHarmonize {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
+    my $enabled = $params && defined $params->{enabled} ? $params->{enabled} : 0;
+    my $region = $params && $params->{region} ? $params->{region} : 'DE';
+
+    unless ($channelId) {
+        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
+        return;
+    }
+
+    my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
+    setHarmonizeOverride($channelId, $on);
+    appendRecentLog(($on ? 'Harmonize aktiviert: ' : 'Harmonize deaktiviert: ') . $channelId);
+    my $channel = findChannelMetaById($channelId, $region);
+    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
+    my $msg = $on
+        ? "Harmonize für $name aktiviert."
+        : "Harmonize für $name deaktiviert.";
+    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
+}
+
+sub handleAdminForceDiscontinuity {
+    my ($client, $request) = @_;
+    my $params = try { HTTP::Request::Params->new({ req => $request })->params };
+    my $channelId = $params && $params->{channelId} ? $params->{channelId} : '';
+    my $region = $params && $params->{region} ? $params->{region} : 'DE';
+
+    unless ($channelId) {
+        sendRedirect($client, '/admin?msg=' . uri_escape_utf8('Fehlende channelId') . '&region=' . uri_escape_utf8($region));
+        return;
+    }
+
+    queueForcedDiscontinuity($channelId);
+    appendRecentLog('DISCONTINUITY vorgemerkt: ' . $channelId);
+    my $channel = findChannelMetaById($channelId, $region);
+    my $name = $channel ? ($channel->{name} || $channelId) : $channelId;
+    my $msg = "DISCONTINUITY wird beim nächsten m3u8 für $name eingefügt.";
+    sendRedirect($client, '/admin?msg=' . uri_escape_utf8($msg) . '&region=' . uri_escape_utf8($region));
+}
+
+sub processRequest {
+    my ($client) = @_;
+    my $request = $client->get_request() or die("could not get Client-Request.\n");
+    $client->autoflush(1);
+    my $path = $request->uri->path;
+    if ($debug) {
+        printf("Request received for path $path\n");
+    }
+    if ($path eq "/playlist") {
+        sendM3uFile($client, 0, $request);
+    } elsif ($path eq "/tvheadend") {
+        sendM3uFile($client, 1, $request);
+    } elsif ($path =~ m{^/stream/}) {
+        sendDirectStream($client, $request);
+    } elsif ($path eq "/proxy.m3u8") {
+        sendPlaylistProxy($client, $request);
+    } elsif ($path eq "/master3u8") {
+        sendMasterAlias($client, $request);
+    } elsif ($path eq "/epg") {
+        sendXmltvEpgFile($client, $request);
+    } elsif ($path =~ m{^/dynamic_stream/}) {
+        sendDynamicStream($client, $request);
+    } elsif ($path eq "/admin") {
+        sendAdminPage($client, $request);
+    } elsif ($path eq "/admin/events") {
+        sendAdminEvents($client, $request);
+    } elsif ($path eq "/admin/toggle_harmonize") {
+        handleAdminToggleHarmonize($client, $request);
+    } elsif ($path eq "/admin/force_discontinuity") {
+        handleAdminForceDiscontinuity($client, $request);
+    } elsif ($path eq "/admin/channels") {
+        sendAdminChannels($client, $request);
+    } elsif ($path eq "/admin/set_config") {
+        handleAdminSetConfig($client, $request);
+    } elsif ($path eq "/admin/restart_stream") {
+        handleAdminRestartStream($client, $request);
+    } elsif ($path eq "/favicon.ico") {
+        my $response = HTTP::Response->new(204);
+        $client->send_response($response);
+    } elsif ($path eq "/") {
+        sendHelp($client, $request);
+    } else {
+        $client->send_error(RC_NOT_FOUND, "No such path available: $path");
+    }
+}
+
+if (!$localhost) {
+    $hostIp = Net::Address::IP::Local->public_ipv4;
+}
+
+if (defined(getArgsValue("--port"))) {
+    $port = getArgsValue("--port");
+}
+
+my $daemon = HTTP::Daemon->new(
+    LocalAddr => $hostIp,
+    LocalPort => $port,
+    Reuse => 1,
+    ReuseAddr => 1,
+    ReusePort => $port,
+) or die "Server could not be started.\n\n";
+
+$SIG{PIPE} = sub {
+    if ($debug) {
+        printf("SIGPIPE received - client disconnected\n");
+    }
+    exit(0);
+};
+$SIG{CHLD} = 'IGNORE';
+
+printf("PlutoTVServer started in version $version listening on $hostIp using port $port.\n");
+appendRecentLog("Serverstart auf $hostIp:$port");
+
+while (my $client = $daemon->accept) {
+    if (forkProcess() == 1) {
+        try {
+            processRequest($client);
+        } catch {
+            warn "Error processing request: $_\n";
+        };
+        exit(0);
+    }
+}
