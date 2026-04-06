@@ -442,24 +442,29 @@ sub buildChannelAdminEntries {
 sub handleAdminSetConfig {
     my ($client, $request) = @_;
     my $params = try { HTTP::Request::Params->new({ req => $request })->params } || {};
-    my $stall = int($params->{stall_timeout} || 15);
-    my $fails = int($params->{max_failures}  || 5);
-    my $depth = int($params->{log_depth}     || 10);
+    my $stall   = int($params->{stall_timeout}   || 15);
+    my $startup = int($params->{startup_timeout} || 45);
+    my $fails   = int($params->{max_failures}    || 5);
+    my $depth   = int($params->{log_depth}       || 10);
 
-    $stall = 5   if $stall < 5;
-    $stall = 120 if $stall > 120;
-    $fails = 1   if $fails < 1;
-    $fails = 20  if $fails > 20;
-    $depth = 5   if $depth < 5;
-    $depth = 100 if $depth > 100;
+    $stall   = 5   if $stall < 5;
+    $stall   = 120 if $stall > 120;
+    $startup = 5   if $startup < 5;
+    $startup = 180 if $startup > 180;
+    $startup = $stall if $startup < $stall;
+    $fails   = 1   if $fails < 1;
+    $fails   = 20  if $fails > 20;
+    $depth   = 5   if $depth < 5;
+    $depth   = 100 if $depth > 100;
 
     saveRuntimeConfig({
-        stall_timeout => $stall,
-        max_failures  => $fails,
-        log_depth     => $depth,
+        stall_timeout   => $stall,
+        startup_timeout => $startup,
+        max_failures    => $fails,
+        log_depth       => $depth,
     });
 
-    appendRecentLog("Konfiguration gespeichert: stall=${stall}s, fail=${fails}, log=${depth}");
+    appendRecentLog("Konfiguration gespeichert: stall=${stall}s, startup=${startup}s, fail=${fails}, log=${depth}");
     sendJsonOk($client, msg => 'Konfiguration gespeichert');
 }
 
@@ -2086,7 +2091,7 @@ sub streamHlsViaFfmpeg {
         unless ($videoWindow) {
             $idleLoops++;
             if ($idleLoops % 5 == 0) {
-                appendRecentLog('Keine neues Harmonize-Fenster verfuegbar: ' . $channelId);
+                appendRecentLog('Kein neues Harmonize-Fenster verfuegbar: ' . $channelId);
                 my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
                 $videoUrl = $freshVideo if $freshVideo;
                 $audioUrl = $freshAudio if $freshAudio;
@@ -2097,6 +2102,12 @@ sub streamHlsViaFfmpeg {
         $idleLoops = 0;
 
         my $audioWindow = findMatchingWindow($audioWindows, \%processedAudioWindows);
+        appendRecentLog('Harmonize-Fenster: ' . $channelId
+            . ' v=' . ($videoWindow->{startSequence}//'?') . '-' . ($videoWindow->{endSequence}//'?')
+            . ' seg=' . scalar(@{ $videoWindow->{segments} || [] })
+            . ($audioWindow ? (' a=' . ($audioWindow->{startSequence}//'?') . '-' . ($audioWindow->{endSequence}//'?')
+            . ' aseg=' . scalar(@{ $audioWindow->{segments} || [] })) : ' ohne-audio-window'));
+
         my %window = (
             id => $videoWindow->{id},
             videoSegments => $videoWindow->{segments},
@@ -2116,6 +2127,7 @@ sub streamHlsViaFfmpeg {
         return 'switch' if defined $result && $result eq 'switch';
         unless ($result) {
             $failures++;
+            appendRecentLog('Harmonize-Fenster ohne Output beendet: ' . $channelId . ' (Versuch ' . $failures . '/' . $maxFailures . ')');
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
@@ -2127,6 +2139,7 @@ sub streamHlsViaFfmpeg {
         $failures = 0;
     }
 
+    appendRecentLog('Harmonize-Stream nach Max-Fehlversuchen beendet: ' . $channelId);
     return 0;
 }
 
@@ -2913,7 +2926,8 @@ sub sendAdminPage {
     <div class="card">
         <div class="card-head"><h2>Konfiguration</h2></div>
         <div class="card-body">
-            <div class="cfg-row"><label>Stall-Timeout</label><input type="number" id="cfgStall" min="5" max="120"><span class="muted">Sekunden ohne ffmpeg-Output</span></div>
+            <div class="cfg-row"><label>Stall-Timeout</label><input type="number" id="cfgStall" min="5" max="120"><span class="muted">Sekunden ohne ffmpeg-Output nach erstem Datenpaket</span></div>
+            <div class="cfg-row"><label>Startup-Timeout</label><input type="number" id="cfgStartup" min="5" max="180"><span class="muted">Sekunden bis zum ersten ffmpeg-Output</span></div>
             <div class="cfg-row"><label>Max. Fehlversuche</label><input type="number" id="cfgFail" min="1" max="20"><span class="muted">Neustarts pro Stream</span></div>
             <div class="cfg-row"><label>Log-Tiefe</label><input type="number" id="cfgLogDepth" min="5" max="100"><span class="muted">Gespeicherte Logzeilen</span></div>
             <div style="margin-top:12px"><button class="btn btn-primary" onclick="saveConfig()">Speichern</button></div>
