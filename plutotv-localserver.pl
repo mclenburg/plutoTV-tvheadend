@@ -501,9 +501,10 @@ sub buildAdminSnapshot {
         channels => $channels,
         logs     => \@recent,
         config   => {
-            stall_timeout => int(getConfigValue('stall_timeout', 15)),
-            max_failures  => int(getConfigValue('max_failures',  5)),
-            log_depth     => int(getConfigValue('log_depth',     10)),
+            stall_timeout   => int(getConfigValue('stall_timeout', 15)),
+            startup_timeout => int(getConfigValue('startup_timeout', 45)),
+            max_failures    => int(getConfigValue('max_failures',  5)),
+            log_depth       => int(getConfigValue('log_depth',     10)),
         },
     };
 }
@@ -1878,7 +1879,7 @@ sub streamReencodedWindow {
     }
 
     push @cmd,
-        '-vf', 'scale=1025:720',
+        '-vf', 'scale=1280:720',
         '-c:v', $encoder,
         ($encoder eq 'libx264' ? ('-preset', 'veryfast', '-tune', 'zerolatency') : ()),
         '-c:a', 'aac',
@@ -1902,9 +1903,13 @@ sub streamReencodedWindow {
     my $client_alive = 1;
     my $buffer = '';
     my $sel = IO::Select->new($ffh);
-    my $last_output_at = time();
+    my $started_at = time();
+    my $last_output_at = $started_at;
     my $stall_timeout = int(getConfigValue('stall_timeout', 15));
+    my $startup_timeout = int(getConfigValue('startup_timeout', 45));
+    $startup_timeout = $stall_timeout if $startup_timeout < $stall_timeout;
     my $firstChunk = 1;
+    my $has_output = 0;
 
     while (1) {
         my $desired = desiredModeByOverride($channelId, $request);
@@ -1919,6 +1924,7 @@ sub streamReencodedWindow {
             my $read = sysread($ffh, $buffer, 1316);
             last unless defined $read && $read > 0;
             $last_output_at = time();
+            $has_output = 1;
             $buffer = correctMpegTsTimestamps($buffer, $channelId, ($firstChunk && $window->{startsAfterDiscontinuity}) ? 1 : 0);
             $firstChunk = 0;
             my $ok = eval { $client->write($buffer); 1 };
@@ -1926,7 +1932,25 @@ sub streamReencodedWindow {
                 $client_alive = 0;
                 last;
             }
-        } elsif (time() - $last_output_at >= $stall_timeout) {
+            next;
+        }
+
+        my $child_done = waitpid($ffpid, WNOHANG);
+        if (defined $child_done && $child_done == $ffpid) {
+            last;
+        }
+
+        if (!$has_output) {
+            if (time() - $started_at >= $startup_timeout) {
+                appendRecentLog('ffmpeg-Fenster-Starttimeout, Neustart: ' . $channelId);
+                kill 'TERM', $ffpid;
+                close($ffh);
+                return 0;
+            }
+            next;
+        }
+
+        if (time() - $last_output_at >= $stall_timeout) {
             appendRecentLog('ffmpeg-Fenster-Stall, Neustart: ' . $channelId);
             kill 'TERM', $ffpid;
             close($ffh);
@@ -1935,7 +1959,7 @@ sub streamReencodedWindow {
     }
 
     close($ffh);
-    return $client_alive ? 1 : 0;
+    return ($client_alive && $has_output) ? 1 : 0;
 }
 
 sub streamHlsViaFfmpeg {
@@ -2854,6 +2878,7 @@ sub sendAdminPage {
         window.saveConfig = function(){
             api('/admin/set_config', {
                 stall_timeout: document.getElementById('cfgStall').value,
+                startup_timeout: document.getElementById('cfgStartup').value,
                 max_failures: document.getElementById('cfgFail').value,
                 log_depth: document.getElementById('cfgLogDepth').value
             }).catch(()=>{});
@@ -2934,6 +2959,7 @@ sub sendAdminPage {
         function renderConfig(){
             const cfg = current.config || {};
             document.getElementById('cfgStall').value = cfg.stall_timeout || 15;
+            document.getElementById('cfgStartup').value = cfg.startup_timeout || 45;
             document.getElementById('cfgFail').value = cfg.max_failures || 5;
             document.getElementById('cfgLogDepth').value = cfg.log_depth || 10;
         }
