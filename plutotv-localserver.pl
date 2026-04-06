@@ -68,7 +68,7 @@ my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
 my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
 my $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
 my $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
-my $harmonizeSessionStateFile = $runtimeStateDir . '/harmonize_sessions.json';
+my $harmonizeSessionsStateFile = $runtimeStateDir . '/harmonize_sessions.json';
 my $tempFile;
 
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
@@ -80,7 +80,7 @@ if (defined $tempFile && length $tempFile) {
     $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
     $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
     $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
-    $harmonizeSessionStateFile = $runtimeStateDir . '/harmonize_sessions.json';
+    $harmonizeSessionsStateFile = $runtimeStateDir . '/harmonize_sessions.json';
 }
 
 sub parseChannelListArg {
@@ -281,284 +281,6 @@ sub saveRuntimeConfig {
     return saveJsonFile($runtimeConfigStateFile, $hashref);
 }
 
-
-sub loadHarmonizeSessions {
-    my $parsed = loadJsonFile($harmonizeSessionStateFile, {});
-    return {} unless ref($parsed) eq 'HASH';
-    return $parsed;
-}
-
-sub modifyHarmonizeSessions {
-    my ($callback) = @_;
-    return modifyJsonFile($harmonizeSessionStateFile, {}, sub {
-        my ($sessions) = @_;
-        $sessions = {} unless ref($sessions) eq 'HASH';
-        return $callback->($sessions);
-    });
-}
-
-sub createHarmonizeSession {
-    my (%info) = @_;
-    my $sessionId = uuid_to_string(create_uuid(UUID_V4));
-    my $now = time();
-    modifyHarmonizeSessions(sub {
-        my ($sessions) = @_;
-        $sessions->{$sessionId} = {
-            sessionId      => $sessionId,
-            createdAt      => $now,
-            channelId      => $info{channelId} || '',
-            region         => $info{region} || 'DE',
-            videoUrl       => $info{videoUrl} || '',
-            audioUrl       => $info{audioUrl} || '',
-            startVideoSeq  => int($info{startVideoSeq} || 0),
-            startAudioSeq  => defined $info{startAudioSeq} ? int($info{startAudioSeq}) : undef,
-        };
-        return $sessions;
-    });
-    return $sessionId;
-}
-
-sub getHarmonizeSession {
-    my ($sessionId) = @_;
-    return undef unless defined $sessionId && length $sessionId;
-    my $sessions = loadHarmonizeSessions();
-    my $session = $sessions->{$sessionId};
-    return (ref($session) eq 'HASH') ? $session : undef;
-}
-
-sub deleteHarmonizeSession {
-    my ($sessionId) = @_;
-    return unless defined $sessionId && length $sessionId;
-    modifyHarmonizeSessions(sub {
-        my ($sessions) = @_;
-        delete $sessions->{$sessionId};
-        return $sessions;
-    });
-}
-
-sub rewriteUriAttributeLineAbsolute {
-    my ($line, $baseUrl) = @_;
-    return $line unless defined $line && defined $baseUrl;
-    $line =~ s{URI="([^"]+)"}{'URI="' . resolvePlaylistUrlPreserveQuery($baseUrl, $1) . '"'}eg;
-    return $line;
-}
-
-sub parseHlsPlaylistEntries {
-    my ($playlistContent, $baseUrl) = @_;
-    my @lines = split /\r?\n/, ($playlistContent || '');
-    my $mediaSequence = 0;
-    my $targetDuration = 10;
-    my $pendingDiscontinuity = 0;
-    my $currentMapLine = undef;
-    my $currentKeyLine = '#EXT-X-KEY:METHOD=NONE';
-    my $pendingExtinf = undef;
-    my @entries;
-
-    for my $line (@lines) {
-        if ($line =~ /^#EXT-X-MEDIA-SEQUENCE:(\d+)/) {
-            $mediaSequence = int($1);
-            next;
-        }
-        if ($line =~ /^#EXT-X-TARGETDURATION:(\d+)/) {
-            $targetDuration = int($1);
-            next;
-        }
-        if ($line =~ /^#EXT-X-DISCONTINUITY$/) {
-            $pendingDiscontinuity = 1;
-            next;
-        }
-        if ($line =~ /^#EXT-X-MAP:/) {
-            $currentMapLine = rewriteUriAttributeLineAbsolute($line, $baseUrl);
-            next;
-        }
-        if ($line =~ /^#EXT-X-KEY:/) {
-            $currentKeyLine = rewriteUriAttributeLineAbsolute($line, $baseUrl);
-            next;
-        }
-        if ($line =~ /^#EXTINF:/) {
-            $pendingExtinf = $line;
-            next;
-        }
-        next if $line =~ /^#/;
-        next unless defined $line && length $line;
-        next unless defined $pendingExtinf || defined $currentMapLine;
-
-        push @entries, {
-            sequence   => $mediaSequence,
-            uri        => resolvePlaylistUrlPreserveQuery($baseUrl, $line),
-            extinfLine => ($pendingExtinf || '#EXTINF:1.0,'),
-            mapLine    => $currentMapLine,
-            keyLine    => $currentKeyLine,
-            discBefore => $pendingDiscontinuity ? 1 : 0,
-        };
-        $pendingExtinf = undef;
-        $pendingDiscontinuity = 0;
-        $mediaSequence++;
-    }
-
-    return {
-        targetDuration => $targetDuration,
-        entries        => \@entries,
-    };
-}
-
-sub findNextDiscontinuitySequenceFromPlaylist {
-    my ($playlistContent, $baseUrl, $startSeq) = @_;
-    my $parsed = parseHlsPlaylistEntries($playlistContent, $baseUrl);
-    for my $entry (@{ $parsed->{entries} || [] }) {
-        next unless $entry->{discBefore};
-        return $entry->{sequence} if !defined($startSeq) || $entry->{sequence} > $startSeq;
-    }
-    return undef;
-}
-
-sub determineLiveStartSequence {
-    my ($playlistContent, $baseUrl) = @_;
-    my $parsed = parseHlsPlaylistEntries($playlistContent, $baseUrl);
-    my $entries = $parsed->{entries} || [];
-    return undef unless @$entries;
-    return $entries->[0]->{sequence};
-}
-
-sub buildHarmonizeLivePlaylist {
-    my (%args) = @_;
-    my $playlistContent = $args{playlistContent} || '';
-    my $baseUrl = $args{baseUrl};
-    my $startSeq = int($args{startSeq} || 0);
-
-    my $parsed = parseHlsPlaylistEntries($playlistContent, $baseUrl);
-    my @entries = @{ $parsed->{entries} || [] };
-    my @selected;
-    my $cutAtSequence;
-
-    for my $entry (@entries) {
-        next if $entry->{sequence} < $startSeq;
-        if ($entry->{discBefore} && @selected) {
-            $cutAtSequence = $entry->{sequence};
-            last;
-        }
-        push @selected, $entry;
-    }
-
-    return (undef, undef) unless @selected;
-
-    my $playlist = "#EXTM3U\n";
-    $playlist .= "#EXT-X-VERSION:3\n";
-    $playlist .= "#EXT-X-TARGETDURATION:" . int($parsed->{targetDuration} || 10) . "\n";
-    $playlist .= "#EXT-X-MEDIA-SEQUENCE:" . int($selected[0]->{sequence}) . "\n";
-
-    my $lastMap = '';
-    my $lastKey = '';
-
-    for my $entry (@selected) {
-        if (defined $entry->{mapLine}) {
-            my $mapLine = $entry->{mapLine};
-            if ($mapLine ne $lastMap) {
-                $playlist .= $mapLine . "\n";
-                $lastMap = $mapLine;
-            }
-        }
-        if (defined $entry->{keyLine}) {
-            my $keyLine = $entry->{keyLine};
-            if ($keyLine ne $lastKey) {
-                $playlist .= $keyLine . "\n";
-                $lastKey = $keyLine;
-            }
-        }
-        $playlist .= $entry->{extinfLine} . "\n";
-        $playlist .= $entry->{uri} . "\n";
-    }
-
-    $playlist .= "#EXT-X-ENDLIST\n" if defined $cutAtSequence;
-    return ($playlist, $cutAtSequence);
-}
-
-sub fetchLivePlaylistWindow {
-    my ($playlistUrl, $startSeq) = @_;
-    return unless defined $playlistUrl && length $playlistUrl;
-    my $response = getResponseFromUrl($playlistUrl);
-    return unless $response && $response->is_success;
-    my $content = $response->decoded_content;
-    my ($playlist, $cutAtSequence) = buildHarmonizeLivePlaylist(
-        playlistContent => $content,
-        baseUrl         => $playlistUrl,
-        startSeq        => $startSeq,
-    );
-    return ($playlist, $cutAtSequence, $content);
-}
-
-sub ffmpegSupportsEncoder {
-    my ($encoder) = @_;
-    our %ffmpeg_encoder_support_cache;
-    return 0 unless $ffmpeg && defined $encoder && length $encoder;
-    return $ffmpeg_encoder_support_cache{$encoder} if exists $ffmpeg_encoder_support_cache{$encoder};
-    my $output = qx{$ffmpeg -hide_banner -encoders 2>/dev/null};
-    my $supported = ($output =~ /\b\Q$encoder\E\b/) ? 1 : 0;
-    $ffmpeg_encoder_support_cache{$encoder} = $supported;
-    return $supported;
-}
-
-sub getCurrentBoundarySequences {
-    my ($videoUrl, $audioUrl, $currentVideoSeq, $currentAudioSeq) = @_;
-    my $videoNext;
-    my $audioNext;
-
-    if (defined $videoUrl && length $videoUrl) {
-        my $resp = getResponseFromUrl($videoUrl);
-        if ($resp && $resp->is_success) {
-            $videoNext = findNextDiscontinuitySequenceFromPlaylist($resp->decoded_content, $videoUrl, $currentVideoSeq);
-        }
-    }
-
-    if (defined $audioUrl && length $audioUrl) {
-        my $resp = getResponseFromUrl($audioUrl);
-        if ($resp && $resp->is_success) {
-            $audioNext = findNextDiscontinuitySequenceFromPlaylist($resp->decoded_content, $audioUrl, $currentAudioSeq);
-        }
-    }
-
-    return ($videoNext, $audioNext);
-}
-
-sub sendHarmonizeMediaPlaylist {
-    my ($client, $request) = @_;
-    my $path = $request->uri->path;
-    my ($sessionId, $kind) = $path =~ m{^/harmonize_media/([^/]+)/((?:video|audio))\.m3u8$};
-    unless ($sessionId && $kind) {
-        $client->send_error(RC_BAD_REQUEST, "Invalid harmonize media path");
-        return;
-    }
-
-    my $session = getHarmonizeSession($sessionId);
-    unless ($session) {
-        $client->send_error(RC_NOT_FOUND, "Unknown harmonize session");
-        return;
-    }
-
-    my $playlistUrl = ($kind eq 'audio') ? ($session->{audioUrl} || '') : ($session->{videoUrl} || '');
-    my $startSeq = ($kind eq 'audio') ? $session->{startAudioSeq} : $session->{startVideoSeq};
-    unless ($playlistUrl) {
-        $client->send_error(RC_NOT_FOUND, "No playlist URL for requested track");
-        return;
-    }
-
-    my ($playlist) = fetchLivePlaylistWindow($playlistUrl, $startSeq);
-    unless (defined $playlist && length $playlist) {
-        $client->send_error(RC_SERVICE_UNAVAILABLE, "Playlist window not ready");
-        return;
-    }
-
-    my $response = HTTP::Response->new();
-    $response->code(200);
-    $response->message("OK");
-    $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
-    $response->header("cache-control", "no-cache, no-store, must-revalidate");
-    $response->header("pragma", "no-cache");
-    $response->header("expires", "0");
-    $response->content(encode_utf8($playlist));
-    $client->send_response($response);
-}
-
 sub getConfigValue {
     my ($key, $default) = @_;
     my $cfg = loadRuntimeConfig();
@@ -594,6 +316,229 @@ sub desiredModeByOverride {
         return 'copy' if $flag =~ /^(0|false|no|off)$/;
     }
     return 'copy';
+}
+
+
+sub loadHarmonizeSessions {
+    my $parsed = loadJsonFile($harmonizeSessionsStateFile, {});
+    return {} unless ref($parsed) eq 'HASH';
+    return $parsed;
+}
+
+sub updateHarmonizeSession {
+    my ($sessionId, $callback) = @_;
+    my $result;
+    modifyJsonFile($harmonizeSessionsStateFile, {}, sub {
+        my ($sessions) = @_;
+        $sessions = {} unless ref($sessions) eq 'HASH';
+        my $session = ref($sessions->{$sessionId}) eq 'HASH' ? $sessions->{$sessionId} : {};
+        my ($updated, $ret) = $callback->($session);
+        $sessions->{$sessionId} = $updated if ref($updated) eq 'HASH' && %$updated;
+        delete $sessions->{$sessionId} if !defined($updated) || (ref($updated) eq 'HASH' && !%$updated);
+        $result = $ret;
+        return $sessions;
+    });
+    return $result;
+}
+
+sub createHarmonizeSession {
+    my (%args) = @_;
+    my $sessionId = join('-', 'harm', $$, time(), int(rand(100000)));
+    my $session = {
+        sessionId         => $sessionId,
+        channelId         => $args{channelId},
+        region            => $args{region} || 'DE',
+        channelName       => $args{channelName} || $args{channelId},
+        videoUrl          => $args{videoUrl},
+        audioUrl          => $args{audioUrl},
+        currentStartSeq   => int($args{currentStartSeq} || 0),
+        stopBeforeSeq     => undef,
+        nextStartSeq      => undef,
+        lastServedSeq     => undef,
+        targetDuration    => 10,
+        createdAt         => time(),
+        updatedAt         => time(),
+    };
+    saveJsonFile($harmonizeSessionsStateFile, {
+        %{ loadHarmonizeSessions() },
+        $sessionId => $session,
+    });
+    return $sessionId;
+}
+
+sub deleteHarmonizeSession {
+    my ($sessionId) = @_;
+    return unless defined $sessionId && length $sessionId;
+    updateHarmonizeSession($sessionId, sub { return ({}, undef); });
+}
+
+sub cleanupOldHarmonizeSessions {
+    my $now = time();
+    modifyJsonFile($harmonizeSessionsStateFile, {}, sub {
+        my ($sessions) = @_;
+        $sessions = {} unless ref($sessions) eq 'HASH';
+        for my $sid (keys %$sessions) {
+            my $s = $sessions->{$sid};
+            next unless ref($s) eq 'HASH';
+            my $updatedAt = $s->{updatedAt} || $s->{createdAt} || 0;
+            delete $sessions->{$sid} if !$updatedAt || ($now - $updatedAt) > 3600;
+        }
+        return $sessions;
+    });
+}
+
+sub buildWindowedManifestForSession {
+    my ($sessionId, $kind) = @_;
+    my $sessions = loadHarmonizeSessions();
+    my $session = $sessions->{$sessionId};
+    return unless ref($session) eq 'HASH';
+
+    my $upstreamUrl = ($kind && $kind eq 'audio') ? $session->{audioUrl} : $session->{videoUrl};
+    return undef unless defined $upstreamUrl && length $upstreamUrl;
+
+    my $playlistResponse = getResponseFromUrl($upstreamUrl);
+    return undef unless $playlistResponse && $playlistResponse->is_success;
+    my $playlistContent = $playlistResponse->decoded_content;
+    my $playlistInfo = parsePlaylistInfo($playlistContent);
+    my $runningNumber = 1;
+    my @segments = extractSegmentsFromPlaylist($playlistContent, $upstreamUrl, $playlistInfo, \$runningNumber);
+    my @eligible = grep { ($_->{sequence} || 0) >= int($session->{currentStartSeq} || 0) } @segments;
+
+    my $stopBeforeSeq = defined $session->{stopBeforeSeq} ? int($session->{stopBeforeSeq}) : undef;
+    if (!defined $stopBeforeSeq) {
+        for my $segment (@eligible) {
+            next unless $segment->{isDiscontinuity};
+            my $seq = int($segment->{sequence} || 0);
+            next if $seq <= int($session->{currentStartSeq} || 0);
+            $stopBeforeSeq = $seq;
+            updateHarmonizeSession($sessionId, sub {
+                my ($s) = @_;
+                $s->{stopBeforeSeq} = $seq;
+                $s->{nextStartSeq} = $seq;
+                $s->{updatedAt} = time();
+                return ($s, undef);
+            });
+            last;
+        }
+    }
+
+    my @out = @eligible;
+    @out = grep { ($_->{sequence} || 0) < $stopBeforeSeq } @out if defined $stopBeforeSeq;
+
+    my $lastSeq;
+    $lastSeq = $out[-1]->{sequence} if @out;
+    updateHarmonizeSession($sessionId, sub {
+        my ($s) = @_;
+        $s->{targetDuration} = int($playlistInfo->{targetDuration} || 10);
+        $s->{lastServedSeq} = $lastSeq if defined $lastSeq;
+        $s->{updatedAt} = time();
+        return ($s, undef);
+    });
+
+    my $manifest = "#EXTM3U\n";
+    $manifest .= "#EXT-X-VERSION:3\n";
+    $manifest .= "#EXT-X-TARGETDURATION:" . int($playlistInfo->{targetDuration} || 10) . "\n";
+    $manifest .= "#EXT-X-MEDIA-SEQUENCE:" . int($session->{currentStartSeq} || 0) . "\n";
+    for my $segment (@out) {
+        $manifest .= "#EXTINF:" . ($segment->{duration} || 10) . ",\n";
+        $manifest .= $segment->{url} . "\n";
+    }
+    $manifest .= "#EXT-X-ENDLIST\n" if defined $stopBeforeSeq;
+    return $manifest;
+}
+
+sub sendHarmonizeMediaPlaylist {
+    my ($client, $request) = @_;
+    my $path = $request->uri->path;
+    my ($sessionId, $kind) = $path =~ m{^/harmonize_media/([^/]+)/(video|audio)\.m3u8$};
+    unless ($sessionId && $kind) {
+        $client->send_error(RC_BAD_REQUEST, "Invalid harmonize media path");
+        return;
+    }
+
+    my $manifest = buildWindowedManifestForSession($sessionId, $kind);
+    unless (defined $manifest) {
+        $client->send_error(RC_NOT_FOUND, "Unknown harmonize session");
+        return;
+    }
+
+    my $response = HTTP::Response->new();
+    $response->code(200);
+    $response->message("OK");
+    $response->header("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+    $response->header("cache-control", "no-cache, no-store, must-revalidate");
+    $response->header("pragma", "no-cache");
+    $response->header("expires", "0");
+    $response->content(encode_utf8($manifest));
+    $client->send_response($response);
+}
+
+sub ffmpegSupportsEncoder {
+    my ($encoder) = @_;
+    return 0 unless $ffmpeg && defined $encoder && length $encoder;
+    our %ffmpeg_encoder_support_cache;
+    return $ffmpeg_encoder_support_cache{$encoder} if exists $ffmpeg_encoder_support_cache{$encoder};
+    my $output = qx($ffmpeg -hide_banner -encoders 2>/dev/null);
+    my $supported = ($output =~ /^\s*[A-Z.]+\s+\Q$encoder\E\s+/m) ? 1 : 0;
+    $ffmpeg_encoder_support_cache{$encoder} = $supported;
+    return $supported;
+}
+
+sub buildPanzerFfmpegCommand {
+    my (%args) = @_;
+    my $videoInputUrl = $args{videoInputUrl} or return;
+    my $audioInputUrl = $args{audioInputUrl};
+    my $serviceName = $args{serviceName} || 'Harmonized';
+    my $videoEncoder = ffmpegSupportsEncoder('h264_v4l2m2m') ? 'h264_v4l2m2m' : 'libx264';
+
+    my @cmd = (
+        $ffmpeg,
+        '-hide_banner',
+        '-loglevel', $debug ? 'warning' : 'error',
+        '-nostdin',
+        '-fflags', '+genpts+discardcorrupt',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '2',
+        '-i', $videoInputUrl,
+    );
+
+    if ($audioInputUrl) {
+        push @cmd,
+            '-fflags', '+genpts+discardcorrupt',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '2',
+            '-i', $audioInputUrl,
+            '-map', '0:v:0?',
+            '-map', '1:a:0?';
+    } else {
+        push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+    }
+
+    push @cmd,
+        '-vf', 'fps=25,scale=1280:720:flags=fast_bilinear:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p',
+        '-c:v', $videoEncoder,
+        '-b:v', '1800k',
+        '-maxrate', '1800k',
+        '-bufsize', '3600k',
+        '-g', '50',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-ar', '48000',
+        '-ac', '2',
+        '-b:a', '96k',
+        '-muxdelay', '0',
+        '-muxpreload', '0',
+        '-mpegts_flags', '+resend_headers',
+        '-avoid_negative_ts', 'make_zero',
+        '-max_interleave_delta', '1000000',
+        '-flush_packets', '1',
+        '-metadata', 'service_provider=PlutoTV',
+        '-metadata', 'service_name=' . $serviceName,
+        '-f', 'mpegts', 'pipe:1';
+
+    return (\@cmd, $videoEncoder);
 }
 
 sub loadRecentLogs {
@@ -1352,7 +1297,8 @@ sub sendHelp {
         "\t/stream/{id}.m3u8\tfor direct HLS stream\n" .
         "\t/master3u8?id=ID\tlegacy alias for ffmpeg pipe input\n" .
         "\t/epg\t\tfor xmltv-epg-file\n" .
-        "\t/admin\t\tfor runtime configuration UI\n\n" .
+        "\t/admin\t\tfor runtime configuration UI\n" .
+        "\t/harmonize_media/{sid}/{kind}.m3u8\tinternal windowed harmonize source\n\n" .
         "Available regions: " . join(", ", sort keys %regions) . "\n" .
         "Example: /tvheadend?region=US\n");
     $client->send_response($response);
@@ -1892,7 +1838,6 @@ sub sendElementaryDynamicStream {
     streamWithDiscontinuityRestart($client, $channelId . '-' . ($kind || 'video'), $region, $playlistUrl);
 }
 
-
 sub streamHlsViaFfmpeg {
     my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName, $headersSentRef, $activeStreamKey, $request) = @_;
     return 0 unless $ffmpeg;
@@ -1902,185 +1847,110 @@ sub streamHlsViaFfmpeg {
     if (!$headersSentRef || !$$headersSentRef) {
         eval { sendMpegTsHeaders($client); };
         if ($@) {
-            if ($debug) { printf("Failed to send headers - client disconnected: %s\n", $@); }
+            if ($debug) { printf("Failed to send headers - client disconnected: %s
+", $@); }
             return 0;
         }
         $$headersSentRef = 1 if $headersSentRef;
     }
 
-    my $maxFailures   = int(getConfigValue('max_failures',  5));
-    my $stall_timeout = int(getConfigValue('stall_timeout', 15));
+    my $maxFailures = int(getConfigValue('max_failures', 5));
     my $failures = 0;
-    my $encoder = ffmpegSupportsEncoder('h264_v4l2m2m') ? 'h264_v4l2m2m' : 'libx264';
-
-    my $videoStartSeq;
-    my $audioStartSeq;
-
-    my $videoProbe = getResponseFromUrl($videoUrl);
-    if ($videoProbe && $videoProbe->is_success) {
-        $videoStartSeq = determineLiveStartSequence($videoProbe->decoded_content, $videoUrl);
-    }
-    my $audioProbe;
-    if ($audioUrl) {
-        $audioProbe = getResponseFromUrl($audioUrl);
-        if ($audioProbe && $audioProbe->is_success) {
-            $audioStartSeq = determineLiveStartSequence($audioProbe->decoded_content, $audioUrl);
-        }
-    }
-
-    return 0 unless defined $videoStartSeq;
-
-    my $client_alive = 1;
-    my $mode_switch_requested = 0;
-    my $firstChunkAfterRestart = 1;
+    my $startSeq = 0;
 
     while ($failures < $maxFailures) {
         updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
 
         my $sessionId = createHarmonizeSession(
-            channelId     => $channelId,
-            region        => $region,
-            videoUrl      => $videoUrl,
-            audioUrl      => $audioUrl,
-            startVideoSeq => $videoStartSeq,
-            startAudioSeq => $audioStartSeq,
+            channelId       => $channelId,
+            channelName     => ($channelName || $channelId),
+            region          => $region,
+            videoUrl        => $videoUrl,
+            audioUrl        => $audioUrl,
+            currentStartSeq => $startSeq,
         );
 
-        my $videoLocalUrl = 'http://' . $hostIp . ':' . $port . '/harmonize_media/' . $sessionId . '/video.m3u8';
-        my $audioLocalUrl = $audioUrl ? ('http://' . $hostIp . ':' . $port . '/harmonize_media/' . $sessionId . '/audio.m3u8') : undef;
-
-        my @cmd = (
-            $ffmpeg,
-            '-loglevel', 'fatal',
-            '-nostdin',
-            '-fflags', '+genpts+discardcorrupt',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '2',
-            '-i', $videoLocalUrl,
+        my $videoInputUrl = 'http://' . $hostIp . ':' . $port . '/harmonize_media/' . $sessionId . '/video.m3u8';
+        my $audioInputUrl = $audioUrl ? ('http://' . $hostIp . ':' . $port . '/harmonize_media/' . $sessionId . '/audio.m3u8') : undef;
+        my ($cmdRef, $encoder) = buildPanzerFfmpegCommand(
+            videoInputUrl => $videoInputUrl,
+            audioInputUrl => $audioInputUrl,
+            serviceName   => ($channelName || $channelId),
         );
-
-        if ($audioLocalUrl) {
-            push @cmd,
-                '-fflags', '+genpts+discardcorrupt',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '2',
-                '-i', $audioLocalUrl,
-                '-map', '0:v:0?', '-map', '1:a:0?';
-        } else {
-            push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+        unless ($cmdRef && @$cmdRef) {
+            deleteHarmonizeSession($sessionId);
+            return 0;
         }
 
-        push @cmd,
-            '-vf', 'fps=25,scale=1280:720:flags=fast_bilinear:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p',
-            '-c:v', $encoder,
-            '-b:v', '1800k',
-            '-maxrate', '1800k',
-            '-bufsize', '3600k',
-            '-g', '50',
-            '-keyint_min', '50',
-            '-c:a', 'aac',
-            '-ar', '48000',
-            '-ac', '2',
-            '-b:a', '96k',
-            '-metadata', 'service_provider=PlutoTV',
-            '-metadata', 'service_name=' . ($channelName || $channelId),
-            '-muxdelay', '0',
-            '-muxpreload', '0',
-            '-mpegts_flags', '+resend_headers',
-            '-flush_packets', '1',
-            '-f', 'mpegts',
-            'pipe:1';
-
         appendRecentLog('Harmonize gestartet: ' . $channelId . ' [' . $encoder . ']');
+        if ($debug) {
+            printf("Starting windowed harmonizer for %s using %s
+", $channelId, $encoder);
+        }
 
         my $ffh;
-        my $ffpid = open($ffh, '-|', @cmd);
+        my $ffpid = open($ffh, '-|', @$cmdRef);
         unless ($ffpid) {
             deleteHarmonizeSession($sessionId);
-            warn "Failed to start ffmpeg HLS harmonizer: $!\n";
+            warn "Failed to start ffmpeg harmonizer: $!
+";
             $failures++;
-            sleep 1;
             next;
         }
         binmode($ffh);
 
-        my $sel = IO::Select->new($ffh);
-        my $last_output_at = time();
-        my $last_mode_check = 0;
+        my $client_alive = 1;
+        my $mode_switch_requested = 0;
         my $buffer = '';
-        my $process_finished = 0;
-
         while (1) {
-            if (time() - $last_mode_check >= 1) {
-                $last_mode_check = time();
-                if (desiredModeByOverride($channelId, $request) eq 'copy') {
-                    $mode_switch_requested = 1;
-                    last;
-                }
+            if (desiredModeByOverride($channelId, $request) eq 'copy') {
+                $mode_switch_requested = 1;
+                kill 'TERM', $ffpid if $ffpid;
+                last;
             }
 
-            my @ready = $sel->can_read(0.5);
-            if (@ready) {
-                my $read = sysread($ffh, $buffer, 1316);
-                if (!defined $read || $read <= 0) {
-                    $process_finished = 1;
-                    last;
-                }
-                $last_output_at = time();
-                my $payload = correctMpegTsTimestamps($buffer, $channelId, $firstChunkAfterRestart ? 1 : 0);
-                $firstChunkAfterRestart = 0;
-                my $ok = eval { $client->write($payload); 1 };
-                unless ($ok) {
-                    $client_alive = 0;
-                    last;
-                }
-            } elsif (time() - $last_output_at >= $stall_timeout) {
-                appendRecentLog('Harmonize-Stall, Neustart: ' . $channelId);
+            my $read = sysread($ffh, $buffer, 1316);
+            last unless defined $read && $read > 0;
+
+            my $payload = correctMpegTsTimestamps($buffer, $channelId, 0);
+            my $ok = eval { $client->write($payload); 1 };
+            unless ($ok) {
+                $client_alive = 0;
                 last;
             }
         }
 
-        kill 'TERM', $ffpid if $ffpid && !$process_finished;
         close($ffh);
+        my $sessions = loadHarmonizeSessions();
+        my $session = $sessions->{$sessionId};
+        my $nextStart = (ref($session) eq 'HASH' && defined $session->{nextStartSeq})
+            ? int($session->{nextStartSeq})
+            : ((ref($session) eq 'HASH' && defined $session->{lastServedSeq}) ? int($session->{lastServedSeq}) + 1 : undef);
         deleteHarmonizeSession($sessionId);
 
         return 'switch' if $mode_switch_requested;
         last unless $client_alive;
 
-        my ($nextVideoSeq, $nextAudioSeq) = getCurrentBoundarySequences($videoUrl, $audioUrl, $videoStartSeq, $audioStartSeq);
-        if (defined $nextVideoSeq || defined $nextAudioSeq) {
-            $videoStartSeq = defined $nextVideoSeq ? $nextVideoSeq : $videoStartSeq;
-            $audioStartSeq = defined $nextAudioSeq ? $nextAudioSeq : $audioStartSeq;
-            $firstChunkAfterRestart = 1;
-            appendRecentLog('DISCONTINUITY erkannt, Harmonize-Neustart: ' . $channelId);
+        unless (defined $nextStart && $nextStart >= $startSeq) {
+            my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
+            $videoUrl = $freshVideo if $freshVideo;
+            $audioUrl = $freshAudio if defined $freshAudio;
+            $failures++;
             next;
         }
 
+        if ($debug) {
+            printf("Window completed for %s, continuing at sequence %d
+", $channelId, $nextStart);
+        }
+        $startSeq = $nextStart;
         my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
         $videoUrl = $freshVideo if $freshVideo;
-        $audioUrl = $freshAudio if $freshAudio;
-
-        my $freshVideoResp = $videoUrl ? getResponseFromUrl($videoUrl) : undef;
-        if ($freshVideoResp && $freshVideoResp->is_success) {
-            my $freshSeq = determineLiveStartSequence($freshVideoResp->decoded_content, $videoUrl);
-            $videoStartSeq = $freshSeq if defined $freshSeq;
-        }
-        if ($audioUrl) {
-            my $freshAudioResp = getResponseFromUrl($audioUrl);
-            if ($freshAudioResp && $freshAudioResp->is_success) {
-                my $freshSeq = determineLiveStartSequence($freshAudioResp->decoded_content, $audioUrl);
-                $audioStartSeq = $freshSeq if defined $freshSeq;
-            }
-        }
-
-        $firstChunkAfterRestart = 1;
-        $failures++;
-        sleep 1;
+        $audioUrl = $freshAudio if defined $freshAudio;
+        $failures = 0;
     }
 
-    return $client_alive ? 1 : 0;
+    return 1;
 }
 
 sub sendDynamicStream {
@@ -3160,6 +3030,8 @@ sub processRequest {
         sendElementaryDynamicStream($client, $request, 'video');
     } elsif ($path =~ m{^/dynamic_audio_stream/}) {
         sendElementaryDynamicStream($client, $request, 'audio');
+    } elsif ($path =~ m{^/harmonize_media/}) {
+        sendHarmonizeMediaPlaylist($client, $request);
     } elsif ($path eq "/admin") {
         sendAdminPage($client, $request);
     } elsif ($path eq "/admin/events") {
@@ -3208,6 +3080,7 @@ $SIG{CHLD} = 'IGNORE';
 
 printf("PlutoTVServer started in version $version listening on $hostIp using port $port.\n");
 appendRecentLog("Serverstart auf $hostIp:$port");
+cleanupOldHarmonizeSessions();
 
 while (my $client = $daemon->accept) {
     if (forkProcess() == 1) {
