@@ -152,6 +152,31 @@ sub saveJsonFile {
     return 1;
 }
 
+sub modifyJsonFile {
+    my ($path, $default, $callback) = @_;
+    ensureRuntimeStateDir();
+    my $fh;
+    if (-e $path) {
+        open($fh, '+<', $path) or return $default;
+    } else {
+        open($fh, '+>', $path) or return $default;
+    }
+    flock($fh, LOCK_EX);
+    local $/;
+    my $content = <$fh>;
+    my $data = $default;
+    if (defined $content && length $content) {
+        my $parsed = eval { decode_json($content) };
+        $data = defined $parsed ? $parsed : $default;
+    }
+    $data = $callback->($data);
+    seek($fh, 0, 0);
+    truncate($fh, 0);
+    print $fh encode_json($data);
+    close($fh);
+    return $data;
+}
+
 sub loadHarmonizeOverrides {
     my $parsed = loadJsonFile($harmonizeStateFile, {});
     return {} unless ref($parsed) eq 'HASH';
@@ -212,41 +237,31 @@ sub saveActiveStreams {
     return saveJsonFile($activeStreamsStateFile, $hashref);
 }
 
-sub withActiveStreamsLocked {
-    my ($callback) = @_;
-    ensureRuntimeStateDir();
-    open(my $fh, '+>>', $activeStreamsStateFile) or return;
-    flock($fh, LOCK_EX) or do { close($fh); return; };
-    seek($fh, 0, 0);
-    local $/;
-    my $content = <$fh>;
-    my $streams = {};
-    if (defined $content && length $content) {
-        my $parsed = eval { decode_json($content) };
-        $streams = $parsed if ref($parsed) eq 'HASH';
-    }
-    my @result = $callback->($streams);
-    seek($fh, 0, 0);
-    truncate($fh, 0);
-    print $fh encode_json($streams);
-    close($fh);
-    return wantarray ? @result : $result[0];
-}
-
 sub registerActiveStream {
     my (%info) = @_;
-    my $startedAt = $info{startedAt} || time();
-    my $key = (defined $info{channelId} && length $info{channelId} ? $info{channelId} : 'stream')
-        . '_' . (defined $info{pid} ? $info{pid} : $$)
-        . '_' . int($startedAt * 1000)
-        . '_' . int(rand(100000));
-    $info{pid} = defined $info{pid} ? $info{pid} : $$;
-    $info{startedAt} ||= $startedAt;
-    $info{lastSeenAt} ||= $info{startedAt};
-    withActiveStreamsLocked(sub {
+    my $key;
+    my $now = time();
+    modifyJsonFile($activeStreamsStateFile, {}, sub {
         my ($streams) = @_;
-        $streams->{$key} = { %info };
-        return $key;
+        $streams = {} unless ref($streams) eq 'HASH';
+
+        if ($info{is_direct}) {
+            my $channelId = $info{channelId} || 'unknown';
+            $key = 'direct-' . $channelId;
+            my $existing = (ref($streams->{$key}) eq 'HASH') ? $streams->{$key} : {};
+            $info{pid} = 0;
+            $info{startedAt} = $existing->{startedAt} || $now;
+            $info{lastSeenAt} = $now;
+            $info{ttl} ||= 20;
+            $streams->{$key} = { %$existing, %info };
+        } else {
+            $key = $$ . '-' . int($now * 1000) . '-' . int(rand(100000));
+            $info{pid} = $$ unless defined $info{pid};
+            $info{startedAt} ||= $now;
+            $info{lastSeenAt} ||= $now;
+            $streams->{$key} = \%info;
+        }
+        return $streams;
     });
     return $key;
 }
@@ -254,29 +269,12 @@ sub registerActiveStream {
 sub unregisterActiveStream {
     my ($key) = @_;
     return unless defined $key && length $key;
-    withActiveStreamsLocked(sub {
+    modifyJsonFile($activeStreamsStateFile, {}, sub {
         my ($streams) = @_;
+        $streams = {} unless ref($streams) eq 'HASH';
         delete $streams->{$key};
-        return 1;
+        return $streams;
     });
-}
-
-sub touchActiveStream {
-    my ($key, %changes) = @_;
-    return unless defined $key && length $key;
-    withActiveStreamsLocked(sub {
-        my ($streams) = @_;
-        return unless ref($streams->{$key}) eq 'HASH';
-        $streams->{$key}->{lastSeenAt} = time();
-        for my $k (keys %changes) {
-            $streams->{$key}->{$k} = $changes{$k};
-        }
-        return 1;
-    });
-}
-
-sub directStreamDisplayTtl {
-    return 30;
 }
 
 # Reliable cross-platform process liveness check.
@@ -292,33 +290,30 @@ sub pidIsAlive {
 }
 
 sub cleanupStaleActiveStreams {
-    my $streams = loadActiveStreams();
-    my $changed = 0;
     my $now = time();
-    for my $key (keys %$streams) {
-        my $entry = $streams->{$key};
-        unless (ref($entry) eq 'HASH') {
-            delete $streams->{$key};
-            $changed = 1;
-            next;
-        }
+    my $streams = modifyJsonFile($activeStreamsStateFile, {}, sub {
+        my ($streams) = @_;
+        $streams = {} unless ref($streams) eq 'HASH';
+        for my $key (keys %$streams) {
+            my $entry = $streams->{$key};
+            next unless ref($entry) eq 'HASH';
 
-        if ($entry->{is_direct}) {
-            my $lastSeenAt = $entry->{lastSeenAt} || $entry->{startedAt} || 0;
-            if (($now - $lastSeenAt) > directStreamDisplayTtl()) {
-                delete $streams->{$key};
-                $changed = 1;
+            if ($entry->{is_direct}) {
+                my $ttl = int($entry->{ttl} || 20);
+                my $lastSeenAt = int($entry->{lastSeenAt} || $entry->{startedAt} || 0);
+                if (!$lastSeenAt || ($now - $lastSeenAt) > $ttl) {
+                    delete $streams->{$key};
+                }
+                next;
             }
-            next;
-        }
 
-        my $pid = $entry->{pid};
-        if (!$pid || !pidIsAlive($pid)) {
-            delete $streams->{$key};
-            $changed = 1;
+            my $pid = $entry->{pid};
+            if (!$pid || !pidIsAlive($pid)) {
+                delete $streams->{$key};
+            }
         }
-    }
-    saveActiveStreams($streams) if $changed;
+        return $streams;
+    });
     return $streams;
 }
 
@@ -352,7 +347,16 @@ sub getConfigValue {
 sub updateActiveStream {
     my ($key, %changes) = @_;
     return unless defined $key && length $key;
-    return touchActiveStream($key, %changes);
+    modifyJsonFile($activeStreamsStateFile, {}, sub {
+        my ($streams) = @_;
+        $streams = {} unless ref($streams) eq 'HASH';
+        return $streams unless ref($streams->{$key}) eq 'HASH';
+        for my $k (keys %changes) {
+            $streams->{$key}->{$k} = $changes{$k};
+        }
+        $streams->{$key}->{lastSeenAt} = time() unless exists $changes{lastSeenAt};
+        return $streams;
+    });
 }
 
 sub desiredModeByOverride {
@@ -419,12 +423,12 @@ sub buildAdminSnapshot {
             key         => $key,
             channelId   => $channelId,
             channelName => $entry->{channelName} || $channelId,
-            mode        => $entry->{mode} || 'copy',
+            mode        => $entry->{mode} || ($entry->{is_direct} ? 'direct' : 'copy'),
             desiredMode => $entry->{desiredMode} || ($harmonize->{$channelId} ? 'harmonize' : 'copy'),
             started     => formatEpochLocal($entry->{startedAt}),
             pid         => $entry->{pid} || 0,
-            harmonize   => ($harmonize->{$channelId} || 0) ? 1 : 0,
             isDirect    => ($entry->{is_direct} || 0) ? 1 : 0,
+            harmonize   => ($harmonize->{$channelId} || 0) ? 1 : 0,
         };
     }
 
@@ -1347,18 +1351,17 @@ sub sendDirectStream {
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
     my $channel = getChannelById($channelId, $region);
-    my $activeStreamKey = registerActiveStream(
+    registerActiveStream(
         channelId   => $channelId,
         channelName => ($channel ? ($channel->{name} || $channelId) : $channelId),
         mode        => 'direct',
         desiredMode => 'direct',
         is_direct   => 1,
+        ttl         => 20,
     );
-    appendRecentLog('Direct-Playlist geliefert: ' . $channelId);
 
     my (undef, undef, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, 1);
     unless ($master && $masterUrl) {
-        unregisterActiveStream($activeStreamKey);
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
         return;
     }
@@ -1373,7 +1376,6 @@ sub sendDirectStream {
     $response->header("expires", "0");
     $response->content(encode_utf8($dynamicPlaylist));
     $client->send_response($response);
-    touchActiveStream($activeStreamKey);
 }
 sub sendPlaylistProxy {
     my ($client, $request) = @_;
@@ -1752,24 +1754,20 @@ sub streamHlsViaFfmpeg {
         }
 
         push @cmd,
-            '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p',
-            '-c:v', 'h264_v4l2m2m',
-            '-b:v', '2500k',
-            '-g', '50',
-            '-c:a', 'aac',
-            '-ar', '48000',
-            '-ac', '2',
-            '-b:a', '128k',
+            '-c:v', 'copy',
+            '-bsf:v', 'h264_mp4toannexb',
+            '-c:a', 'copy',
             '-muxdelay', '0', '-muxpreload', '0',
             '-mpegts_flags', '+resend_headers',
             '-avoid_negative_ts', 'make_zero',
             '-max_interleave_delta', '1000000',
             '-flush_packets', '1',
             '-metadata', 'service_provider=PlutoTV',
-            '-metadata', 'service_name=Harmonized',
+            '-metadata', 'service_name=' . ($channelName || $channelId),
             '-f', 'mpegts', 'pipe:1';
 
-        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s (720p re-encode via h264_v4l2m2m/AAC)\n", $channelId); }
+        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s
+", $channelId); }
 
         my $ffh;
         my $ffpid = open($ffh, '-|', @cmd);
@@ -2581,8 +2579,8 @@ sub sendAdminPage {
         code{font-family:ui-monospace,monospace;font-size:12px;background:#f0f2f5;padding:1px 5px;border-radius:3px}
         .badge{display:inline-block;padding:2px 7px;border-radius:9px;font-size:11px;font-weight:600}
         .badge-copy{background:#e3f0ff;color:#1565c0}
-        .badge-direct{background:#ecfdf3;color:#166534}
         .badge-harmonize{background:#fff8e1;color:#8a6000}
+        .badge-direct{background:#eef2ff;color:#4338ca}
         .badge-on{background:#e6f4ea;color:#1e6e35}
         .badge-off{background:#fef9ee;color:#9c6300}
         .btns{display:flex;gap:5px;flex-wrap:wrap}
