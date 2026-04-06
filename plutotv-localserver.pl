@@ -1852,6 +1852,71 @@ sub findMatchingWindow {
     return undef;
 }
 
+sub findBestAudioWindowForVideoWindow {
+    my ($audioWindows, $videoWindow, $processedWindowSignatures) = @_;
+    return undef unless $audioWindows && ref($audioWindows) eq 'ARRAY' && $videoWindow && ref($videoWindow) eq 'HASH';
+
+    my $videoStart = $videoWindow->{startSequence};
+    my $videoEnd   = $videoWindow->{endSequence};
+    my ($best, $bestOverlap, $bestDistance);
+
+    for my $window (@$audioWindows) {
+        next unless $window && ref($window) eq 'HASH';
+        next unless ref($window->{segments}) eq 'ARRAY' && @{ $window->{segments} };
+        my $signature = $window->{signature} || '';
+        next if length($signature) && $processedWindowSignatures->{$signature};
+
+        my $start = $window->{startSequence};
+        my $end   = $window->{endSequence};
+        my $overlap = 0;
+        if (defined $videoStart && defined $videoEnd && defined $start && defined $end) {
+            my $left  = $videoStart > $start ? $videoStart : $start;
+            my $right = $videoEnd   < $end   ? $videoEnd   : $end;
+            $overlap = ($right >= $left) ? ($right - $left + 1) : 0;
+        }
+
+        my $distance = 0;
+        $distance += abs(($start // 0) - ($videoStart // 0));
+        $distance += abs(($end   // 0) - ($videoEnd   // 0));
+
+        if (!defined($best)
+            || $overlap > $bestOverlap
+            || ($overlap == $bestOverlap && $distance < $bestDistance)) {
+            $best = $window;
+            $bestOverlap = $overlap;
+            $bestDistance = $distance;
+        }
+    }
+
+    return $best;
+}
+
+sub buildAudioSegmentSliceForVideoWindow {
+    my ($audioContent, $audioUrl, $videoWindow) = @_;
+    return [] unless $audioContent && $audioUrl && $videoWindow && ref($videoWindow) eq 'HASH';
+
+    my $playlistInfo = parsePlaylistInfo($audioContent);
+    my $running = 1;
+    my @segments = extractSegmentsFromPlaylist($audioContent, $audioUrl, $playlistInfo, \$running);
+    return [] unless @segments;
+
+    my $videoStart = $videoWindow->{startSequence};
+    my $videoEnd   = $videoWindow->{endSequence};
+    my @matching;
+    if (defined $videoStart && defined $videoEnd) {
+        @matching = grep {
+            defined($_->{sequence}) && $_->{sequence} >= $videoStart && $_->{sequence} <= $videoEnd
+        } @segments;
+    }
+    return \@matching if @matching;
+
+    my $wanted = scalar(@{ $videoWindow->{segments} || [] });
+    $wanted = 1 if $wanted < 1;
+    @matching = @segments[-$wanted .. -1] if @segments >= $wanted;
+    @matching = @segments if @segments < $wanted;
+    return \@matching;
+}
+
 sub buildReencodeFfmpegCommand {
     my (%args) = @_;
     my $encoder       = $args{encoder}       || 'libx264';
@@ -2101,17 +2166,29 @@ sub streamHlsViaFfmpeg {
         }
         $idleLoops = 0;
 
-        my $audioWindow = findMatchingWindow($audioWindows, \%processedAudioWindows);
+        my $audioWindow = $audioContent ? findBestAudioWindowForVideoWindow($audioWindows, $videoWindow, \%processedAudioWindows) : undef;
+        my $audioSegments = [];
+        my $audioLogLabel = ' ohne-audio';
+        if ($audioWindow && ref($audioWindow->{segments}) eq 'ARRAY' && @{ $audioWindow->{segments} }) {
+            $audioSegments = $audioWindow->{segments};
+            $audioLogLabel = ' a=' . ($audioWindow->{startSequence}//'?') . '-' . ($audioWindow->{endSequence}//'?')
+                . ' aseg=' . scalar(@{ $audioWindow->{segments} || [] })
+                . ' av-sync=window';
+        } elsif ($audioContent && $audioUrl) {
+            $audioSegments = buildAudioSegmentSliceForVideoWindow($audioContent, $audioUrl, $videoWindow);
+            if ($audioSegments && ref($audioSegments) eq 'ARRAY' && @$audioSegments) {
+                $audioLogLabel = ' aseg=' . scalar(@$audioSegments) . ' av-sync=slice';
+            }
+        }
         appendRecentLog('Harmonize-Fenster: ' . $channelId
             . ' v=' . ($videoWindow->{startSequence}//'?') . '-' . ($videoWindow->{endSequence}//'?')
             . ' seg=' . scalar(@{ $videoWindow->{segments} || [] })
-            . ($audioWindow ? (' a=' . ($audioWindow->{startSequence}//'?') . '-' . ($audioWindow->{endSequence}//'?')
-            . ' aseg=' . scalar(@{ $audioWindow->{segments} || [] })) : ' ohne-audio-window'));
+            . $audioLogLabel);
 
         my %window = (
             id => $videoWindow->{id},
             videoSegments => $videoWindow->{segments},
-            audioSegments => ($audioWindow ? $audioWindow->{segments} : []),
+            audioSegments => $audioSegments,
             startsAfterDiscontinuity => $videoWindow->{startsAfterDiscontinuity} ? 1 : 0,
         );
 
