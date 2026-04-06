@@ -1735,33 +1735,22 @@ sub streamMuxedFromLocalChildStreams {
 }
 
 
-sub buildHarmonizeFfmpegCommand {
+sub buildPanzerEncodeCommand {
     my (%args) = @_;
-    my $videoInput = $args{videoInput} || return;
-    my $audioInput = $args{audioInput};
+    my $inputSource = $args{inputSource} || 'pipe:0';
     my $channelName = $args{channelName} || $args{channelId} || 'Harmonized';
     my $videoCodec = $args{videoCodec} || 'h264_v4l2m2m';
 
-    my @cmd = (
+    return (
         $ffmpeg,
         '-loglevel', 'error',
         '-nostdin',
         '-threads', '1',
-        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoInput,
-    );
-
-    if ($audioInput) {
-        push @cmd, '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioInput;
-    }
-
-    push @cmd, '-map', '0:v:0?';
-    if ($audioInput) {
-        push @cmd, '-map', '1:a:0?';
-    } else {
-        push @cmd, '-map', '0:a:0?';
-    }
-
-    push @cmd,
+        '-thread_queue_size', '512',
+        '-fflags', '+genpts+discardcorrupt',
+        '-i', $inputSource,
+        '-map', '0:v:0?',
+        '-map', '0:a:0?',
         '-vf', 'fps=25,scale=1280:720:flags=fast_bilinear:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p',
         '-c:v', $videoCodec,
         '-b:v', '1800k',
@@ -1781,9 +1770,32 @@ sub buildHarmonizeFfmpegCommand {
         '-metadata', 'service_provider=PlutoTV',
         '-metadata', 'service_name=' . $channelName,
         '-f', 'mpegts',
-        'pipe:1';
+        'pipe:1'
+    );
+}
 
-    return @cmd;
+sub buildSegmentMuxCommand {
+    my (%args) = @_;
+    my $videoInput = $args{videoInput} || return;
+    my $audioInput = $args{audioInput} || return;
+
+    return (
+        $ffmpeg,
+        '-loglevel', 'error',
+        '-nostdin',
+        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoInput,
+        '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioInput,
+        '-map', '0:v:0?', '-map', '1:a:0?',
+        '-c', 'copy',
+        '-muxdelay', '0',
+        '-muxpreload', '0',
+        '-mpegts_flags', '+resend_headers',
+        '-avoid_negative_ts', 'make_zero',
+        '-max_interleave_delta', '1000000',
+        '-flush_packets', '1',
+        '-f', 'mpegts',
+        'pipe:1'
+    );
 }
 
 sub stopChildProcesses {
@@ -1805,14 +1817,12 @@ sub spawnSegmentWorker {
 
     my $pid = fork();
     if (!defined $pid) {
-        warn "Failed to fork $kind worker: $!
-";
+        warn "Failed to fork $kind worker: $!\n";
         return;
     }
     if ($pid == 0) {
         local $SIG{PIPE} = 'DEFAULT';
-        open(my $fh, '>', $fifo) or do { warn "Failed to open $kind fifo for writing: $!
-"; exit(1); };
+        open(my $fh, '>', $fifo) or do { warn "Failed to open $kind fifo for writing: $!\n"; exit(1); };
         binmode($fh);
         eval { streamPlaylistToHandle($fh, $channelId, $region, $playlistUrl, $kind); };
         close($fh);
@@ -1821,17 +1831,47 @@ sub spawnSegmentWorker {
     return $pid;
 }
 
+sub spawnExecProcess {
+    my (%args) = @_;
+    my $cmd = $args{cmd} || return;
+    my $stdin_fh = $args{stdin_fh};
+    my $stdout_fh = $args{stdout_fh};
+    my $stderr_path = $args{stderr_path} || '/dev/null';
+
+    my $pid = fork();
+    if (!defined $pid) {
+        warn "Failed to fork external process: $!\n";
+        return;
+    }
+    if ($pid == 0) {
+        local $SIG{PIPE} = 'DEFAULT';
+        if ($stdin_fh) {
+            open(STDIN, '<&', fileno($stdin_fh)) or exit(1);
+        } else {
+            open(STDIN, '<', '/dev/null') or exit(1);
+        }
+        if ($stdout_fh) {
+            open(STDOUT, '>&', fileno($stdout_fh)) or exit(1);
+        } else {
+            open(STDOUT, '>', '/dev/null') or exit(1);
+        }
+        open(STDERR, '>>', $stderr_path) or open(STDERR, '>', '/dev/null');
+        exec { $cmd->[0] } @$cmd;
+        exit(1);
+    }
+    return $pid;
+}
+
 sub streamHlsViaFfmpeg {
     my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName, $headersSentRef, $activeStreamKey, $request) = @_;
     return 0 unless $ffmpeg;
-    return 0 unless $videoUrl;
+    return 0 unless $videoUrl && $audioUrl;
 
     $client->timeout(5);
     if (!$headersSentRef || !$$headersSentRef) {
         eval { sendMpegTsHeaders($client); };
         if ($@) {
-            if ($debug) { printf("Failed to send headers - client disconnected: %s
-", $@); }
+            if ($debug) { printf("Failed to send headers - client disconnected: %s\n", $@); }
             return 0;
         }
         $$headersSentRef = 1 if $headersSentRef;
@@ -1845,24 +1885,21 @@ sub streamHlsViaFfmpeg {
         updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
 
         if ($failures > 0) {
-            if ($debug) { printf("Restarting hybrid harmonizer for %s (attempt %d/%d)
-", $channelId, $failures + 1, $maxFailures); }
+            if ($debug) { printf("Restarting hybrid harmonizer for %s (attempt %d/%d)\n", $channelId, $failures + 1, $maxFailures); }
             sleep(2);
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
+            last unless $videoUrl && $audioUrl;
         }
 
         my $tmpdir = tempdir('plutotv-harmonize-XXXXXX', TMPDIR => 1, CLEANUP => 1);
         my $videoFifo = "$tmpdir/video.ts";
         my $audioFifo = "$tmpdir/audio.ts";
+        my $ffmpegErr = "$tmpdir/ffmpeg.err";
 
-        unless (mkfifo($videoFifo, 0700)) { warn "Failed to create video fifo: $!
-"; $failures++; next; }
-        if ($audioUrl) {
-            unless (mkfifo($audioFifo, 0700)) { warn "Failed to create audio fifo: $!
-"; unlink $videoFifo; $failures++; next; }
-        }
+        unless (mkfifo($videoFifo, 0700)) { warn "Failed to create video fifo: $!\n"; $failures++; next; }
+        unless (mkfifo($audioFifo, 0700)) { warn "Failed to create audio fifo: $!\n"; unlink $videoFifo; $failures++; next; }
 
         my @children;
         my $videoPid = spawnSegmentWorker(
@@ -1874,55 +1911,93 @@ sub streamHlsViaFfmpeg {
         );
         push @children, $videoPid if $videoPid;
 
-        if ($audioUrl) {
-            my $audioPid = spawnSegmentWorker(
-                fifo => $audioFifo,
-                channelId => $channelId,
-                region => $region,
-                playlistUrl => $audioUrl,
-                kind => 'audio',
-            );
-            push @children, $audioPid if $audioPid;
-        }
+        my $audioPid = spawnSegmentWorker(
+            fifo => $audioFifo,
+            channelId => $channelId,
+            region => $region,
+            playlistUrl => $audioUrl,
+            kind => 'audio',
+        );
+        push @children, $audioPid if $audioPid;
+
+        my ($mux_read, $mux_write);
+        pipe($mux_read, $mux_write) or do {
+            warn "Failed to create mux pipe: $!\n";
+            stopChildProcesses(@children);
+            unlink $videoFifo if -p $videoFifo || -e $videoFifo;
+            unlink $audioFifo if -p $audioFifo || -e $audioFifo;
+            $failures++;
+            next;
+        };
+        binmode($mux_read);
+        binmode($mux_write);
+
+        my ($enc_read, $enc_write);
+        pipe($enc_read, $enc_write) or do {
+            warn "Failed to create encoder pipe: $!\n";
+            close($mux_read);
+            close($mux_write);
+            stopChildProcesses(@children);
+            unlink $videoFifo if -p $videoFifo || -e $videoFifo;
+            unlink $audioFifo if -p $audioFifo || -e $audioFifo;
+            $failures++;
+            next;
+        };
+        binmode($enc_read);
+        binmode($enc_write);
+
+        my $muxPid = spawnExecProcess(
+            cmd => [ buildSegmentMuxCommand(videoInput => $videoFifo, audioInput => $audioFifo) ],
+            stdout_fh => $mux_write,
+            stderr_path => $ffmpegErr,
+        );
+        close($mux_write);
 
         my @codec_candidates = ('h264_v4l2m2m', 'libx264');
-        my ($ffh, $ffpid, $codec_used);
+        my ($encPid, $codec_used);
         for my $codec (@codec_candidates) {
-            my @cmd = buildHarmonizeFfmpegCommand(
-                videoInput => $videoFifo,
-                audioInput => ($audioUrl ? $audioFifo : undef),
-                channelId => $channelId,
-                channelName => ($channelName || $channelId),
-                videoCodec => $codec,
+            $encPid = spawnExecProcess(
+                cmd => [ buildPanzerEncodeCommand(
+                    inputSource => 'pipe:0',
+                    channelId => $channelId,
+                    channelName => ($channelName || $channelId),
+                    videoCodec => $codec,
+                ) ],
+                stdin_fh => $mux_read,
+                stdout_fh => $enc_write,
+                stderr_path => $ffmpegErr,
             );
-            $ffpid = open($ffh, '-|', @cmd);
-            if ($ffpid) {
+            if ($encPid) {
                 $codec_used = $codec;
                 last;
             }
         }
+        close($mux_read);
+        close($enc_write);
 
-        unless ($ffpid) {
-            warn "Failed to start harmonize ffmpeg: $!
-";
-            stopChildProcesses(@children);
+        unless ($muxPid && $encPid) {
+            warn "Failed to start hybrid harmonizer pipeline\n";
+            close($enc_read);
+            stopChildProcesses(grep { $_ } (@children, $muxPid, $encPid));
             unlink $videoFifo if -p $videoFifo || -e $videoFifo;
-            unlink $audioFifo if $audioUrl && (-p $audioFifo || -e $audioFifo);
+            unlink $audioFifo if -p $audioFifo || -e $audioFifo;
             $failures++;
             next;
         }
-        binmode($ffh);
+
         appendRecentLog('Harmonize gestartet: ' . $channelId . ' [' . $codec_used . ']');
 
         my $client_alive          = 1;
         my $mode_switch_requested = 0;
         my $stalled               = 0;
+        my $startup_failed        = 0;
         my $last_output_at        = time();
         my $last_mode_check       = 0;
         my $last_disc_check       = time();
+        my $first_output_seen     = 0;
         my $last_seen_discontinuity_seq;
         my $buffer                = '';
-        my $sel = IO::Select->new($ffh);
+        my $sel = IO::Select->new($enc_read);
 
         while (1) {
             if (time() - $last_mode_check >= 1) {
@@ -1944,28 +2019,38 @@ sub streamHlsViaFfmpeg {
 
             my @ready = $sel->can_read(0.5);
             if (@ready) {
-                my $read = sysread($ffh, $buffer, 1316);
+                my $read = sysread($enc_read, $buffer, 1316);
                 last unless defined $read && $read > 0;
                 $last_output_at = time();
+                $first_output_seen = 1;
                 my $ok = eval { $client->write($buffer); 1 };
                 unless ($ok) { $client_alive = 0; last; }
-            } elsif (time() - $last_output_at >= $stall_timeout) {
-                if ($debug) { printf("hybrid harmonizer stalled >%ds for %s, restarting
-", $stall_timeout, $channelId); }
-                appendRecentLog('Harmonize-Stall, Neustart: ' . $channelId);
-                $stalled = 1;
-                last;
+            } else {
+                my $enc_alive = pidIsAlive($encPid);
+                my $mux_alive = pidIsAlive($muxPid);
+
+                if (!$first_output_seen && (!$enc_alive || !$mux_alive) && (time() - $last_output_at) >= 3) {
+                    appendRecentLog('Harmonize-Start fehlgeschlagen, Neustart: ' . $channelId);
+                    $startup_failed = 1;
+                    last;
+                }
+
+                if ((time() - $last_output_at) >= $stall_timeout) {
+                    if ($debug) { printf("hybrid harmonizer stalled >%ds for %s, restarting\n", $stall_timeout, $channelId); }
+                    appendRecentLog('Harmonize-Stall, Neustart: ' . $channelId);
+                    $stalled = 1;
+                    last;
+                }
             }
         }
 
-        kill 'TERM', $ffpid if $ffpid && ($mode_switch_requested || $stalled);
-        close($ffh);
-        stopChildProcesses(@children);
+        close($enc_read);
+        stopChildProcesses(@children, $muxPid, $encPid);
         unlink $videoFifo if -p $videoFifo || -e $videoFifo;
-        unlink $audioFifo if $audioUrl && (-p $audioFifo || -e $audioFifo);
+        unlink $audioFifo if -p $audioFifo || -e $audioFifo;
 
         return 'switch' if $mode_switch_requested;
-        if ($stalled) {
+        if ($stalled || $startup_failed) {
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
@@ -1978,6 +2063,7 @@ sub streamHlsViaFfmpeg {
 
     return 1;
 }
+
 sub sendDynamicStream {
     my ($client, $request) = @_;
     my $activeStreamKey;
