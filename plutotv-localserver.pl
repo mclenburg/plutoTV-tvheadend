@@ -136,6 +136,18 @@ our %master_url_cache = ();
 my $sessionRefreshInterval = 25 * 60;
 my $sessionRetryCooldown = 30;
 
+my %harmonizerProfile = (
+    width         => 1280,
+    height        => 720,
+    video_bitrate => '2500k',
+    audio_bitrate => '128k',
+    audio_rate    => 48000,
+    gop           => 50,
+    hw_encoder    => 'h264_v4l2m2m',
+    sw_encoder    => 'libx264',
+);
+
+
 
 # -----------------------------------------------------------------------------
 # Request and response helpers
@@ -1735,6 +1747,90 @@ sub streamMuxedFromLocalChildStreams {
 }
 
 
+
+sub buildHarmonizeFilterChain {
+    return join(',',
+        'scale=' . $harmonizerProfile{width} . ':' . $harmonizerProfile{height} . ':force_original_aspect_ratio=decrease',
+        'pad=' . $harmonizerProfile{width} . ':' . $harmonizerProfile{height} . ':(ow-iw)/2:(oh-ih)/2',
+        'format=yuv420p',
+    );
+}
+
+sub buildHarmonizeFfmpegCommand {
+    my (%args) = @_;
+    my $videoUrl    = $args{videoUrl} or return ();
+    my $audioUrl    = $args{audioUrl};
+    my $channelName = $args{channelName} || $args{channelId} || 'PlutoTV';
+    my $videoEncoder = $args{videoEncoder} || $harmonizerProfile{hw_encoder};
+
+    my @cmd = (
+        $ffmpeg, '-loglevel', 'warning', '-nostdin',
+        '-fflags', '+genpts+discardcorrupt',
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+        '-re',
+        '-i', $videoUrl,
+    );
+
+    if ($audioUrl) {
+        push @cmd,
+            '-fflags', '+genpts+discardcorrupt',
+            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
+            '-re',
+            '-i', $audioUrl,
+            '-map', '0:v:0?', '-map', '1:a:0?';
+    } else {
+        push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+    }
+
+    push @cmd,
+        '-vf', buildHarmonizeFilterChain(),
+        '-c:v', $videoEncoder,
+        '-b:v', $harmonizerProfile{video_bitrate},
+        '-g', $harmonizerProfile{gop},
+        '-keyint_min', $harmonizerProfile{gop},
+        '-bf', '0',
+        '-c:a', 'aac',
+        '-ar', $harmonizerProfile{audio_rate},
+        '-ac', '2',
+        '-b:a', $harmonizerProfile{audio_bitrate},
+        '-mpegts_flags', '+resend_headers',
+        '-muxdelay', '0',
+        '-muxpreload', '0',
+        '-flush_packets', '1',
+        '-metadata', 'service_provider=PlutoTV',
+        '-metadata', 'service_name=' . $channelName,
+        '-f', 'mpegts',
+        'pipe:1';
+
+    if ($videoEncoder eq $harmonizerProfile{sw_encoder}) {
+        push @cmd, ('-preset', 'veryfast', '-tune', 'zerolatency');
+    }
+
+    return @cmd;
+}
+
+sub startHarmonizeFfmpegProcess {
+    my (%args) = @_;
+    my @encoders = ($harmonizerProfile{hw_encoder}, $harmonizerProfile{sw_encoder});
+    my @attempts;
+
+    for my $encoder (@encoders) {
+        my @cmd = buildHarmonizeFfmpegCommand(%args, videoEncoder => $encoder);
+        next unless @cmd;
+        my $ffh;
+        my $ffpid = open($ffh, '-|', @cmd);
+        if ($ffpid) {
+            binmode($ffh);
+            return ($ffh, $ffpid, $encoder);
+        }
+        push @attempts, $encoder;
+        appendRecentLog('FFmpeg-Start fehlgeschlagen mit Encoder ' . $encoder . ': ' . ($! || 'unbekannt'));
+    }
+
+    return;
+}
+
+
 sub streamHlsViaFfmpeg {
     my ($client, $channelId, $region, $videoUrl, $audioUrl, $channelName, $headersSentRef, $activeStreamKey, $request) = @_;
     return 0 unless $ffmpeg;
@@ -1744,8 +1840,7 @@ sub streamHlsViaFfmpeg {
     if (!$headersSentRef || !$$headersSentRef) {
         eval { sendMpegTsHeaders($client); };
         if ($@) {
-            if ($debug) { printf("Failed to send headers - client disconnected: %s
-", $@); }
+            if ($debug) { printf("Failed to send headers - client disconnected: %s\n", $@); }
             return 0;
         }
         $$headersSentRef = 1 if $headersSentRef;
@@ -1755,74 +1850,54 @@ sub streamHlsViaFfmpeg {
     my $stall_timeout = int(getConfigValue('stall_timeout', 15));
     my $failures = 0;
     my $ua = createUserAgent();
-
-    # Variables retained for compatibility; inner loop uses stall-detection.
     my $last_seen_discontinuity_seq;
-    my $last_restart_at = time();
-    my $restart_cooldown = 8;
+
+    detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq);
 
     while ($failures < $maxFailures) {
-        updateActiveStream($activeStreamKey, mode => 'harmonize', desiredMode => desiredModeByOverride($channelId, $request)) if $activeStreamKey;
+        updateActiveStream($activeStreamKey,
+            mode        => 'harmonize',
+            desiredMode => desiredModeByOverride($channelId, $request),
+        ) if $activeStreamKey;
 
         if ($failures > 0) {
-            if ($debug) { printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)
-", $channelId, $failures + 1, $maxFailures); }
+            if ($debug) {
+                printf("Restarting ffmpeg HLS harmonizer for %s (attempt %d/%d)\n", $channelId, $failures + 1, $maxFailures);
+            }
             sleep(2);
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
-            detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq) unless defined $last_seen_discontinuity_seq;
         }
 
-        my @cmd = (
-            $ffmpeg, '-loglevel', 'fatal', '-nostdin',
-            '-fflags', '+genpts+discardcorrupt',
-            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
-            '-i', $videoUrl,
+        my ($ffh, $ffpid, $encoder) = startHarmonizeFfmpegProcess(
+            channelId   => $channelId,
+            channelName => ($channelName || $channelId),
+            videoUrl    => $videoUrl,
+            audioUrl    => $audioUrl,
         );
-
-        if ($audioUrl) {
-            push @cmd,
-                '-fflags', '+genpts+discardcorrupt',
-                '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2',
-                '-i', $audioUrl,
-                '-map', '0:v:0?', '-map', '1:a:0?';
-        } else {
-            push @cmd, '-map', '0:v:0?', '-map', '0:a:0?';
+        unless ($ffpid) {
+            warn "Failed to start ffmpeg HLS harmonizer\n";
+            $failures++;
+            next;
         }
 
-        push @cmd,
-            '-c:v', 'copy',
-            '-bsf:v', 'h264_mp4toannexb',
-            '-c:a', 'copy',
-            '-muxdelay', '0', '-muxpreload', '0',
-            '-mpegts_flags', '+resend_headers',
-            '-avoid_negative_ts', 'make_zero',
-            '-max_interleave_delta', '1000000',
-            '-flush_packets', '1',
-            '-metadata', 'service_provider=PlutoTV',
-            '-metadata', 'service_name=' . ($channelName || $channelId),
-            '-f', 'mpegts', 'pipe:1';
+        appendRecentLog('Harmonize gestartet: ' . $channelId . ' [' . $encoder . ']');
+        if ($debug) {
+            printf("Starting ffmpeg HLS harmonizer for %s with %s\n", $channelId, $encoder);
+        }
 
-        if ($debug) { printf("Starting ffmpeg HLS harmonizer for %s
-", $channelId); }
-
-        my $ffh;
-        my $ffpid = open($ffh, '-|', @cmd);
-        unless ($ffpid) { warn "Failed to start ffmpeg HLS harmonizer: $!
-"; $failures++; next; }
-        binmode($ffh);
-
-        my $client_alive          = 1;
-        my $mode_switch_requested = 0;
-        my $stalled               = 0;
-        my $last_output_at        = time();
-        my $last_mode_check       = 0;
-        my $buffer                = '';
+        my $client_alive             = 1;
+        my $mode_switch_requested    = 0;
+        my $stalled                  = 0;
+        my $playlist_discontinuity   = 0;
+        my $last_output_at           = time();
+        my $last_mode_check          = 0;
+        my $last_discontinuity_check = 0;
+        my $buffer                   = '';
         my $sel = IO::Select->new($ffh);
 
         while (1) {
-            # Check mode-switch every ~1 s (cheap file read)
             if (time() - $last_mode_check >= 1) {
                 $last_mode_check = time();
                 if (desiredModeByOverride($channelId, $request) eq 'copy') {
@@ -1831,31 +1906,45 @@ sub streamHlsViaFfmpeg {
                 }
             }
 
-            # Non-blocking read: 0.5 s timeout keeps mode-check responsive
-            # even while ffmpeg is between segments.
+            if (time() - $last_discontinuity_check >= 2) {
+                $last_discontinuity_check = time();
+                if (detectNewPlaylistDiscontinuity($ua, $videoUrl, $audioUrl, \$last_seen_discontinuity_seq)) {
+                    $playlist_discontinuity = 1;
+                    appendRecentLog('DISCONTINUITY erkannt, Harmonize-Neustart: ' . $channelId);
+                    last;
+                }
+            }
+
             my @ready = $sel->can_read(0.5);
             if (@ready) {
                 my $read = sysread($ffh, $buffer, 1316);
-                last unless defined $read && $read > 0;  # ffmpeg EOF
+                last unless defined $read && $read > 0;
                 $last_output_at = time();
                 my $ok = eval { $client->write($buffer); 1 };
-                unless ($ok) { $client_alive = 0; last; }
+                unless ($ok) {
+                    $client_alive = 0;
+                    last;
+                }
             } elsif (time() - $last_output_at >= $stall_timeout) {
-                if ($debug) { printf("ffmpeg stalled >%ds for %s, restarting\n", $stall_timeout, $channelId); }
+                if ($debug) {
+                    printf("ffmpeg stalled >%ds for %s, restarting\n", $stall_timeout, $channelId);
+                }
                 appendRecentLog('ffmpeg-Stall, Neustart: ' . $channelId);
                 $stalled = 1;
                 last;
             }
         }
 
-        kill 'TERM', $ffpid if $ffpid && ($mode_switch_requested || $stalled);
+        kill 'TERM', $ffpid if $ffpid && ($mode_switch_requested || $stalled || $playlist_discontinuity);
         close($ffh);
 
         return 'switch' if $mode_switch_requested;
-        if ($stalled) {
+
+        if ($playlist_discontinuity || $stalled) {
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
             $videoUrl = $freshVideo if $freshVideo;
             $audioUrl = $freshAudio if $freshAudio;
+            $failures++;
             next;
         }
 
@@ -1865,7 +1954,6 @@ sub streamHlsViaFfmpeg {
 
     return 1;
 }
-
 
 sub sendDynamicStream {
     my ($client, $request) = @_;
