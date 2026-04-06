@@ -1929,6 +1929,8 @@ sub buildReencodeFfmpegCommand {
         $ffmpeg, '-loglevel', 'error', '-nostdin',
         '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
         '-fflags', '+genpts+discardcorrupt',
+        '-analyzeduration', '2000000',
+        '-probesize', '2000000',
         '-i', $videoPlaylist,
     );
 
@@ -1936,10 +1938,14 @@ sub buildReencodeFfmpegCommand {
         push @cmd,
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
             '-fflags', '+genpts+discardcorrupt',
+            '-analyzeduration', '2000000',
+            '-probesize', '2000000',
             '-i', $audioPlaylist,
             '-map', '0:v:0', '-map', '1:a:0?';
     } else {
-        push @cmd, '-map', '0:v:0', '-map', '0:a:0?';
+        push @cmd,
+            '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+            '-map', '0:v:0', '-map', '1:a:0';
     }
 
     push @cmd,
@@ -1951,6 +1957,7 @@ sub buildReencodeFfmpegCommand {
         '-ar', '48000',
         '-b:a', '160k',
         '-ac', '2',
+        '-shortest',
         '-muxdelay', '0',
         '-muxpreload', '0',
         '-mpegts_flags', '+resend_headers',
@@ -2140,6 +2147,11 @@ sub streamHlsViaFfmpeg {
         my $videoContent = $videoResponse && $videoResponse->is_success ? $videoResponse->decoded_content : undef;
         my $audioContent = $audioResponse && $audioResponse->is_success ? $audioResponse->decoded_content : undef;
 
+        if ($audioUrl && !$audioContent) {
+            my $status = $audioResponse ? $audioResponse->status_line : 'no response';
+            appendRecentLog('Audio-Playlist nicht lesbar: ' . $channelId . ' | ' . $status);
+        }
+
         unless ($videoContent) {
             $failures++;
             my (undef, undef, undef, undef, $freshVideo, $freshAudio) = getPlaybackUrlsForChannel($channelId, $region, 1);
@@ -2168,7 +2180,7 @@ sub streamHlsViaFfmpeg {
 
         my $audioWindow = $audioContent ? findBestAudioWindowForVideoWindow($audioWindows, $videoWindow, \%processedAudioWindows) : undef;
         my $audioSegments = [];
-        my $audioLogLabel = ' ohne-audio';
+        my $audioLogLabel = ' audio=silent-fallback';
         if ($audioWindow && ref($audioWindow->{segments}) eq 'ARRAY' && @{ $audioWindow->{segments} }) {
             $audioSegments = $audioWindow->{segments};
             $audioLogLabel = ' a=' . ($audioWindow->{startSequence}//'?') . '-' . ($audioWindow->{endSequence}//'?')
