@@ -216,8 +216,9 @@ sub registerActiveStream {
     my (%info) = @_;
     my $streams = loadActiveStreams();
     my $key = $$ . '-' . int(time() * 1000) . '-' . int(rand(100000));
-    $info{pid} = $$;
+    $info{pid} = defined $info{pid} ? $info{pid} : $$;
     $info{startedAt} ||= time();
+    $info{lastSeenAt} ||= $info{startedAt};
     $streams->{$key} = \%info;
     saveActiveStreams($streams);
     return $key;
@@ -229,6 +230,22 @@ sub unregisterActiveStream {
     my $streams = loadActiveStreams();
     delete $streams->{$key};
     saveActiveStreams($streams);
+}
+
+sub touchActiveStream {
+    my ($key, %changes) = @_;
+    return unless defined $key && length $key;
+    my $streams = loadActiveStreams();
+    return unless ref($streams->{$key}) eq 'HASH';
+    $streams->{$key}->{lastSeenAt} = time();
+    for my $k (keys %changes) {
+        $streams->{$key}->{$k} = $changes{$k};
+    }
+    saveActiveStreams($streams);
+}
+
+sub directStreamDisplayTtl {
+    return 30;
 }
 
 # Reliable cross-platform process liveness check.
@@ -246,9 +263,25 @@ sub pidIsAlive {
 sub cleanupStaleActiveStreams {
     my $streams = loadActiveStreams();
     my $changed = 0;
+    my $now = time();
     for my $key (keys %$streams) {
         my $entry = $streams->{$key};
-        my $pid = ref($entry) eq 'HASH' ? $entry->{pid} : undef;
+        unless (ref($entry) eq 'HASH') {
+            delete $streams->{$key};
+            $changed = 1;
+            next;
+        }
+
+        if ($entry->{is_direct}) {
+            my $lastSeenAt = $entry->{lastSeenAt} || $entry->{startedAt} || 0;
+            if (($now - $lastSeenAt) > directStreamDisplayTtl()) {
+                delete $streams->{$key};
+                $changed = 1;
+            }
+            next;
+        }
+
+        my $pid = $entry->{pid};
         if (!$pid || !pidIsAlive($pid)) {
             delete $streams->{$key};
             $changed = 1;
@@ -290,6 +323,7 @@ sub updateActiveStream {
     return unless defined $key && length $key;
     my $streams = loadActiveStreams();
     return unless ref($streams->{$key}) eq 'HASH';
+    $streams->{$key}->{lastSeenAt} = time();
     for my $k (keys %changes) {
         $streams->{$key}->{$k} = $changes{$k};
     }
@@ -365,6 +399,7 @@ sub buildAdminSnapshot {
             started     => formatEpochLocal($entry->{startedAt}),
             pid         => $entry->{pid} || 0,
             harmonize   => ($harmonize->{$channelId} || 0) ? 1 : 0,
+            isDirect    => ($entry->{is_direct} || 0) ? 1 : 0,
         };
     }
 
@@ -1286,8 +1321,19 @@ sub sendDirectStream {
     my $params = try { HTTP::Request::Params->new({ req => $request })->params };
     $region = $params->{'region'} if $params && $params->{'region'} && exists $regions{$params->{'region'}};
 
+    my $channel = getChannelById($channelId, $region);
+    my $activeStreamKey = registerActiveStream(
+        channelId   => $channelId,
+        channelName => ($channel ? ($channel->{name} || $channelId) : $channelId),
+        mode        => 'direct',
+        desiredMode => 'direct',
+        is_direct   => 1,
+    );
+    appendRecentLog('Direct-Playlist geliefert: ' . $channelId);
+
     my (undef, undef, $masterUrl, $master) = getMasterPlaylistForChannel($channelId, $region, 1);
     unless ($master && $masterUrl) {
+        unregisterActiveStream($activeStreamKey);
         $client->send_error(RC_INTERNAL_SERVER_ERROR, "Failed to fetch stream");
         return;
     }
@@ -1302,6 +1348,7 @@ sub sendDirectStream {
     $response->header("expires", "0");
     $response->content(encode_utf8($dynamicPlaylist));
     $client->send_response($response);
+    touchActiveStream($activeStreamKey);
 }
 sub sendPlaylistProxy {
     my ($client, $request) = @_;
@@ -2505,6 +2552,7 @@ sub sendAdminPage {
         code{font-family:ui-monospace,monospace;font-size:12px;background:#f0f2f5;padding:1px 5px;border-radius:3px}
         .badge{display:inline-block;padding:2px 7px;border-radius:9px;font-size:11px;font-weight:600}
         .badge-copy{background:#e3f0ff;color:#1565c0}
+        .badge-direct{background:#ecfdf3;color:#166534}
         .badge-harmonize{background:#fff8e1;color:#8a6000}
         .badge-on{background:#e6f4ea;color:#1e6e35}
         .badge-off{background:#fef9ee;color:#9c6300}
@@ -2609,8 +2657,8 @@ sub sendAdminPage {
         var region0 = '__REGION__';
         var allRegions = __REGIONS__;
 
-    // Region selector: populated server-side via __REGION_OPTIONS__,
-    // just wire the onchange here.
+        // Region selector: populated server-side via __REGION_OPTIONS__,
+        // just wire the onchange here.
         document.getElementById('regionSel').onchange = function(){
             location.href = '/admin?region=' + encodeURIComponent(this.value);
         };
@@ -2730,7 +2778,7 @@ sub sendAdminPage {
             renderConfig(s.config);
         }
 
-    // SSE with auto-reconnect
+        // SSE with auto-reconnect
         var es, retryTimer;
         function connectSSE() {
             var dot   = document.getElementById('sseDot');
