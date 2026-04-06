@@ -1651,7 +1651,7 @@ sub streamMuxedFromLocalChildStreams {
         }
 
         my @cmd = (
-            $ffmpeg, '-loglevel', 'error', '-nostdin',
+            $ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin',
             '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $videoFifo,
             '-thread_queue_size', '512', '-fflags', '+genpts+discardcorrupt', '-i', $audioFifo,
             '-map', '0:v:0', '-map', '1:a:0',
@@ -1926,7 +1926,7 @@ sub buildReencodeFfmpegCommand {
     my $hasAudio      = $args{hasAudio} ? 1 : 0;
 
     my @cmd = (
-        $ffmpeg, '-loglevel', 'error', '-nostdin',
+        $ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin',
         '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
         '-fflags', '+genpts+discardcorrupt',
         '-analyzeduration', '2000000',
@@ -2025,10 +2025,11 @@ sub streamReencodedWindow {
             hasAudio      => $hasAudio,
             channelName   => $channelName,
         );
-        my $cmdline = join(' ', map { shellQuote($_) } @cmd) . ' 2>' . shellQuote($stderrFile);
+        my $cmdline = join(' ', map { shellQuote($_) } @cmd)
+            . ' 2> >(tee -a ' . shellQuote($stderrFile) . ' >&2)';
 
         my $ffh;
-        my $ffpid = open($ffh, '-|', 'sh', '-c', $cmdline);
+        my $ffpid = open($ffh, '-|', 'bash', '-lc', $cmdline);
         unless ($ffpid) {
             appendRecentLog('ffmpeg-Start fehlgeschlagen [' . $encoder . ']: ' . $channelId);
             next ENCODER;
