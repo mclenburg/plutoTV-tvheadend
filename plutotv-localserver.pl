@@ -25,7 +25,10 @@ use Crypt::CBC;
 use IPC::Run qw(run);
 use open qw(:std :utf8);
 use MIME::Base64 qw(decode_base64);
-use File::Temp qw(tempdir);
+use File::Temp qw(tempdir tmpnam);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use File::Spec;
 use POSIX qw(mkfifo WNOHANG);
 use IO::Select;
 use JSON::PP qw(encode_json decode_json);
@@ -62,24 +65,50 @@ my $useStreamlink = grep { $_ eq '--usestreamlink'} @ARGV;
 my $debug = 0;
 my %hybrid_harmonize_channels = ();
 
-my $runtimeStateDir = '/tmp/plutotv-localserver';
-my $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
-my $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
-my $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
-my $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
-my $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
+my $runtimeStateDir;
+my $harmonizeStateFile;
+my $activeStreamsStateFile;
+my $forceDiscontinuityStateFile;
+my $recentLogStateFile;
+my $runtimeConfigStateFile;
 my $tempFile;
 
-GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
-if (defined $tempFile && length $tempFile) {
-    require File::Basename;
-    $runtimeStateDir = File::Basename::dirname($tempFile);
-    $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
-    $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
-    $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
-    $recentLogStateFile = $runtimeStateDir . '/recent_logs.json';
-    $runtimeConfigStateFile = $runtimeStateDir . '/runtime_config.json';
+sub detectWritableTempBaseDir {
+    for my $candidate (grep { defined $_ && length $_ } ($ENV{TMPDIR}, '/tmp', File::Spec->tmpdir())) {
+        next unless -d $candidate;
+        next unless -w $candidate;
+        return $candidate;
+    }
+    return File::Spec->tmpdir();
 }
+
+sub resolveRuntimeStateDir {
+    my ($tempArg) = @_;
+    my $baseDir;
+
+    if (defined $tempArg && length $tempArg) {
+        if (-d $tempArg) {
+            $baseDir = $tempArg;
+        } else {
+            $baseDir = dirname($tempArg);
+        }
+    }
+
+    $baseDir ||= detectWritableTempBaseDir();
+    return File::Spec->catdir($baseDir, 'plutotv-localserver');
+}
+
+sub refreshRuntimeStatePaths {
+    $harmonizeStateFile          = File::Spec->catfile($runtimeStateDir, 'harmonize_channels.json');
+    $activeStreamsStateFile      = File::Spec->catfile($runtimeStateDir, 'active_streams.json');
+    $forceDiscontinuityStateFile = File::Spec->catfile($runtimeStateDir, 'force_discontinuity.json');
+    $recentLogStateFile          = File::Spec->catfile($runtimeStateDir, 'recent_logs.json');
+    $runtimeConfigStateFile      = File::Spec->catfile($runtimeStateDir, 'runtime_config.json');
+}
+
+GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
+$runtimeStateDir = resolveRuntimeStateDir($tempFile);
+refreshRuntimeStatePaths();
 
 sub parseChannelListArg {
     my ($value) = @_;
@@ -112,8 +141,10 @@ my $sessionRetryCooldown = 30;
 
 
 sub ensureRuntimeStateDir {
-    return if -d $runtimeStateDir;
-    mkdir $runtimeStateDir;
+    return 1 if -d $runtimeStateDir;
+    eval { make_path($runtimeStateDir) };
+    return 0 if $@ || !-d $runtimeStateDir || !-w $runtimeStateDir;
+    return 1;
 }
 
 sub htmlEscape {
@@ -128,7 +159,7 @@ sub htmlEscape {
 
 sub loadJsonFile {
     my ($path, $default) = @_;
-    ensureRuntimeStateDir();
+    ensureRuntimeStateDir() or return $default;
     return $default unless -e $path;
     open(my $fh, '<', $path) or return $default;
     flock($fh, LOCK_SH);
@@ -142,7 +173,7 @@ sub loadJsonFile {
 
 sub saveJsonFile {
     my ($path, $data) = @_;
-    ensureRuntimeStateDir();
+    ensureRuntimeStateDir() or return 0;
     my $tmp = $path . '.tmp.' . $$;
     open(my $fh, '>', $tmp) or return 0;
     flock($fh, LOCK_EX);
@@ -2959,6 +2990,12 @@ sub handleAdminToggleHarmonize {
     my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
     my $region    = ($params && $params->{region} && exists $regions{$params->{region}}) ? $params->{region} : 'DE';
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
+
+    unless (ensureRuntimeStateDir()) {
+        appendRecentLog('Runtime-State-Verzeichnis nicht beschreibbar: ' . ($runtimeStateDir || 'unbekannt'));
+        sendJsonError($client, 'Temp-Verzeichnis nicht beschreibbar', runtimeStateDir => $runtimeStateDir);
+        return;
+    }
 
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
     my $saved = setHarmonizeOverride($channelId, $on);
