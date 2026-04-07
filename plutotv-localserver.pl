@@ -1800,34 +1800,32 @@ sub streamHarmonized {
                     $stopReason = $gotOutput ? 'stall' : 'startup timeout';
                     last FFREAD;
                 }
-                $keepaliveAt = time();
             }
         }
+
+        stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
+        $$ffmpegPidRef = 0 if $ffmpegPidRef;
+        cleanupBatchDir($batchDir);
+
+        if ($gotOutput) {
+            $processed{$_->{url}} = time() for @batch;
+            cleanupOldSegments(\%processed);
+            $failures = 0;
+            $batchNum++;
+        } else {
+            $failures++;
+            sleep(1);
+        }
+
+        if ($foundDisc && @remainder && $clientAlive) {
+            @pendingSegs = @remainder;
+            next;
+        }
+
+        sleep(2) if $clientAlive;
     }
 
-    stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
-    $$ffmpegPidRef = 0 if $ffmpegPidRef;
-    cleanupBatchDir($batchDir);
-
-    if ($gotOutput) {
-        $processed{$_->{url}} = time() for @batch;
-        cleanupOldSegments(\%processed);
-        $failures = 0;
-        $batchNum++;
-    } else {
-        $failures++;
-        sleep(1);
-    }
-
-    if ($foundDisc && @remainder && $clientAlive) {
-        @pendingSegs = @remainder;
-        next;
-    }
-
-    sleep(2) if $clientAlive;
-}
-
-return $clientAlive ? 1 : 0;
+    return $clientAlive ? 1 : 0;
 }
 
 
@@ -2686,7 +2684,7 @@ sub sendAdminPage {
         var allRegions = __REGIONS__;
         var channels   = [];  // [{id, name, harmonize}]
 
-    // Region selector
+        // Region selector
         document.getElementById('rsel').onchange = function(){
             location.href = '/admin?region=' + encodeURIComponent(this.value);
         };
@@ -2719,7 +2717,7 @@ sub sendAdminPage {
             xhr.send(body);
         }
 
-    // ── Channel list ─────────────────────────────────────────────────────────────
+        // ── Channel list ─────────────────────────────────────────────────────────────
         function renderChannels(filter){
             var list=document.getElementById('chList');
             var q=(filter||'').toLowerCase().trim();
@@ -2789,7 +2787,7 @@ sub sendAdminPage {
             xhr.send();
         }
 
-    // ── Active streams ────────────────────────────────────────────────────────────
+        // ── Active streams ────────────────────────────────────────────────────────────
         function renderStreams(streams){
             var tbody=document.getElementById('streamsTbody');
             var sdot=document.getElementById('streamsDot');
@@ -2818,7 +2816,7 @@ sub sendAdminPage {
             api('/admin/restart_stream',{key:key});
         };
 
-    // ── Config ────────────────────────────────────────────────────────────────────
+        // ── Config ────────────────────────────────────────────────────────────────────
         function renderConfig(cfg){
             if(!cfg) return;
             if(cfg.stall_timeout!=null) document.getElementById('cfgStall').value=cfg.stall_timeout;
@@ -2833,7 +2831,7 @@ sub sendAdminPage {
             });
         };
 
-    // ── Render SSE snapshot ───────────────────────────────────────────────────────
+        // ── Render SSE snapshot ───────────────────────────────────────────────────────
         function renderLogs(logs){
             document.getElementById('logPre').textContent =
                 (logs||[]).map(function(l){return '['+l.ts+'] '+l.line;}).join('\n')
@@ -2858,7 +2856,7 @@ sub sendAdminPage {
             }
         }
 
-    // ── SSE ───────────────────────────────────────────────────────────────────────
+        // ── SSE ───────────────────────────────────────────────────────────────────────
         var es, retryT;
         function connectSSE(){
             var dot=document.getElementById('sseDot');
@@ -2876,7 +2874,7 @@ sub sendAdminPage {
             };
         }
 
-    // ── Init ──────────────────────────────────────────────────────────────────────
+        // ── Init ──────────────────────────────────────────────────────────────────────
         render(snap0);
         loadChannels();
         connectSSE();
@@ -3087,6 +3085,6 @@ while (my $client = $daemon->accept) {
         } catch {
             warn "Error processing request: $_\n";
         };
-exit(0);
-}
+        exit(0);
+    }
 }
