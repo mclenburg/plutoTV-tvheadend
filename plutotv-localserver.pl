@@ -1416,9 +1416,13 @@ sub prepareSegmentBatch {
 
         if (open(my $fh, '>', $base)) {
             binmode $fh; print $fh $data; close $fh;
+            my $localMapPath = '';
+            if (defined $seg->{mapUrl} && length $seg->{mapUrl} && exists $savedMaps{$seg->{mapUrl}}) {
+                $localMapPath = $savedMaps{$seg->{mapUrl}};
+            }
             push @localPaths, { path => $base,
                 duration => $seg->{duration} || 10,
-                mapPath  => $savedMaps{$seg->{mapUrl}} || '' };
+                mapPath  => $localMapPath };
         } else {
             printf("prepareSegmentBatch: write failed: %s\n", $!) if $debug;
             unlink $_ for glob("$batchDir/*");
@@ -2525,7 +2529,7 @@ sub sendAdminPage {
         var allRegions = __REGIONS__;
         var channels   = [];  // [{id, name, harmonize}]
 
-    // Region selector
+        // Region selector
         document.getElementById('rsel').onchange = function(){
             location.href = '/admin?region=' + encodeURIComponent(this.value);
         };
@@ -2558,7 +2562,7 @@ sub sendAdminPage {
             xhr.send(body);
         }
 
-    // ── Channel list ─────────────────────────────────────────────────────────────
+        // ── Channel list ─────────────────────────────────────────────────────────────
         function renderChannels(filter){
             var list=document.getElementById('chList');
             var q=(filter||'').toLowerCase().trim();
@@ -2628,7 +2632,7 @@ sub sendAdminPage {
             xhr.send();
         }
 
-    // ── Active streams ────────────────────────────────────────────────────────────
+        // ── Active streams ────────────────────────────────────────────────────────────
         function renderStreams(streams){
             var tbody=document.getElementById('streamsTbody');
             var sdot=document.getElementById('streamsDot');
@@ -2657,7 +2661,7 @@ sub sendAdminPage {
             api('/admin/restart_stream',{key:key});
         };
 
-    // ── Config ────────────────────────────────────────────────────────────────────
+        // ── Config ────────────────────────────────────────────────────────────────────
         function renderConfig(cfg){
             if(!cfg) return;
             if(cfg.stall_timeout!=null) document.getElementById('cfgStall').value=cfg.stall_timeout;
@@ -2672,7 +2676,7 @@ sub sendAdminPage {
             });
         };
 
-    // ── Render SSE snapshot ───────────────────────────────────────────────────────
+        // ── Render SSE snapshot ───────────────────────────────────────────────────────
         function renderLogs(logs){
             document.getElementById('logPre').textContent =
                 (logs||[]).map(function(l){return '['+l.ts+'] '+l.line;}).join('\n')
@@ -2697,7 +2701,7 @@ sub sendAdminPage {
             }
         }
 
-    // ── SSE ───────────────────────────────────────────────────────────────────────
+        // ── SSE ───────────────────────────────────────────────────────────────────────
         var es, retryT;
         function connectSSE(){
             var dot=document.getElementById('sseDot');
@@ -2715,7 +2719,7 @@ sub sendAdminPage {
             };
         }
 
-    // ── Init ──────────────────────────────────────────────────────────────────────
+        // ── Init ──────────────────────────────────────────────────────────────────────
         render(snap0);
         loadChannels();
         connectSSE();
