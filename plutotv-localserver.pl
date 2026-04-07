@@ -1711,7 +1711,10 @@ sub streamHarmonized {
         my @newSegs = filterNewSegments(\@all, \%processed);
         unshift @newSegs, @pendingSegs;
         @pendingSegs = ();
-        unless (@newSegs) { sleep(2); next; }
+        unless (@newSegs) {
+            select(undef, undef, undef, 0.1);
+            next;
+        }
 
         my (@batch, @remainder);
         my $foundDisc = 0;
@@ -1806,6 +1809,8 @@ sub streamHarmonized {
         $$ffmpegPidRef = 0 if $ffmpegPidRef;
         cleanupBatchDir($batchDir);
 
+        my $endedNormally = ($stopReason eq 'eof' && $gotOutput) ? 1 : 0;
+
         if ($gotOutput) {
             $processed{$_->{url}} = time() for @batch;
             cleanupOldSegments(\%processed);
@@ -1813,7 +1818,7 @@ sub streamHarmonized {
             $batchNum++;
         } else {
             $failures++;
-            sleep(1);
+            select(undef, undef, undef, 0.2);
         }
 
         if ($foundDisc && @remainder && $clientAlive) {
@@ -1821,7 +1826,11 @@ sub streamHarmonized {
             next;
         }
 
-        sleep(2) if $clientAlive;
+        if ($endedNormally && $clientAlive) {
+            next;
+        }
+
+        select(undef, undef, undef, 0.2) if $clientAlive;
     }
 
     return $clientAlive ? 1 : 0;
