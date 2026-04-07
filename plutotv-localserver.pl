@@ -1501,6 +1501,7 @@ sub buildFfmpegCmd {
         '-ac', '2',
         '-b:a', '128k',
         '-af', 'aresample=async=1:min_hard_comp=0.100:first_pts=0',
+        '-mpegts_flags', '+resend_headers',
         '-muxpreload', '0',
         '-muxdelay', '0',
         '-f', 'mpegts',
@@ -1594,8 +1595,8 @@ sub sendKeepaliveFrames {
 #  3. Write local m3u8 for each batch (up to next DISCONTINUITY)
 #  4. Run ffmpeg (HW encoder if available) on local m3u8
 #  5. Wait for previous ffmpeg to fully drain before starting next (sequential stitching)
-#  6. Apply correctMpegTsTimestamps to ffmpeg output
-#  7. Stream corrected bytes to tvheadend
+#  6. Let ffmpeg output a fresh MPEG-TS stream without post-processing
+#  7. Stream bytes directly to tvheadend
 sub streamHarmonized {
     my ($client, $channelId, $region, $videoUrl, $channelName, $headersSentRef, $activeStreamKey, $ffmpegPidRef) = @_;
     return 0 unless $ffmpeg && $videoUrl;
@@ -1717,7 +1718,6 @@ sub streamHarmonized {
 
         my $sel         = IO::Select->new($ffh);
         my $lastOutput  = time();
-        my $firstChunk  = ($batchNum > 0) ? 1 : 0;
         my $gotOutput   = 0;
         my $curTimeout  = $startupTimeout;
         my $buf         = '';
@@ -1737,9 +1737,7 @@ sub streamHarmonized {
                     $curTimeout = $stallTimeout;
                 }
                 $lastOutput = time();
-                my $out = correctMpegTsTimestamps($buf, "$channelId-harm", $firstChunk);
-                $firstChunk = 0;
-                my $ok = eval { $client->write($out); 1 };
+                my $ok = eval { $client->write($buf); 1 };
                 unless ($ok) {
                     $clientAlive = 0;
                     $stopReason = 'client disconnect';
