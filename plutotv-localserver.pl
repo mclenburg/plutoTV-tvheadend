@@ -1475,6 +1475,74 @@ sub writeBatchM3u8 {
 }
 
 
+
+sub splitSegmentsAtDiscontinuity {
+    my ($segmentsRef) = @_;
+    my @segs = @{$segmentsRef || []};
+    my (@batch, @remainder);
+    my $foundDisc = 0;
+    for my $i (0 .. $#segs) {
+        my $seg = $segs[$i];
+        if ($seg->{isDiscontinuity} && @batch) {
+            @remainder = @segs[$i .. $#segs];
+            $foundDisc = 1;
+            last;
+        }
+        push @batch, $seg;
+    }
+    @batch = @segs unless @batch;
+    return (\@batch, \@remainder, $foundDisc);
+}
+
+sub spawnBatchPreloader {
+    my ($segsRef, $batchDir) = @_;
+    my $pid = fork();
+    die "fork preloader failed: $!" unless defined $pid;
+    if ($pid == 0) {
+        my $ok = 0;
+        eval {
+            my $ua = createUserAgent();
+            my %kc;
+            my @local = prepareSegmentBatch($ua, $segsRef, $batchDir, \%kc, undef);
+            if (@local) {
+                my $m3uPath = "$batchDir/playlist.m3u8";
+                if (writeBatchM3u8($m3uPath, \@local)) {
+                    if (open(my $rfh, '>', "$batchDir/.ready")) {
+                        print $rfh time();
+                        close $rfh;
+                    }
+                    $ok = 1;
+                }
+            }
+            1;
+        } or do {
+            $ok = 0;
+        };
+        unless ($ok) {
+            eval {
+                if (open(my $ffh, '>', "$batchDir/.failed")) {
+                    print $ffh time();
+                    close $ffh;
+                }
+            };
+        }
+        exit($ok ? 0 : 1);
+    }
+    return $pid;
+}
+
+sub batchReady {
+    my ($batchDir) = @_;
+    return 0 unless defined $batchDir && length $batchDir;
+    return -e "$batchDir/.ready" ? 1 : 0;
+}
+
+sub batchFailed {
+    my ($batchDir) = @_;
+    return 0 unless defined $batchDir && length $batchDir;
+    return -e "$batchDir/.failed" ? 1 : 0;
+}
+
 sub unregisterLiveFfmpegPid {
     my ($pid) = @_;
     return unless $pid;
@@ -1640,7 +1708,7 @@ sub sendKeepaliveFrames {
     $count ||= 7;
     my $nullpkt = chr(0x47) . chr(0x1F) . chr(0xFF) . chr(0x10) . (chr(0xFF) x 184);
     for (1 .. $count) {
-        my $ok = eval { $client->write($nullpkt); };
+        my $ok = eval { $client->write($nullpkt); 1 };
         return 0 unless $ok;
     }
     return 1;
@@ -1693,105 +1761,133 @@ sub streamHarmonized {
     my $failures       = 0;
     my $clientAlive    = 1;
     my @pendingSegs;
+    my $preparedNext;
 
     printf("streamHarmonized: channel=%s encoder=%s startup_timeout=%ds
 ",
         $channelId, $encoder, $startupTimeout) if $debug;
 
     while ($clientAlive && $failures < $maxFailures) {
-        if ((time() - $lastRefreshAt) >= $sessionRefreshInterval) {
-            my (undef, undef, undef, undef, $fresh) = getPlaybackUrlsForChannel($channelId, $region, 1);
-            if ($fresh) { $videoUrl = $fresh; $lastRefreshAt = time(); }
-        }
-
-        my $resp = getResponseFromUrl($videoUrl, ua => $ua);
-        unless ($resp && $resp->is_success) {
-            printf("streamHarmonized: playlist failed for %s: %s
-",
-                $channelId, $resp ? $resp->status_line : 'no response') if $debug;
-            $failures++;
-            sleep(1);
-            next;
-        }
-
-        my $content = $resp->decoded_content;
-        my $info    = parsePlaylistInfo($content);
-        my $rn      = 1;
-        my @all     = extractSegmentsFromPlaylist($content, $videoUrl, $info, \$rn);
-        my @newSegs = filterNewSegments(\@all, \%processed);
-        unshift @newSegs, @pendingSegs;
-        @pendingSegs = ();
-        # Deduplicate by URL: pendingSegs entries take priority (correct
-        # isDiscontinuity flag). Without this, a segment that is in both
-        # @pendingSegs and the current playlist appears twice, causing the
-        # split logic to treat the duplicate DISC-flagged entry as a new
-        # real discontinuity - leading to ever-growing stale remainder chains
-        # whose CDN URLs expire and ultimately kill the stream.
-        { my %_seen; @newSegs = grep { !$_seen{$_->{url}}++ } @newSegs; }
-        unless (@newSegs) {
-            select(undef, undef, undef, 0.1);
-            next;
-        }
-
         my (@batch, @remainder);
         my $foundDisc = 0;
-        for my $i (0 .. $#newSegs) {
-            my $seg = $newSegs[$i];
-            if ($seg->{isDiscontinuity} && @batch) {
-                @remainder = @newSegs[$i .. $#newSegs];
-                $foundDisc = 1;
-                last;
-            }
-            push @batch, $seg;
-        }
-        @batch = @newSegs unless @batch;
+        my $batchDir;
+        my $m3uPath;
+        my $source = 'live';
 
-        my $batchDir = shmBase() . "/plutotv-$$-$batchNum";
-        # Keepalive callback: send null TS packets to tvheadend between
-        # segment downloads so it does not declare the stream dead during
-        # the potentially 10-30 second batch preparation window.
-        my $keepaliveCb = sub {
-            return 0 unless $clientAlive;
-            my $ok = sendKeepaliveFrames($client, 3);
-            unless ($ok) {
-                $clientAlive = 0;
-                return 0;
+        if ($preparedNext && batchReady($preparedNext->{batchDir})) {
+            waitpid($preparedNext->{preloadPid}, WNOHANG) if $preparedNext->{preloadPid};
+            @batch     = @{ $preparedNext->{batch} || [] };
+            @remainder = @{ $preparedNext->{remainder} || [] };
+            $foundDisc = $preparedNext->{foundDisc} ? 1 : 0;
+            $batchDir  = $preparedNext->{batchDir};
+            $m3uPath   = $preparedNext->{m3uPath};
+            $source    = 'preloaded';
+            $preparedNext = undef;
+        } else {
+            if ((time() - $lastRefreshAt) >= $sessionRefreshInterval) {
+                my (undef, undef, undef, undef, $fresh) = getPlaybackUrlsForChannel($channelId, $region, 1);
+                if ($fresh) { $videoUrl = $fresh; $lastRefreshAt = time(); }
             }
-            return 1;
-        };
-        # Send a first round of keepalives immediately before starting downloads
-        if ($batchNum > 0) {
-            unless ($keepaliveCb->()) {
+
+            my $resp = getResponseFromUrl($videoUrl, ua => $ua);
+            unless ($resp && $resp->is_success) {
+                printf("streamHarmonized: playlist failed for %s: %s
+",
+                    $channelId, $resp ? $resp->status_line : 'no response') if $debug;
+                $failures++;
+                sleep(1);
+                next;
+            }
+
+            my $content = $resp->decoded_content;
+            my $info    = parsePlaylistInfo($content);
+            my $rn      = 1;
+            my @all     = extractSegmentsFromPlaylist($content, $videoUrl, $info, \$rn);
+            my @newSegs = filterNewSegments(\@all, \%processed);
+            unshift @newSegs, @pendingSegs;
+            @pendingSegs = ();
+            { my %_seen; @newSegs = grep { !$_seen{$_->{url}}++ } @newSegs; }
+            unless (@newSegs) {
+                select(undef, undef, undef, 0.1);
+                next;
+            }
+
+            my ($batchRef, $remainderRef, $disc) = splitSegmentsAtDiscontinuity(\@newSegs);
+            @batch     = @$batchRef;
+            @remainder = @$remainderRef;
+            $foundDisc = $disc;
+
+            $batchDir = shmBase() . "/plutotv-$$-$batchNum";
+            my $keepaliveCb = sub {
+                return 0 unless $clientAlive;
+                my $ok = sendKeepaliveFrames($client, 3);
+                unless ($ok) {
+                    $clientAlive = 0;
+                    return 0;
+                }
+                return 1;
+            };
+            if ($batchNum > 0) {
+                unless ($keepaliveCb->()) {
+                    cleanupBatchDir($batchDir);
+                    last;
+                }
+            }
+            my @local = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache, $keepaliveCb);
+            if (@local && $local[0] eq 'DISCONNECT') {
+                $clientAlive = 0;
                 cleanupBatchDir($batchDir);
                 last;
             }
-        }
-        my @local    = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache, $keepaliveCb);
-        if (@local && $local[0] eq 'DISCONNECT') {
-            $clientAlive = 0;
-            cleanupBatchDir($batchDir);
-            last;
-        }
-        unless (@local) {
-            printf("streamHarmonized: segment download failed, batch %d
+            unless (@local) {
+                printf("streamHarmonized: segment download failed, batch %d
 ", $batchNum) if $debug;
-            cleanupBatchDir($batchDir);
-            $failures++;
-            sleep(1);
-            next;
+                cleanupBatchDir($batchDir);
+                $failures++;
+                sleep(1);
+                next;
+            }
+
+            $m3uPath = "$batchDir/playlist.m3u8";
+            unless (writeBatchM3u8($m3uPath, \@local)) {
+                cleanupBatchDir($batchDir);
+                $failures++;
+                sleep(1);
+                next;
+            }
         }
 
-        my $m3uPath = "$batchDir/playlist.m3u8";
-        unless (writeBatchM3u8($m3uPath, \@local)) {
-            cleanupBatchDir($batchDir);
-            $failures++;
-            sleep(1);
-            next;
-        }
-
-        printf("streamHarmonized: batch %d: %d segs, disc=%s, encoder=%s
+        if (!$preparedNext && $foundDisc && @remainder) {
+            my ($nextBatchRef, $nextRemainderRef, $nextFoundDisc) = splitSegmentsAtDiscontinuity(\@remainder);
+            if (@$nextBatchRef) {
+                my $nextBatchDir = shmBase() . "/plutotv-$$-" . ($batchNum + 1) . "-pre";
+                cleanupBatchDir($nextBatchDir);
+                my $preloadPid;
+                eval { $preloadPid = spawnBatchPreloader($nextBatchRef, $nextBatchDir); 1 } or do {
+                    $preloadPid = 0;
+                    warn "streamHarmonized: preloader spawn failed: $@
+";
+                };
+                if ($preloadPid) {
+                    $preparedNext = {
+                        preloadPid => $preloadPid,
+                        batch      => [ @$nextBatchRef ],
+                        remainder  => [ @$nextRemainderRef ],
+                        allSegs    => [ @$nextBatchRef, @$nextRemainderRef ],
+                        foundDisc  => $nextFoundDisc ? 1 : 0,
+                        batchDir   => $nextBatchDir,
+                        m3uPath    => "$nextBatchDir/playlist.m3u8",
+                    };
+                    printf("streamHarmonized: preloading batch %d: %d segs, nextDisc=%s
 ",
-            $batchNum, scalar(@batch), $foundDisc ? 'yes' : 'no', $encoder) if $debug;
+                        $batchNum + 1, scalar(@$nextBatchRef), $nextFoundDisc ? 'yes' : 'no') if $debug;
+                }
+            }
+        }
+
+        printf("streamHarmonized: batch %d: %d segs, disc=%s, encoder=%s, source=%s
+",
+            $batchNum, scalar(@batch), $foundDisc ? 'yes' : 'no', $encoder, $source) if $debug;
 
         my @cmd = buildFfmpegCmd($m3uPath, $encoder);
         printf("ffmpeg cmd: %s
@@ -1849,8 +1945,7 @@ sub streamHarmonized {
         stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
         $$ffmpegPidRef = 0 if $ffmpegPidRef;
         cleanupBatchDir($batchDir);
-        # Send keepalive immediately after ffmpeg exit so tvheadend stays
-        # connected during the gap before the next batch starts.
+
         if ($clientAlive) {
             unless (sendKeepaliveFrames($client, 7)) {
                 $clientAlive = 0;
@@ -1869,16 +1964,53 @@ sub streamHarmonized {
             select(undef, undef, undef, 0.2);
         }
 
+        if ($endedNormally && $clientAlive && $preparedNext) {
+            my $waitUntil = time() + 2;
+            while ($clientAlive && time() < $waitUntil && !batchReady($preparedNext->{batchDir}) && !batchFailed($preparedNext->{batchDir})) {
+                my $ok = sendKeepaliveFrames($client, 3);
+                unless ($ok) { $clientAlive = 0; last; }
+                waitpid($preparedNext->{preloadPid}, WNOHANG) if $preparedNext->{preloadPid};
+                select(undef, undef, undef, 0.05);
+            }
+
+            if ($preparedNext && batchReady($preparedNext->{batchDir})) {
+                next;
+            }
+
+            if ($preparedNext && batchFailed($preparedNext->{batchDir})) {
+                waitpid($preparedNext->{preloadPid}, WNOHANG) if $preparedNext->{preloadPid};
+                cleanupBatchDir($preparedNext->{batchDir});
+                @pendingSegs = @{ $preparedNext->{allSegs} || [] };
+                $preparedNext = undef;
+                next if $clientAlive;
+            }
+
+            if ($preparedNext && !batchReady($preparedNext->{batchDir})) {
+                @pendingSegs = @{ $preparedNext->{allSegs} || [] };
+                $preparedNext = undef;
+                next if $clientAlive;
+            }
+        }
+
+        if ($endedNormally && $clientAlive) {
+            if ($foundDisc && @remainder) {
+                @pendingSegs = @remainder;
+            }
+            next;
+        }
+
         if ($foundDisc && @remainder && $clientAlive) {
             @pendingSegs = @remainder;
             next;
         }
 
-        if ($endedNormally && $clientAlive) {
-            next;
-        }
-
         select(undef, undef, undef, 0.2) if $clientAlive;
+    }
+
+    if ($preparedNext) {
+        eval { kill('TERM', $preparedNext->{preloadPid}) if $preparedNext->{preloadPid} && pidIsAlive($preparedNext->{preloadPid}); };
+        waitpid($preparedNext->{preloadPid}, WNOHANG) if $preparedNext->{preloadPid};
+        cleanupBatchDir($preparedNext->{batchDir}) if $preparedNext->{batchDir};
     }
 
     return $clientAlive ? 1 : 0;
@@ -1917,7 +2049,6 @@ sub sendDynamicStream {
     appendRecentLog("Stream gestartet: $channelName [$mode]");
 
     my $ffmpegPid = 0;
-    my $clientGone = 0;
 
     # Local handlers: guarantee cleanup on disconnect (SIGPIPE) or admin restart (SIGTERM)
     my $cleanup = sub {
@@ -1927,13 +2058,7 @@ sub sendDynamicStream {
         appendRecentLog("Stream unterbrochen: $channelName");
         exit(0);
     };
-    my $markClientGone = sub {
-        $clientGone = 1;
-        if ($debug) {
-            printf("sendDynamicStream: SIGPIPE for %s\n", $channelId);
-        }
-    };
-    local $SIG{PIPE} = $markClientGone;
+    local $SIG{PIPE} = $cleanup;
     local $SIG{TERM} = $cleanup;
     local $SIG{INT}  = $cleanup;
     local $SIG{QUIT} = $cleanup;
@@ -1948,9 +2073,9 @@ sub sendDynamicStream {
         streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
     }
 
-    stopFfmpegProcess($ffmpegPid, undef, ($clientGone ? 'client disconnect' : 'stream end'), $activeStreamKey) if $ffmpegPid;
+    stopFfmpegProcess($ffmpegPid, undef, 'stream end', $activeStreamKey) if $ffmpegPid;
     unregisterActiveStream($activeStreamKey);
-    appendRecentLog($clientGone ? "Stream unterbrochen: $channelName" : "Stream beendet: $channelName");
+    appendRecentLog("Stream beendet: $channelName");
 }
 
 
