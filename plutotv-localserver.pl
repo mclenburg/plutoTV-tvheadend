@@ -105,6 +105,7 @@ our %channel_timestamps = ();
 our %session_cache = ();
 our %channel_cache = ();
 our %master_url_cache = ();
+our %live_ffmpeg_pids = ();
 
 
 my $sessionRefreshInterval = 25 * 60;
@@ -1463,6 +1464,54 @@ sub writeBatchM3u8 {
     return 1;
 }
 
+
+sub unregisterLiveFfmpegPid {
+    my ($pid) = @_;
+    return unless $pid;
+    delete $live_ffmpeg_pids{$pid};
+}
+
+sub registerLiveFfmpegPid {
+    my ($pid, $channelId) = @_;
+    return unless $pid;
+    $live_ffmpeg_pids{$pid} = {
+        channelId => ($channelId || ''),
+        ts => time(),
+    };
+}
+
+sub killAllLiveFfmpegProcesses {
+    my ($reason) = @_;
+    my @pids = grep { pidIsAlive($_) } sort { $a <=> $b } keys %live_ffmpeg_pids;
+    return 1 unless @pids;
+    appendRecentLog("Cleanup ffmpeg [$reason]: " . join(',', @pids)) if $debug;
+    kill('TERM', @pids);
+    my $deadline = time() + 3;
+    while (time() < $deadline) {
+        @pids = grep { pidIsAlive($_) } @pids;
+        last unless @pids;
+        for my $pid (@pids) { waitpid($pid, WNOHANG); }
+        select(undef, undef, undef, 0.1);
+    }
+    @pids = grep { pidIsAlive($_) } @pids;
+    if (@pids) {
+        kill('KILL', @pids);
+        my $deadline2 = time() + 2;
+        while (time() < $deadline2) {
+            @pids = grep { pidIsAlive($_) } @pids;
+            last unless @pids;
+            for my $pid (@pids) { waitpid($pid, WNOHANG); }
+            select(undef, undef, undef, 0.1);
+        }
+    }
+    unregisterLiveFfmpegPid($_) for keys %live_ffmpeg_pids;
+    return 1;
+}
+
+END {
+    eval { killAllLiveFfmpegProcesses('END') };
+}
+
 # ── Build the ffmpeg encoding command ─────────────────────────────────────────
 sub buildFfmpegCmd {
     my ($m3uPath, $encoder) = @_;
@@ -1477,19 +1526,17 @@ sub buildFfmpegCmd {
         '-i', $m3uPath,
         '-map', '0:v:0',
         '-map', '0:a:0?',
+        '-fps_mode', 'passthrough',
     );
     if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
-            '-vf', 'format=nv12,scale=1280:720',
+            '-pix_fmt', 'nv12',
             '-c:v', 'h264_v4l2m2m',
-            '-num_capture_buffers', '16',
-            '-num_output_buffers',  '16',
             '-b:v', '3M',
             '-maxrate', '3M',
             '-bufsize', '6M';
     } else {
         push @cmd,
-            '-vf', 'scale=1280:720',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-tune', 'zerolatency',
@@ -1545,6 +1592,7 @@ sub stopFfmpegProcess {
         kill('KILL', $pid);
         waitForPidExit($pid, time() + 2);
     }
+    unregisterLiveFfmpegPid($pid);
     updateActiveStream($activeStreamKey, ffmpegPid => 0) if $activeStreamKey;
     return !pidIsAlive($pid);
 }
@@ -1573,6 +1621,7 @@ sub spawnFfmpegProcess {
     }
     close $writer;
     binmode($reader);
+    registerLiveFfmpegPid($pid, $channelId);
     updateActiveStream($activeStreamKey, ffmpegPid => $pid) if $activeStreamKey;
     return ($pid, $reader);
 }
@@ -1722,7 +1771,6 @@ sub streamHarmonized {
         my $curTimeout  = $startupTimeout;
         my $buf         = '';
         my $stopReason  = 'eof';
-        my $keepaliveAt = time();
 
         FFREAD: while (1) {
             my @ready = $sel->can_read(0.5);
@@ -1752,42 +1800,34 @@ sub streamHarmonized {
                     $stopReason = $gotOutput ? 'stall' : 'startup timeout';
                     last FFREAD;
                 }
-                if ($foundDisc && time() - $keepaliveAt >= 0.8) {
-                    my $ok = sendKeepaliveFrames($client, 7);
-                    unless ($ok) {
-                        $clientAlive = 0;
-                        $stopReason = 'client disconnect';
-                        last FFREAD;
-                    }
-                    $keepaliveAt = time();
-                }
+                $keepaliveAt = time();
             }
         }
-
-        stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
-        $$ffmpegPidRef = 0 if $ffmpegPidRef;
-        cleanupBatchDir($batchDir);
-
-        if ($gotOutput) {
-            $processed{$_->{url}} = time() for @batch;
-            cleanupOldSegments(\%processed);
-            $failures = 0;
-            $batchNum++;
-        } else {
-            $failures++;
-            sleep(1);
-        }
-
-        if ($foundDisc && @remainder && $clientAlive) {
-            @pendingSegs = @remainder;
-            sendKeepaliveFrames($client, 14);
-            next;
-        }
-
-        sleep(2) if $clientAlive;
     }
 
-    return $clientAlive ? 1 : 0;
+    stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
+    $$ffmpegPidRef = 0 if $ffmpegPidRef;
+    cleanupBatchDir($batchDir);
+
+    if ($gotOutput) {
+        $processed{$_->{url}} = time() for @batch;
+        cleanupOldSegments(\%processed);
+        $failures = 0;
+        $batchNum++;
+    } else {
+        $failures++;
+        sleep(1);
+    }
+
+    if ($foundDisc && @remainder && $clientAlive) {
+        @pendingSegs = @remainder;
+        next;
+    }
+
+    sleep(2) if $clientAlive;
+}
+
+return $clientAlive ? 1 : 0;
 }
 
 
@@ -2646,7 +2686,7 @@ sub sendAdminPage {
         var allRegions = __REGIONS__;
         var channels   = [];  // [{id, name, harmonize}]
 
-        // Region selector
+    // Region selector
         document.getElementById('rsel').onchange = function(){
             location.href = '/admin?region=' + encodeURIComponent(this.value);
         };
@@ -2679,7 +2719,7 @@ sub sendAdminPage {
             xhr.send(body);
         }
 
-        // ── Channel list ─────────────────────────────────────────────────────────────
+    // ── Channel list ─────────────────────────────────────────────────────────────
         function renderChannels(filter){
             var list=document.getElementById('chList');
             var q=(filter||'').toLowerCase().trim();
@@ -2749,7 +2789,7 @@ sub sendAdminPage {
             xhr.send();
         }
 
-        // ── Active streams ────────────────────────────────────────────────────────────
+    // ── Active streams ────────────────────────────────────────────────────────────
         function renderStreams(streams){
             var tbody=document.getElementById('streamsTbody');
             var sdot=document.getElementById('streamsDot');
@@ -2778,7 +2818,7 @@ sub sendAdminPage {
             api('/admin/restart_stream',{key:key});
         };
 
-        // ── Config ────────────────────────────────────────────────────────────────────
+    // ── Config ────────────────────────────────────────────────────────────────────
         function renderConfig(cfg){
             if(!cfg) return;
             if(cfg.stall_timeout!=null) document.getElementById('cfgStall').value=cfg.stall_timeout;
@@ -2793,7 +2833,7 @@ sub sendAdminPage {
             });
         };
 
-        // ── Render SSE snapshot ───────────────────────────────────────────────────────
+    // ── Render SSE snapshot ───────────────────────────────────────────────────────
         function renderLogs(logs){
             document.getElementById('logPre').textContent =
                 (logs||[]).map(function(l){return '['+l.ts+'] '+l.line;}).join('\n')
@@ -2818,7 +2858,7 @@ sub sendAdminPage {
             }
         }
 
-        // ── SSE ───────────────────────────────────────────────────────────────────────
+    // ── SSE ───────────────────────────────────────────────────────────────────────
         var es, retryT;
         function connectSSE(){
             var dot=document.getElementById('sseDot');
@@ -2836,7 +2876,7 @@ sub sendAdminPage {
             };
         }
 
-        // ── Init ──────────────────────────────────────────────────────────────────────
+    // ── Init ──────────────────────────────────────────────────────────────────────
         render(snap0);
         loadChannels();
         connectSSE();
@@ -3047,6 +3087,6 @@ while (my $client = $daemon->accept) {
         } catch {
             warn "Error processing request: $_\n";
         };
-        exit(0);
-    }
+exit(0);
+}
 }
