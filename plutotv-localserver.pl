@@ -1467,7 +1467,8 @@ sub writeBatchM3u8 {
 sub buildFfmpegCmd {
     my ($m3uPath, $encoder) = @_;
     my @cmd = (
-        $ffmpeg, '-v', 'fatal', '-nostdin',
+        $ffmpeg, '-hide_banner',
+        '-loglevel', 'debug', '-nostdin',
         '-allowed_extensions', 'ALL',
         '-protocol_whitelist', 'file,pipe,crypto',
         '-fflags', '+genpts+discardcorrupt',
@@ -1607,7 +1608,13 @@ sub streamHarmonized {
             unlink $_ for glob("$batchDir/*"); rmdir $batchDir;
             $failures++; sleep(1); next;
         }
-        if ($ffpid == 0) { exec @cmd; exit(1); }
+        if ($ffpid == 0) {
+            my $fflog = $tempFile . "plutotv-ffmpeg-$channelId.log";
+            open(STDERR, '>>', $fflog) or die "cannot open ffmpeg log $fflog: $!";
+            select STDERR; $| = 1; select STDOUT; $| = 1;
+            exec @cmd;
+            exit(1);
+        }
         binmode($ffh);
 
         # ── Steps 5+6+7: Read ffmpeg output → correct timestamps → send ───────
