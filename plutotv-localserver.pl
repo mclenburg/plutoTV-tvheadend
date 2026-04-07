@@ -113,7 +113,16 @@ my $sessionRetryCooldown = 30;
 
 sub ensureRuntimeStateDir {
     return if -d $runtimeStateDir;
-    mkdir $runtimeStateDir;
+    # make_path creates nested directories; suppresses EEXIST
+    eval { require File::Path; File::Path::make_path($runtimeStateDir); };
+    if ($@) {
+        # Fallback: plain mkdir (works for /tmp/xxx, one level deep)
+        mkdir $runtimeStateDir unless -d $runtimeStateDir;
+    }
+    unless (-d $runtimeStateDir) {
+        warn "plutotv: cannot create state dir '$runtimeStateDir': $!
+";
+    }
 }
 
 sub htmlEscape {
@@ -144,11 +153,19 @@ sub saveJsonFile {
     my ($path, $data) = @_;
     ensureRuntimeStateDir();
     my $tmp = $path . '.tmp.' . $$;
-    open(my $fh, '>', $tmp) or return 0;
+    my $fh;
+    unless (open($fh, '>', $tmp)) {
+        warn "plutotv: saveJsonFile: cannot write '$tmp': $!\n";
+        return 0;
+    }
     flock($fh, LOCK_EX);
     print $fh encode_json($data);
     close($fh);
-    rename($tmp, $path) or return 0;
+    unless (rename($tmp, $path)) {
+        warn "plutotv: saveJsonFile: rename '$tmp' -> '$path' failed: $!\n";
+        unlink $tmp;
+        return 0;
+    }
     return 1;
 }
 
@@ -2809,7 +2826,11 @@ sub handleAdminToggleHarmonize {
     my $enabled   = ($params && defined $params->{enabled}) ? $params->{enabled} : 0;
     unless ($channelId) { sendJsonError($client, 'Fehlende channelId'); return; }
     my $on = ($enabled =~ /^(1|true|yes|on)$/i) ? 1 : 0;
-    setHarmonizeOverride($channelId, $on);
+    my $saved = setHarmonizeOverride($channelId, $on);
+    unless ($saved) {
+        sendJsonError($client, "Speichern fehlgeschlagen (Pfad: $harmonizeStateFile)");
+        return;
+    }
     appendRecentLog(($on ? 'Harmonize an: ' : 'Harmonize aus: ') . $channelId);
     sendJsonOk($client, msg => ($on ? 'Harmonize aktiviert' : 'Harmonize deaktiviert'));
 }
