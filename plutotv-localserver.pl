@@ -1529,7 +1529,7 @@ sub buildFfmpegCmd {
     );
     if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
-            '-vf', 'format=nv12',
+            '-vf', 'scale=1280:720,format=yuv420p',
             '-c:v', 'h264_v4l2m2m',
             '-b:v', '3M',
             '-maxrate', '3M',
@@ -1546,7 +1546,7 @@ sub buildFfmpegCmd {
         '-ar', '48000',
         '-ac', '2',
         '-b:a', '128k',
-        '-af', 'aresample=async=1:min_hard_comp=0.100:first_pts=0',
+        '-af', 'aresample=async=1:first_pts=0',
         '-mpegts_flags', '+resend_headers',
         '-muxpreload', '0',
         '-muxdelay', '0',
