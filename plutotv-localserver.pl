@@ -1475,13 +1475,65 @@ sub writeBatchM3u8 {
 }
 
 
+sub unregisterLiveFfmpegPid {
+    my ($pid) = @_;
+    return unless $pid;
+    delete $live_ffmpeg_pids{$pid};
+}
 
-sub splitSegmentsAtDiscontinuity {
-    my ($segmentsRef) = @_;
+sub registerLiveFfmpegPid {
+    my ($pid, $channelId) = @_;
+    return unless $pid;
+    $live_ffmpeg_pids{$pid} = {
+        channelId => ($channelId || ''),
+        ts => time(),
+    };
+}
+
+sub killAllLiveFfmpegProcesses {
+    my ($reason) = @_;
+    my @pids = grep { pidIsAlive($_) } sort { $a <=> $b } keys %live_ffmpeg_pids;
+    return 1 unless @pids;
+    appendRecentLog("Cleanup ffmpeg [$reason]: " . join(',', @pids)) if $debug;
+    kill('TERM', @pids);
+    my $deadline = time() + 3;
+    while (time() < $deadline) {
+        @pids = grep { pidIsAlive($_) } @pids;
+        last unless @pids;
+        for my $pid (@pids) { waitpid($pid, WNOHANG); }
+        select(undef, undef, undef, 0.1);
+    }
+    @pids = grep { pidIsAlive($_) } @pids;
+    if (@pids) {
+        kill('KILL', @pids);
+        my $deadline2 = time() + 2;
+        while (time() < $deadline2) {
+            @pids = grep { pidIsAlive($_) } @pids;
+            last unless @pids;
+            for my $pid (@pids) { waitpid($pid, WNOHANG); }
+            select(undef, undef, undef, 0.1);
+        }
+    }
+    unregisterLiveFfmpegPid($_) for keys %live_ffmpeg_pids;
+    return 1;
+}
+
+END {
+    eval { killAllLiveFfmpegProcesses('END') };
+}
+
+sub selectWindowBatch {
+    my ($segmentsRef, $minSegs, $targetSegs, $maxSegs) = @_;
+    $minSegs    ||= 5;
+    $targetSegs ||= 6;
+    $maxSegs    ||= 8;
     my @segs = @{$segmentsRef || []};
+    return ([], [], 0, 1) unless @segs;
+
     my (@batch, @remainder);
     my $foundDisc = 0;
-    for my $i (0 .. $#segs) {
+
+    for (my $i = 0; $i <= $#segs; $i++) {
         my $seg = $segs[$i];
         if ($seg->{isDiscontinuity} && @batch) {
             @remainder = @segs[$i .. $#segs];
@@ -1489,9 +1541,24 @@ sub splitSegmentsAtDiscontinuity {
             last;
         }
         push @batch, $seg;
+
+        if (@batch >= $targetSegs) {
+            my $j = $i + 1;
+            while ($j <= $#segs && @batch < $maxSegs
+                && ($#segs - $j + 1) > 0
+                && ($#segs - $j + 1) < $minSegs
+                && !$segs[$j]->{isDiscontinuity}) {
+                push @batch, $segs[$j];
+                $j++;
+            }
+            @remainder = @segs[$j .. $#segs] if $j <= $#segs;
+            last;
+        }
     }
+
     @batch = @segs unless @batch;
-    return (\@batch, \@remainder, $foundDisc);
+    my $needMore = (!$foundDisc && !@remainder && @batch < $minSegs) ? 1 : 0;
+    return (\@batch, \@remainder, $foundDisc, $needMore);
 }
 
 sub spawnBatchPreloader {
@@ -1541,53 +1608,6 @@ sub batchFailed {
     my ($batchDir) = @_;
     return 0 unless defined $batchDir && length $batchDir;
     return -e "$batchDir/.failed" ? 1 : 0;
-}
-
-sub unregisterLiveFfmpegPid {
-    my ($pid) = @_;
-    return unless $pid;
-    delete $live_ffmpeg_pids{$pid};
-}
-
-sub registerLiveFfmpegPid {
-    my ($pid, $channelId) = @_;
-    return unless $pid;
-    $live_ffmpeg_pids{$pid} = {
-        channelId => ($channelId || ''),
-        ts => time(),
-    };
-}
-
-sub killAllLiveFfmpegProcesses {
-    my ($reason) = @_;
-    my @pids = grep { pidIsAlive($_) } sort { $a <=> $b } keys %live_ffmpeg_pids;
-    return 1 unless @pids;
-    appendRecentLog("Cleanup ffmpeg [$reason]: " . join(',', @pids)) if $debug;
-    kill('TERM', @pids);
-    my $deadline = time() + 3;
-    while (time() < $deadline) {
-        @pids = grep { pidIsAlive($_) } @pids;
-        last unless @pids;
-        for my $pid (@pids) { waitpid($pid, WNOHANG); }
-        select(undef, undef, undef, 0.1);
-    }
-    @pids = grep { pidIsAlive($_) } @pids;
-    if (@pids) {
-        kill('KILL', @pids);
-        my $deadline2 = time() + 2;
-        while (time() < $deadline2) {
-            @pids = grep { pidIsAlive($_) } @pids;
-            last unless @pids;
-            for my $pid (@pids) { waitpid($pid, WNOHANG); }
-            select(undef, undef, undef, 0.1);
-        }
-    }
-    unregisterLiveFfmpegPid($_) for keys %live_ffmpeg_pids;
-    return 1;
-}
-
-END {
-    eval { killAllLiveFfmpegProcesses('END') };
 }
 
 # ── Build the ffmpeg encoding command ─────────────────────────────────────────
@@ -1708,7 +1728,7 @@ sub sendKeepaliveFrames {
     $count ||= 7;
     my $nullpkt = chr(0x47) . chr(0x1F) . chr(0xFF) . chr(0x10) . (chr(0xFF) x 184);
     for (1 .. $count) {
-        my $ok = eval { $client->write($nullpkt); 1 };
+        my $ok = eval { $client->write($nullpkt); };
         return 0 unless $ok;
     }
     return 1;
@@ -1724,48 +1744,42 @@ sub sendKeepaliveFrames {
 #  6. Let ffmpeg output a fresh MPEG-TS stream without post-processing
 #  7. Stream bytes directly to tvheadend
 sub streamHarmonized {
-    my ($client, $channelId, $region, $videoUrl, $channelName, $headersSentRef, $activeStreamKey, $ffmpegPidRef) = @_;
+    my ($client, $channelId, $region, $videoUrl, $channelName, $headersSentRef, $activeStreamKey) = @_;
     return 0 unless $ffmpeg && $videoUrl;
-
-    local $SIG{CHLD} = 'DEFAULT';
 
     if (!$headersSentRef || !$$headersSentRef) {
         eval {
-            $client->write("HTTP/1.1 200 OK
-");
-            $client->write("Content-Type: video/mp2t
-");
-            $client->write("Cache-Control: no-cache, no-store, must-revalidate
-");
-            $client->write("Connection: close
-
-");
+            $client->write("HTTP/1.1 200 OK\n");
+            $client->write("Content-Type: video/mp2t\n");
+            $client->write("Cache-Control: no-cache, no-store, must-revalidate\n");
+            $client->write("Connection: close\n\n");
         };
         if ($@) {
-            printf("streamHarmonized: header write failed: %s
-", $@) if $debug;
+            printf("streamHarmonized: header write failed: %s\n", $@) if $debug;
             return 0;
         }
         $$headersSentRef = 1 if $headersSentRef;
     }
 
-    my $encoder        = detectHwEncoder();
-    my $maxFailures    = int(getConfigValue('max_failures', 5));
-    my $stallTimeout   = int(getConfigValue('stall_timeout', 30));
-    my $startupTimeout = ($stallTimeout >= 30) ? $stallTimeout : 30;
-    my $ua             = createUserAgent();
+    my $encoder          = detectHwEncoder();
+    my $maxFailures      = int(getConfigValue('max_failures',  5));
+    my $stallTimeout     = int(getConfigValue('stall_timeout', 30));
+    my $startupTimeout   = ($stallTimeout >= 30) ? $stallTimeout : 30;
+    my $ua               = createUserAgent();
     my %keyCache;
     my %processed;
-    my $lastRefreshAt  = 0;
-    my $batchNum       = 0;
-    my $failures       = 0;
-    my $clientAlive    = 1;
+    my $lastRefreshAt    = 0;
+    my $batchNum         = 0;
+    my $failures         = 0;
+    my $clientAlive      = 1;
     my @pendingSegs;
     my $preparedNext;
+    my $minWindowSegs    = 5;
+    my $targetWindowSegs = 6;
+    my $maxWindowSegs    = 8;
 
-    printf("streamHarmonized: channel=%s encoder=%s startup_timeout=%ds
-",
-        $channelId, $encoder, $startupTimeout) if $debug;
+    printf("streamHarmonized: channel=%s encoder=%s startup_timeout=%ds window=%d/%d/%d\n",
+        $channelId, $encoder, $startupTimeout, $minWindowSegs, $targetWindowSegs, $maxWindowSegs) if $debug;
 
     while ($clientAlive && $failures < $maxFailures) {
         my (@batch, @remainder);
@@ -1791,8 +1805,7 @@ sub streamHarmonized {
 
             my $resp = getResponseFromUrl($videoUrl, ua => $ua);
             unless ($resp && $resp->is_success) {
-                printf("streamHarmonized: playlist failed for %s: %s
-",
+                printf("streamHarmonized: playlist failed for %s: %s\n",
                     $channelId, $resp ? $resp->status_line : 'no response') if $debug;
                 $failures++;
                 sleep(1);
@@ -1804,44 +1817,33 @@ sub streamHarmonized {
             my $rn      = 1;
             my @all     = extractSegmentsFromPlaylist($content, $videoUrl, $info, \$rn);
             my @newSegs = filterNewSegments(\@all, \%processed);
+
             unshift @newSegs, @pendingSegs;
             @pendingSegs = ();
             { my %_seen; @newSegs = grep { !$_seen{$_->{url}}++ } @newSegs; }
+
             unless (@newSegs) {
-                select(undef, undef, undef, 0.1);
+                select(undef, undef, undef, 0.2);
                 next;
             }
 
-            my ($batchRef, $remainderRef, $disc) = splitSegmentsAtDiscontinuity(\@newSegs);
+            my ($batchRef, $remainderRef, $disc, $needMore) =
+                selectWindowBatch(\@newSegs, $minWindowSegs, $targetWindowSegs, $maxWindowSegs);
+
+            if ($needMore) {
+                @pendingSegs = @newSegs;
+                select(undef, undef, undef, 0.2);
+                next;
+            }
+
             @batch     = @$batchRef;
             @remainder = @$remainderRef;
             $foundDisc = $disc;
 
             $batchDir = shmBase() . "/plutotv-$$-$batchNum";
-            my $keepaliveCb = sub {
-                return 0 unless $clientAlive;
-                my $ok = sendKeepaliveFrames($client, 3);
-                unless ($ok) {
-                    $clientAlive = 0;
-                    return 0;
-                }
-                return 1;
-            };
-            if ($batchNum > 0) {
-                unless ($keepaliveCb->()) {
-                    cleanupBatchDir($batchDir);
-                    last;
-                }
-            }
-            my @local = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache, $keepaliveCb);
-            if (@local && $local[0] eq 'DISCONNECT') {
-                $clientAlive = 0;
-                cleanupBatchDir($batchDir);
-                last;
-            }
+            my @local = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache);
             unless (@local) {
-                printf("streamHarmonized: segment download failed, batch %d
-", $batchNum) if $debug;
+                printf("streamHarmonized: segment download failed, batch %d\n", $batchNum) if $debug;
                 cleanupBatchDir($batchDir);
                 $failures++;
                 sleep(1);
@@ -1857,55 +1859,65 @@ sub streamHarmonized {
             }
         }
 
-        if (!$preparedNext && $foundDisc && @remainder) {
-            my ($nextBatchRef, $nextRemainderRef, $nextFoundDisc) = splitSegmentsAtDiscontinuity(\@remainder);
-            if (@$nextBatchRef) {
+        if (!$preparedNext && @remainder) {
+            my ($nextBatchRef, $nextRemainderRef, $nextFoundDisc, $nextNeedMore) =
+                selectWindowBatch(\@remainder, $minWindowSegs, $targetWindowSegs, $maxWindowSegs);
+
+            if (@$nextBatchRef && !$nextNeedMore) {
                 my $nextBatchDir = shmBase() . "/plutotv-$$-" . ($batchNum + 1) . "-pre";
                 cleanupBatchDir($nextBatchDir);
-                my $preloadPid;
+                my $preloadPid = 0;
                 eval { $preloadPid = spawnBatchPreloader($nextBatchRef, $nextBatchDir); 1 } or do {
+                    warn "streamHarmonized: preloader spawn failed: $@\n";
                     $preloadPid = 0;
-                    warn "streamHarmonized: preloader spawn failed: $@
-";
                 };
                 if ($preloadPid) {
                     $preparedNext = {
                         preloadPid => $preloadPid,
                         batch      => [ @$nextBatchRef ],
                         remainder  => [ @$nextRemainderRef ],
-                        allSegs    => [ @$nextBatchRef, @$nextRemainderRef ],
+                        allSegs    => [ @remainder ],
                         foundDisc  => $nextFoundDisc ? 1 : 0,
                         batchDir   => $nextBatchDir,
                         m3uPath    => "$nextBatchDir/playlist.m3u8",
                     };
-                    printf("streamHarmonized: preloading batch %d: %d segs, nextDisc=%s
-",
+                    printf("streamHarmonized: preloading batch %d: %d segs, nextDisc=%s\n",
                         $batchNum + 1, scalar(@$nextBatchRef), $nextFoundDisc ? 'yes' : 'no') if $debug;
                 }
+            } else {
+                $preparedNext = {
+                    preloadPid => 0,
+                    batch      => [ @$nextBatchRef ],
+                    remainder  => [ @$nextRemainderRef ],
+                    allSegs    => [ @remainder ],
+                    foundDisc  => $nextFoundDisc ? 1 : 0,
+                    batchDir   => '',
+                    m3uPath    => '',
+                    needMore   => 1,
+                };
             }
         }
 
-        printf("streamHarmonized: batch %d: %d segs, disc=%s, encoder=%s, source=%s
-",
+        printf("streamHarmonized: batch %d: %d segs, disc=%s, encoder=%s, source=%s\n",
             $batchNum, scalar(@batch), $foundDisc ? 'yes' : 'no', $encoder, $source) if $debug;
 
         my @cmd = buildFfmpegCmd($m3uPath, $encoder);
-        printf("ffmpeg cmd: %s
-", join(' ', map { /\s/ ? qq{"$_"} : $_ } @cmd)) if $debug;
 
-        my ($ffpid, $ffh);
-        eval { ($ffpid, $ffh) = spawnFfmpegProcess(\@cmd, $channelId, $activeStreamKey); 1 } or do {
-            warn "streamHarmonized: ffmpeg spawn failed: $@
-";
+        my $ffh;
+        my $ffpid = open($ffh, '-|');
+        unless (defined $ffpid) {
+            warn "streamHarmonized: fork failed: $!\n";
             cleanupBatchDir($batchDir);
             $failures++;
             sleep(1);
             next;
-        };
-        $$ffmpegPidRef = $ffpid if $ffmpegPidRef;
+        }
+        if ($ffpid == 0) { exec @cmd; exit(1); }
+        binmode($ffh);
 
         my $sel         = IO::Select->new($ffh);
         my $lastOutput  = time();
+        my $firstChunk  = ($batchNum > 0) ? 1 : 0;
         my $gotOutput   = 0;
         my $curTimeout  = $startupTimeout;
         my $buf         = '';
@@ -1924,33 +1936,21 @@ sub streamHarmonized {
                     $curTimeout = $stallTimeout;
                 }
                 $lastOutput = time();
-                my $ok = eval { $client->write($buf); 1 };
-                unless ($ok) {
-                    $clientAlive = 0;
-                    $stopReason = 'client disconnect';
-                    last FFREAD;
-                }
-            } else {
-                if (time() - $lastOutput >= $curTimeout) {
-                    printf("streamHarmonized: %s >%ds for %s batch %d
-",
-                        $gotOutput ? 'stall' : 'startup timeout',
-                        $curTimeout, $channelId, $batchNum) if $debug;
-                    $stopReason = $gotOutput ? 'stall' : 'startup timeout';
-                    last FFREAD;
-                }
+                my $out = correctMpegTsTimestamps($buf, "$channelId-harm", $firstChunk);
+                $firstChunk = 0;
+                my $ok = eval { $client->write($out); 1 };
+                unless ($ok) { $clientAlive = 0; $stopReason = 'client disconnect'; last FFREAD; }
+            } elsif (time() - $lastOutput >= $curTimeout) {
+                printf("streamHarmonized: %s >%ds for %s batch %d\n",
+                    $gotOutput ? 'stall' : 'startup timeout',
+                    $curTimeout, $channelId, $batchNum) if $debug;
+                $stopReason = $gotOutput ? 'stall' : 'startup timeout';
+                last FFREAD;
             }
         }
 
-        stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
-        $$ffmpegPidRef = 0 if $ffmpegPidRef;
+        close($ffh);
         cleanupBatchDir($batchDir);
-
-        if ($clientAlive) {
-            unless (sendKeepaliveFrames($client, 7)) {
-                $clientAlive = 0;
-            }
-        }
 
         my $endedNormally = ($stopReason eq 'eof' && $gotOutput) ? 1 : 0;
 
@@ -1964,12 +1964,14 @@ sub streamHarmonized {
             select(undef, undef, undef, 0.2);
         }
 
-        if ($endedNormally && $clientAlive && $preparedNext) {
+        if ($endedNormally && $clientAlive && $preparedNext && $preparedNext->{preloadPid}) {
             my $waitUntil = time() + 2;
-            while ($clientAlive && time() < $waitUntil && !batchReady($preparedNext->{batchDir}) && !batchFailed($preparedNext->{batchDir})) {
+            while ($clientAlive && time() < $waitUntil
+                && !batchReady($preparedNext->{batchDir})
+                && !batchFailed($preparedNext->{batchDir})) {
                 my $ok = sendKeepaliveFrames($client, 3);
                 unless ($ok) { $clientAlive = 0; last; }
-                waitpid($preparedNext->{preloadPid}, WNOHANG) if $preparedNext->{preloadPid};
+                waitpid($preparedNext->{preloadPid}, WNOHANG);
                 select(undef, undef, undef, 0.05);
             }
 
@@ -1978,28 +1980,28 @@ sub streamHarmonized {
             }
 
             if ($preparedNext && batchFailed($preparedNext->{batchDir})) {
-                waitpid($preparedNext->{preloadPid}, WNOHANG) if $preparedNext->{preloadPid};
+                waitpid($preparedNext->{preloadPid}, WNOHANG);
                 cleanupBatchDir($preparedNext->{batchDir});
                 @pendingSegs = @{ $preparedNext->{allSegs} || [] };
                 $preparedNext = undef;
                 next if $clientAlive;
             }
+        }
 
-            if ($preparedNext && !batchReady($preparedNext->{batchDir})) {
-                @pendingSegs = @{ $preparedNext->{allSegs} || [] };
-                $preparedNext = undef;
-                next if $clientAlive;
-            }
+        if ($endedNormally && $clientAlive && $preparedNext && !$preparedNext->{preloadPid}) {
+            @pendingSegs = @{ $preparedNext->{allSegs} || [] };
+            $preparedNext = undef;
+            next;
         }
 
         if ($endedNormally && $clientAlive) {
-            if ($foundDisc && @remainder) {
+            if (@remainder) {
                 @pendingSegs = @remainder;
             }
             next;
         }
 
-        if ($foundDisc && @remainder && $clientAlive) {
+        if (@remainder && $clientAlive) {
             @pendingSegs = @remainder;
             next;
         }
@@ -2015,7 +2017,6 @@ sub streamHarmonized {
 
     return $clientAlive ? 1 : 0;
 }
-
 
 sub sendDynamicStream {
     my ($client, $request) = @_;
@@ -2049,6 +2050,7 @@ sub sendDynamicStream {
     appendRecentLog("Stream gestartet: $channelName [$mode]");
 
     my $ffmpegPid = 0;
+    my $clientGone = 0;
 
     # Local handlers: guarantee cleanup on disconnect (SIGPIPE) or admin restart (SIGTERM)
     my $cleanup = sub {
@@ -2058,7 +2060,13 @@ sub sendDynamicStream {
         appendRecentLog("Stream unterbrochen: $channelName");
         exit(0);
     };
-    local $SIG{PIPE} = $cleanup;
+    my $markClientGone = sub {
+        $clientGone = 1;
+        if ($debug) {
+            printf("sendDynamicStream: SIGPIPE for %s\n", $channelId);
+        }
+    };
+    local $SIG{PIPE} = $markClientGone;
     local $SIG{TERM} = $cleanup;
     local $SIG{INT}  = $cleanup;
     local $SIG{QUIT} = $cleanup;
@@ -2073,9 +2081,9 @@ sub sendDynamicStream {
         streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
     }
 
-    stopFfmpegProcess($ffmpegPid, undef, 'stream end', $activeStreamKey) if $ffmpegPid;
+    stopFfmpegProcess($ffmpegPid, undef, ($clientGone ? 'client disconnect' : 'stream end'), $activeStreamKey) if $ffmpegPid;
     unregisterActiveStream($activeStreamKey);
-    appendRecentLog("Stream beendet: $channelName");
+    appendRecentLog($clientGone ? "Stream unterbrochen: $channelName" : "Stream beendet: $channelName");
 }
 
 
