@@ -1476,27 +1476,22 @@ sub buildFfmpegCmd {
     );
     if ($encoder eq 'h264_v4l2m2m') {
         push @cmd,
-            '-c:v',              'h264_v4l2m2m',
-            '-vf',               'format=nv12,scale=1280:720',  # NV12 is mandatory for RPi4 hw encoder
-            '-num_capture_buffers', '16',
-            '-num_output_buffers',  '16',
-            '-b:v',              '4M',
-            '-maxrate',          '4M',
-            '-bufsize',          '8M';
+            '-vf', 'format=nv12,scale=1280:720',
+            '-c:v', 'h264_v4l2m2m',
+            '-b:v', '3M';
     } else {
         push @cmd,
-            '-c:v',     'libx264',
-            '-preset',  'fast',
-            '-crf',     '23',
-            '-vf',      'scale=1280:720';
+            '-vf', 'scale=1280:720',
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23';
     }
+
     push @cmd,
-        '-c:a',              'aac',
-        '-ar',               '48000',
-        '-b:a',              '128k',
-        '-avoid_negative_ts', 'make_zero',
-        '-f',                'mpegts',
+        '-an',
+        '-f', 'mpegts',
         'pipe:1';
+
     return @cmd;
 }
 
