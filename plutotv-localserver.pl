@@ -1640,7 +1640,7 @@ sub sendKeepaliveFrames {
     $count ||= 7;
     my $nullpkt = chr(0x47) . chr(0x1F) . chr(0xFF) . chr(0x10) . (chr(0xFF) x 184);
     for (1 .. $count) {
-        my $ok = eval { $client->write($nullpkt); 1 };
+        my $ok = eval { $client->write($nullpkt); };
         return 0 unless $ok;
     }
     return 1;
@@ -1751,13 +1751,21 @@ sub streamHarmonized {
         # segment downloads so it does not declare the stream dead during
         # the potentially 10-30 second batch preparation window.
         my $keepaliveCb = sub {
-            return 1 unless $clientAlive;
-            my $ok = eval { sendKeepaliveFrames($client, 3); 1 };
-            $clientAlive = 0 unless $ok;
-            return $ok ? 1 : 0;
+            return 0 unless $clientAlive;
+            my $ok = sendKeepaliveFrames($client, 3);
+            unless ($ok) {
+                $clientAlive = 0;
+                return 0;
+            }
+            return 1;
         };
         # Send a first round of keepalives immediately before starting downloads
-        $keepaliveCb->() if $batchNum > 0;
+        if ($batchNum > 0) {
+            unless ($keepaliveCb->()) {
+                cleanupBatchDir($batchDir);
+                last;
+            }
+        }
         my @local    = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache, $keepaliveCb);
         if (@local && $local[0] eq 'DISCONNECT') {
             $clientAlive = 0;
@@ -1843,7 +1851,11 @@ sub streamHarmonized {
         cleanupBatchDir($batchDir);
         # Send keepalive immediately after ffmpeg exit so tvheadend stays
         # connected during the gap before the next batch starts.
-        sendKeepaliveFrames($client, 7) if $clientAlive;
+        if ($clientAlive) {
+            unless (sendKeepaliveFrames($client, 7)) {
+                $clientAlive = 0;
+            }
+        }
 
         my $endedNormally = ($stopReason eq 'eof' && $gotOutput) ? 1 : 0;
 
@@ -1905,6 +1917,7 @@ sub sendDynamicStream {
     appendRecentLog("Stream gestartet: $channelName [$mode]");
 
     my $ffmpegPid = 0;
+    my $clientGone = 0;
 
     # Local handlers: guarantee cleanup on disconnect (SIGPIPE) or admin restart (SIGTERM)
     my $cleanup = sub {
@@ -1914,7 +1927,13 @@ sub sendDynamicStream {
         appendRecentLog("Stream unterbrochen: $channelName");
         exit(0);
     };
-    local $SIG{PIPE} = $cleanup;
+    my $markClientGone = sub {
+        $clientGone = 1;
+        if ($debug) {
+            printf("sendDynamicStream: SIGPIPE for %s\n", $channelId);
+        }
+    };
+    local $SIG{PIPE} = $markClientGone;
     local $SIG{TERM} = $cleanup;
     local $SIG{INT}  = $cleanup;
     local $SIG{QUIT} = $cleanup;
@@ -1929,9 +1948,9 @@ sub sendDynamicStream {
         streamWithDiscontinuityRestart($client, $channelId, $region, $videoUrl);
     }
 
-    stopFfmpegProcess($ffmpegPid, undef, 'stream end', $activeStreamKey) if $ffmpegPid;
+    stopFfmpegProcess($ffmpegPid, undef, ($clientGone ? 'client disconnect' : 'stream end'), $activeStreamKey) if $ffmpegPid;
     unregisterActiveStream($activeStreamKey);
-    appendRecentLog("Stream beendet: $channelName");
+    appendRecentLog($clientGone ? "Stream unterbrochen: $channelName" : "Stream beendet: $channelName");
 }
 
 
