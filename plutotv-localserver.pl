@@ -2571,13 +2571,24 @@ sub sendAdminPage {
         window.filterChannels = function(v){ renderChannels(v); };
 
         window.toggleHarmonize = function(channelId, on){
+            // Optimistic update: reflect the change immediately in the UI
+            // so the user gets instant feedback and the next SSE tick (which
+            // may still carry the old server state) does not flicker it back.
+            var ch=channels.find(function(c){return c.id===channelId;});
+            if(ch){
+                ch.harmonize=on?1:0;
+                ch._localPending=true;   // guard against SSE overwrite until confirmed
+                renderChannels(document.getElementById('chSearch').value);
+            }
             api('/admin/toggle_harmonize',
                 {channelId: channelId, enabled: on?'1':'0', region: region0},
                 function(d){
-                    if(!d.ok) return;
-                    // Update local cache
-                    var ch=channels.find(function(c){return c.id===channelId;});
-                    if(ch){ ch.harmonize=on?1:0; }
+                    if(ch){ ch._localPending=false; }
+                    if(!d.ok){
+                        // Revert on failure
+                        if(ch){ ch.harmonize=on?0:1; }
+                        renderChannels(document.getElementById('chSearch').value);
+                    }
                 });
         };
 
@@ -2654,12 +2665,18 @@ sub sendAdminPage {
             renderStreams(s.streams||[]);
             renderLogs(s.logs||[]);
             renderConfig(s.config);
-            // Update harmonize state in channel list from snapshot harmonizeList
+            // Update harmonize state from SSE snapshot, but skip channels that
+            // have a locally-pending toggle (optimistic update still in-flight).
             if(s.harmonizeList){
                 var hmSet={};
                 (s.harmonizeList||[]).forEach(function(e){ hmSet[e.channelId]=1; });
-                channels.forEach(function(c){ c.harmonize=hmSet[c.id]?1:0; });
-                renderChannels(document.getElementById('chSearch').value);
+                var changed=false;
+                channels.forEach(function(c){
+                    if(c._localPending) return;   // do not overwrite optimistic update
+                    var newVal=hmSet[c.id]?1:0;
+                    if(c.harmonize!==newVal){ c.harmonize=newVal; changed=true; }
+                });
+                if(changed){ renderChannels(document.getElementById('chSearch').value); }
             }
         }
 
