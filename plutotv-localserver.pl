@@ -1375,7 +1375,7 @@ sub fetchDecryptSegment {
 # ── Download + decrypt a batch of segments into $batchDir (RAM disk) ──────────
 # Returns list of local file paths, or empty list on hard failure.
 sub prepareSegmentBatch {
-    my ($ua, $segsRef, $batchDir, $keyCache) = @_;
+    my ($ua, $segsRef, $batchDir, $keyCache, $keepaliveCb) = @_;
     my @segs = @{$segsRef || []};
     return () unless @segs;
 
@@ -1424,6 +1424,16 @@ sub prepareSegmentBatch {
             push @localPaths, { path => $base,
                 duration => $seg->{duration} || 10,
                 mapPath  => $localMapPath };
+            # Send keepalive to tvheadend between segment downloads so it
+            # does not time out during the batch preparation gap.
+            if ($keepaliveCb) {
+                unless ($keepaliveCb->()) {
+                    # Client disconnected during prep - abort
+                    unlink $_ for glob("$batchDir/*");
+                    rmdir $batchDir;
+                    return ('DISCONNECT');
+                }
+            }
         } else {
             printf("prepareSegmentBatch: write failed: %s\n", $!) if $debug;
             unlink $_ for glob("$batchDir/*");
@@ -1711,6 +1721,13 @@ sub streamHarmonized {
         my @newSegs = filterNewSegments(\@all, \%processed);
         unshift @newSegs, @pendingSegs;
         @pendingSegs = ();
+        # Deduplicate by URL: pendingSegs entries take priority (correct
+        # isDiscontinuity flag). Without this, a segment that is in both
+        # @pendingSegs and the current playlist appears twice, causing the
+        # split logic to treat the duplicate DISC-flagged entry as a new
+        # real discontinuity - leading to ever-growing stale remainder chains
+        # whose CDN URLs expire and ultimately kill the stream.
+        { my %_seen; @newSegs = grep { !$_seen{$_->{url}}++ } @newSegs; }
         unless (@newSegs) {
             select(undef, undef, undef, 0.1);
             next;
@@ -1730,7 +1747,23 @@ sub streamHarmonized {
         @batch = @newSegs unless @batch;
 
         my $batchDir = shmBase() . "/plutotv-$$-$batchNum";
-        my @local    = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache);
+        # Keepalive callback: send null TS packets to tvheadend between
+        # segment downloads so it does not declare the stream dead during
+        # the potentially 10-30 second batch preparation window.
+        my $keepaliveCb = sub {
+            return 1 unless $clientAlive;
+            my $ok = eval { sendKeepaliveFrames($client, 3); 1 };
+            $clientAlive = 0 unless $ok;
+            return $ok ? 1 : 0;
+        };
+        # Send a first round of keepalives immediately before starting downloads
+        $keepaliveCb->() if $batchNum > 0;
+        my @local    = prepareSegmentBatch($ua, \@batch, $batchDir, \%keyCache, $keepaliveCb);
+        if (@local && $local[0] eq 'DISCONNECT') {
+            $clientAlive = 0;
+            cleanupBatchDir($batchDir);
+            last;
+        }
         unless (@local) {
             printf("streamHarmonized: segment download failed, batch %d
 ", $batchNum) if $debug;
@@ -1808,6 +1841,9 @@ sub streamHarmonized {
         stopFfmpegProcess($ffpid, $ffh, $stopReason, $activeStreamKey);
         $$ffmpegPidRef = 0 if $ffmpegPidRef;
         cleanupBatchDir($batchDir);
+        # Send keepalive immediately after ffmpeg exit so tvheadend stays
+        # connected during the gap before the next batch starts.
+        sendKeepaliveFrames($client, 7) if $clientAlive;
 
         my $endedNormally = ($stopReason eq 'eof' && $gotOutput) ? 1 : 0;
 
