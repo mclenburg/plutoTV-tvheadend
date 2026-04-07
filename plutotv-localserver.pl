@@ -73,7 +73,7 @@ my $tempFile;
 GetOptions("debug" => \$debug, "tempFile=s" => \$tempFile);
 if (defined $tempFile && length $tempFile) {
     require File::Basename;
-    $runtimeStateDir = File::Basename::dirname($tempFile);
+    $runtimeStateDir = $tempFile;
     $harmonizeStateFile = $runtimeStateDir . '/harmonize_channels.json';
     $activeStreamsStateFile = $runtimeStateDir . '/active_streams.json';
     $forceDiscontinuityStateFile = $runtimeStateDir . '/force_discontinuity.json';
