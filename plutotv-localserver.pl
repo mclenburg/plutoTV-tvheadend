@@ -32,7 +32,7 @@ use open qw(:std :utf8);
 # Konfiguration
 # ---------------------------------------------------------------------------
 
-my $version = '3.1.1';
+my $version = '3.1.2';
 my $deviceId = uuid_to_string(create_uuid(UUID_V4));
 my $defaultPort = 9000;
 my $defaultRegion = 'DE';
@@ -980,7 +980,11 @@ while (my $client = $daemon->accept) {
     }
 
     if ($pid == 0) {
-        $daemon->close();
+        # HTTP::Daemon::ClientConn hält intern eine Referenz auf das
+        # Daemon-Objekt. Der Listener darf im Kindprozess deshalb nicht vor
+        # Abschluss der Request-Verarbeitung geschlossen werden, da sonst
+        # sockhost/sockport für Antwortheader undefiniert sind. Beim exit()
+        # schließt das Betriebssystem den geerbten Listener automatisch.
         try {
             processRequest($client);
         } catch {
