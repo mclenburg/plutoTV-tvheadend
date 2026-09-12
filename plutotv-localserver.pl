@@ -32,7 +32,7 @@ use open qw(:std :utf8);
 # Konfiguration
 # ---------------------------------------------------------------------------
 
-my $version = '3.1.3';
+my $version = '3.1.4';
 my $deviceId = uuid_to_string(create_uuid(UUID_V4));
 my $defaultPort = 9000;
 my $defaultRegion = 'DE';
@@ -807,6 +807,37 @@ sub sendDirectStream {
 sub streamThroughFfmpeg {
     my ($client, $inputUrl, $channelId) = @_;
 
+    # Pluto verwendet bei Werbe-/Programmwechseln echte HLS-Discontinuities. Dabei
+    # können nicht nur die Zeitstempel springen, sondern innerhalb der TS-Segmente
+    # auch PMT-Version und PIDs wechseln. Ohne merge_pmt_versions legt ffmpeg dann
+    # während eines laufenden Streams neue AVStreams an (z. B. "New video stream
+    # with index 3"). Ein zu Beginn festgelegtes -map kann diesen neuen Stream nicht
+    # dynamisch übernehmen. Der MPEG-TS-Demuxer kann stattdessen bestehende Streams
+    # bei PMT-/PID-Wechseln wiederverwenden; genau dafür ist merge_pmt_versions da.
+    # seg_format_options reicht diese Option vom HLS-Demuxer an den TS-Segment-Demuxer.
+    #
+    # Die globale -dts_delta_threshold-Korrektur wird bewusst NICHT mehr benutzt.
+    # Bei Pluto kann Audio zuerst um z. B. -20 s springen und Video unmittelbar danach
+    # um +20 s. Die globale ffmpeg-Eingangszeitverschiebung pendelt dann zwischen beiden
+    # Streams und erzeugt genau die beobachteten Ton-Aussetzer und Bildsprünge.
+    # Mit -copyts deaktivieren wir diese globale Korrektur und normalisieren DTS/PTS
+    # stattdessen mit dem setts-Bitstreamfilter getrennt je Audio-/Video-Ausgabestrom.
+    # Das bleibt vollständiges Stream-Copy; es wird nichts dekodiert oder transkodiert.
+    #
+    # Bei einem normalen DTS-Abstand wird der Originalabstand übernommen. Bei einem
+    # Rücksprung, Stillstand oder Sprung > 2 Sekunden wird mit der vorherigen
+    # Paketdauer weitergezählt. PTS folgt derselben neuen DTS-Basis, behält aber den
+    # ursprünglichen PTS-DTS-Abstand bei, so dass H.264-B-Frames korrekt bleiben.
+    my $dtsExpr = 'if(eq(N,0),if(eq(DTS,NOPTS),0,DTS),PREV_OUTDTS+'
+        . 'if(gt(eq(DTS,NOPTS)+eq(PREV_INDTS,NOPTS),0),'
+        . 'if(gt(DURATION,0),DURATION,1),'
+        . 'if(gt(lte(DTS-PREV_INDTS,0)+gt(DTS-PREV_INDTS,2/TB),0),'
+        . 'if(gt(PREV_INDURATION,0),PREV_INDURATION,if(gt(DURATION,0),DURATION,1)),'
+        . 'DTS-PREV_INDTS)))';
+    my $ptsExpr = $dtsExpr
+        . '+if(gt(eq(PTS,NOPTS)+eq(DTS,NOPTS),0),0,PTS-DTS)';
+    my $settsFilter = "setts=dts='$dtsExpr':pts='$ptsExpr'";
+
     my @command = (
         $ffmpeg,
         '-hide_banner',
@@ -814,27 +845,24 @@ sub streamThroughFfmpeg {
         '-nostdin',
         '-rw_timeout', '15000000',
         # HLS besteht aus vielen kurzen HTTP-Abrufen. EOF ist dabei normal und darf
-        # ausdrücklich KEIN Reconnect auslösen. reconnect_at_eof/reconnect_streamed
-        # führten dazu, dass ffmpeg die Playlist nach jedem regulären EOF in einer
-        # Endlosschleife erneut öffnete. Echte Transportfehler dürfen dagegen erneut
-        # versucht werden; Segment-Retries übernimmt zusätzlich der HLS-Demuxer.
+        # ausdrücklich KEIN Reconnect auslösen. Echte Transportfehler dürfen dagegen
+        # erneut versucht werden; Segment-Retries übernimmt zusätzlich der HLS-Demuxer.
         '-reconnect', '1',
         '-reconnect_on_network_error', '1',
         '-reconnect_on_http_error', '429,5xx',
         '-reconnect_delay_max', '5',
         '-seg_max_retry', '3',
         '-http_persistent', '1',
-        # HLS/MPEG-TS sind AVFMT_TS_DISCONT-Formate. Ohne -copyts darf ffmpeg
-        # DTS-/PTS-Sprünge selbst korrigieren. Pluto setzt solche Sprünge insbesondere
-        # an Werbe- und Programmgrenzen. 1 s ist absichtlich deutlich strenger als
-        # ffmpegs Standard von 10 s, damit auch kleinere Rücksprünge normalisiert werden.
+        '-seg_format_options', 'merge_pmt_versions=1',
         '-fflags', '+genpts+discardcorrupt',
-        '-dts_delta_threshold', '1.0',
+        '-copyts',
         '-i', $inputUrl,
-        '-map', '0:v?',
-        '-map', '0:a?',
+        '-map', '0:v:0?',
+        '-map', '0:a:0?',
         '-map_metadata', '-1',
         '-c', 'copy',
+        '-bsf:v', $settsFilter,
+        '-bsf:a', $settsFilter,
         '-copytb', '1',
         '-avoid_negative_ts', 'make_non_negative',
         '-mpegts_flags', '+resend_headers+initial_discontinuity',
@@ -904,7 +932,7 @@ sub sendDynamicStream {
     # Den höchsten verfügbaren HLS-Variant-Stream einmalig auflösen. Dadurch muss
     # ffmpeg nicht alle Varianten des Master-Manifests gleichzeitig behandeln.
     my $inputUrl = resolveBestVariantUrl($masterUrl);
-    logDebug("Stream-URL für $channelId: $inputUrl");
+    logDebug("Stream-URL für $channelId: " . urlForLog($inputUrl));
 
     $client->timeout(30);
     my $headerOk = try {
