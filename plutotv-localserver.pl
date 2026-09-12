@@ -32,7 +32,7 @@ use open qw(:std :utf8);
 # Konfiguration
 # ---------------------------------------------------------------------------
 
-my $version = '3.1.0';
+my $version = '3.1.1';
 my $deviceId = uuid_to_string(create_uuid(UUID_V4));
 my $defaultPort = 9000;
 my $defaultRegion = 'DE';
@@ -67,7 +67,7 @@ my @args = @ARGV;
 GetOptionsFromArray(
     \@args,
     'debug!'         => \$debug,
-    'localonly!'     => \$localOnly,
+    'localonly|localhost!' => \$localOnly,
     'usestreamlink!' => \$useStreamlink,
     'port=i'         => \$port,
     'bind=s'         => \$bindAddress,
@@ -642,14 +642,14 @@ sub sendHelp {
         . "Regionen: " . join(', ', sort keys %regions) . "\n\n"
         . "Hinweis: Pluto bestimmt den tatsächlichen Katalog primär über die öffentliche IP-Adresse.\n"
         . "Die Regionsangabe wird an die Pluto-Session weitergegeben, kann aber kein VPN/Geo-Routing ersetzen.\n";
-    sendPlainResponse($client, RC_OK, 'text/plain; charset=utf-8', encode_utf8($text));
+    sendPlainResponse($client, HTTP_OK, 'text/plain; charset=utf-8', encode_utf8($text));
 }
 
 sub sendHealth {
     my ($client) = @_;
     my $status = "OK\nVersion=$version\nffmpeg=" . ($ffmpeg || 'nicht gefunden')
         . "\nstreamlink=" . ($streamlink || 'nicht gefunden') . "\n";
-    sendPlainResponse($client, RC_OK, 'text/plain; charset=utf-8', encode_utf8($status));
+    sendPlainResponse($client, HTTP_OK, 'text/plain; charset=utf-8', encode_utf8($status));
 }
 
 sub sendXmltvEpgFile {
@@ -657,7 +657,7 @@ sub sendXmltvEpgFile {
     my $region = requestRegion($request);
     my @channels = getChannelJson($region);
     unless (@channels) {
-        $client->send_error(RC_INTERNAL_SERVER_ERROR, 'Senderliste konnte nicht von Pluto TV geladen werden.');
+        $client->send_error(HTTP_INTERNAL_SERVER_ERROR, 'Senderliste konnte nicht von Pluto TV geladen werden.');
         return;
     }
 
@@ -712,7 +712,7 @@ sub sendXmltvEpgFile {
 
     $epg .= "</tv>\n";
 
-    my $response = HTTP::Response->new(RC_OK);
+    my $response = HTTP::Response->new(HTTP_OK);
     $response->header('Content-Type' => 'application/xml; charset=utf-8');
     $response->header('Content-Disposition' => 'attachment; filename="plutotv-epg.xml"');
     $response->header('Cache-Control' => 'no-cache');
@@ -728,7 +728,7 @@ sub sendM3uFile {
 
     my @channels = getChannelJson($region);
     unless (@channels) {
-        $client->send_error(RC_INTERNAL_SERVER_ERROR, 'Senderliste konnte nicht von Pluto TV geladen werden.');
+        $client->send_error(HTTP_INTERNAL_SERVER_ERROR, 'Senderliste konnte nicht von Pluto TV geladen werden.');
         return;
     }
 
@@ -736,7 +736,7 @@ sub sendM3uFile {
         ? buildM3uDirect($proto, $host, $region, @channels)
         : buildM3uLegacy($proto, $host, $region, @channels);
 
-    my $response = HTTP::Response->new(RC_OK);
+    my $response = HTTP::Response->new(HTTP_OK);
     $response->header('Content-Type' => 'audio/x-mpegurl; charset=utf-8');
     $response->header('Content-Disposition' => 'attachment; filename="plutotv.m3u8"');
     $response->header('Cache-Control' => 'no-cache');
@@ -753,7 +753,7 @@ sub sendDirectStream {
     my $path = $request->uri->path;
     my ($channelId) = $path =~ m{^/stream/([A-Za-z0-9_-]+)\.m3u8$};
     unless ($channelId) {
-        $client->send_error(RC_BAD_REQUEST, 'Ungültiger Stream-Pfad.');
+        $client->send_error(HTTP_BAD_REQUEST, 'Ungültiger Stream-Pfad.');
         return;
     }
 
@@ -777,7 +777,7 @@ sub sendDirectStream {
         . "$proto://$host/dynamic_stream/$channelId.ts?region=$regionParam\n"
         . "#EXT-X-ENDLIST\n";
 
-    sendPlainResponse($client, RC_OK, 'application/vnd.apple.mpegurl; charset=utf-8', encode_utf8($playlist));
+    sendPlainResponse($client, HTTP_OK, 'application/vnd.apple.mpegurl; charset=utf-8', encode_utf8($playlist));
 }
 
 sub streamThroughFfmpeg {
@@ -859,14 +859,14 @@ sub sendDynamicStream {
     my $path = $request->uri->path;
     my ($channelId) = $path =~ m{^/dynamic_stream/([A-Za-z0-9_-]+)\.ts$};
     unless ($channelId) {
-        $client->send_error(RC_BAD_REQUEST, 'Ungültiger Stream-Pfad.');
+        $client->send_error(HTTP_BAD_REQUEST, 'Ungültiger Stream-Pfad.');
         return;
     }
 
     my $region = requestRegion($request);
     my $masterUrl = getModernStreamUrl($region, $channelId);
     unless ($masterUrl) {
-        $client->send_error(RC_BAD_GATEWAY, 'Pluto-Session oder Stream-URL konnte nicht erzeugt werden.');
+        $client->send_error(HTTP_BAD_GATEWAY, 'Pluto-Session oder Stream-URL konnte nicht erzeugt werden.');
         return;
     }
 
@@ -908,7 +908,7 @@ sub processRequest {
     logDebug("Request: $path");
 
     if ($request->method ne 'GET' && $request->method ne 'HEAD') {
-        $client->send_error(RC_METHOD_NOT_ALLOWED, 'Nur GET/HEAD wird unterstützt.');
+        $client->send_error(HTTP_METHOD_NOT_ALLOWED, 'Nur GET/HEAD wird unterstützt.');
         return;
     }
 
@@ -927,7 +927,7 @@ sub processRequest {
     } elsif ($path eq '/') {
         sendHelp($client);
     } else {
-        $client->send_error(RC_NOT_FOUND, "Unbekannter Pfad: $path");
+        $client->send_error(HTTP_NOT_FOUND, "Unbekannter Pfad: $path");
     }
 }
 
@@ -940,7 +940,8 @@ Aufruf:
 
 Optionen:
   --port PORT          TCP-Port, Standard: $defaultPort
-  --localonly          nur an 127.0.0.1 binden
+  --localonly, --localhost
+                       nur an 127.0.0.1 binden
   --bind ADRESSE       explizite Bind-Adresse, z.B. 192.168.1.30
   --usestreamlink      nur für /playlist Streamlink statt lokalem ffmpeg verwenden
   --debug              ausführliche Diagnosemeldungen
@@ -984,7 +985,7 @@ while (my $client = $daemon->accept) {
             processRequest($client);
         } catch {
             logWarn("Fehler bei Request-Verarbeitung: $_");
-            try { $client->send_error(RC_INTERNAL_SERVER_ERROR, 'Interner Serverfehler.'); };
+            try { $client->send_error(HTTP_INTERNAL_SERVER_ERROR, 'Interner Serverfehler.'); };
         };
         $client->close();
         exit 0;
