@@ -32,7 +32,7 @@ use open qw(:std :utf8);
 # Konfiguration
 # ---------------------------------------------------------------------------
 
-my $version = '3.1.2';
+my $version = '3.1.3';
 my $deviceId = uuid_to_string(create_uuid(UUID_V4));
 my $defaultPort = 9000;
 my $defaultRegion = 'DE';
@@ -188,6 +188,30 @@ sub createUserAgent {
     return $ua;
 }
 
+sub urlForLog {
+    my ($url) = @_;
+    return '' unless defined $url;
+
+    my $safe = $url;
+    try {
+        my $uri = URI->new($url);
+        if (defined $uri->query) {
+            my @pairs = $uri->query_form;
+            for (my $i = 0; $i < @pairs; $i += 2) {
+                my $name = lc($pairs[$i] // '');
+                if ($name eq 'jwt' || $name eq 'token' || $name eq 'sessiontoken') {
+                    $pairs[$i + 1] = '<ausgeblendet>';
+                }
+            }
+            $uri->query_form(@pairs);
+        }
+        $safe = $uri->as_string;
+    } catch {
+        # Nur Logging-Härtung: Bei einem Parserfehler weiterhin die ursprüngliche URL nutzen.
+    };
+    return $safe;
+}
+
 sub httpGetResponse {
     my ($url, $extraHeaders) = @_;
     my $ua = createUserAgent();
@@ -197,10 +221,10 @@ sub httpGetResponse {
             $request->header($name => $extraHeaders->{$name});
         }
     }
-    logDebug("HTTP GET $url");
+    logDebug("HTTP GET " . urlForLog($url));
     my $response = $ua->request($request);
     unless ($response->is_success) {
-        logWarn("HTTP-Aufruf fehlgeschlagen: $url -> " . $response->status_line);
+        logWarn("HTTP-Aufruf fehlgeschlagen: " . urlForLog($url) . " -> " . $response->status_line);
     }
     return $response;
 }
@@ -789,10 +813,17 @@ sub streamThroughFfmpeg {
         '-loglevel', ($debug ? 'warning' : 'error'),
         '-nostdin',
         '-rw_timeout', '15000000',
+        # HLS besteht aus vielen kurzen HTTP-Abrufen. EOF ist dabei normal und darf
+        # ausdrücklich KEIN Reconnect auslösen. reconnect_at_eof/reconnect_streamed
+        # führten dazu, dass ffmpeg die Playlist nach jedem regulären EOF in einer
+        # Endlosschleife erneut öffnete. Echte Transportfehler dürfen dagegen erneut
+        # versucht werden; Segment-Retries übernimmt zusätzlich der HLS-Demuxer.
         '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_at_eof', '1',
+        '-reconnect_on_network_error', '1',
+        '-reconnect_on_http_error', '429,5xx',
         '-reconnect_delay_max', '5',
+        '-seg_max_retry', '3',
+        '-http_persistent', '1',
         # HLS/MPEG-TS sind AVFMT_TS_DISCONT-Formate. Ohne -copyts darf ffmpeg
         # DTS-/PTS-Sprünge selbst korrigieren. Pluto setzt solche Sprünge insbesondere
         # an Werbe- und Programmgrenzen. 1 s ist absichtlich deutlich strenger als
